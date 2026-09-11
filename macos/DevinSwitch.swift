@@ -1,4 +1,5 @@
 import AppKit
+import Combine
 import SwiftUI
 
 struct BridgeConfiguration: Decodable {
@@ -55,8 +56,33 @@ func callBridge(_ payload: [String: String]) throws -> Reply {
     @Published var refreshingUsage = false
     @Published var removing: Account?
     @Published var resuming: Account?
-    @AppStorage("autoRefreshUsage") var autoRefreshUsage = true
-    @AppStorage("projectFolder") var project = ""
+    @Published var autoRefreshUsage: Bool {
+        didSet {
+            guard autoRefreshUsage != oldValue else { return }
+            defaults.set(autoRefreshUsage, forKey: "autoRefreshUsage")
+            if autoRefreshUsage { refreshUsage(force: true) }
+        }
+    }
+    @AppStorage var project: String
+    private let defaults: UserDefaults
+    private let bridge: ([String: String]) async throws -> Reply
+    private var refreshSubscriptions = Set<AnyCancellable>()
+    private var refreshingState = false
+    private var stateRevision = 0
+    private var lastUsageRefresh: Date?
+    nonisolated static let usageRefreshInterval: TimeInterval = 60
+
+    init(
+        defaults: UserDefaults = .standard,
+        bridge: @escaping ([String: String]) async throws -> Reply = { payload in
+            try await Task.detached { try callBridge(payload) }.value
+        }
+    ) {
+        self.defaults = defaults
+        autoRefreshUsage = defaults.object(forKey: "autoRefreshUsage") as? Bool ?? true
+        _project = AppStorage(wrappedValue: "", "projectFolder", store: defaults)
+        self.bridge = bridge
+    }
 
     var account: Account? { snapshot.accounts.first { $0.name == focus } }
     var blocked: Bool { working || snapshot.busy }
@@ -73,18 +99,69 @@ func callBridge(_ payload: [String: String]) throws -> Reply {
         resuming = account
     }
 
-    func refresh() {
-        guard !working else { return }
-        perform(["action": "state"], quiet: true)
+    func startRefreshing(stateInterval: TimeInterval = 4, usageInterval: TimeInterval = AppModel.usageRefreshInterval) {
+        guard refreshSubscriptions.isEmpty else { return }
+        Timer.publish(every: stateInterval, on: .main, in: .common).autoconnect()
+            .sink { [weak self] _ in self?.refresh() }.store(in: &refreshSubscriptions)
+        Timer.publish(every: usageInterval, on: .main, in: .common).autoconnect()
+            .sink { [weak self] _ in
+                guard let self, self.autoRefreshUsage else { return }
+                self.refreshUsage(force: true)
+            }.store(in: &refreshSubscriptions)
+        NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)
+            .merge(with: NSWorkspace.shared.notificationCenter.publisher(for: NSWorkspace.didWakeNotification))
+            .receive(on: RunLoop.main)
+            .sink { [weak self] _ in self?.refreshAfterActivation() }.store(in: &refreshSubscriptions)
+        refreshAfterActivation()
     }
 
-    func perform(_ payload: [String: String], quiet: Bool = false) {
+    func refreshAfterActivation(now: Date = Date()) {
+        refresh()
+        if autoRefreshUsage && (lastUsageRefresh.map { now.timeIntervalSince($0) >= Self.usageRefreshInterval } ?? true) {
+            refreshUsage(force: true)
+        }
+    }
+
+    private func apply(_ state: Snapshot) {
+        if snapshot != state { snapshot = state }
+        if let focus, !state.accounts.contains(where: { $0.name == focus }) { self.focus = nil }
+    }
+
+    func refresh() {
+        guard !working, !refreshingState else { return }
+        refreshingState = true
+        let revision = stateRevision
+        Task {
+            defer {
+                refreshingState = false
+                if revision != stateRevision { refresh() }
+            }
+            do {
+                let reply = try await bridge(["action": "state"])
+                guard revision == stateRevision, !working else { return }
+                if reply.ok {
+                    if let state = reply.state { apply(state) }
+                } else {
+                    failed = true
+                    message = reply.message ?? "Could not refresh accounts."
+                }
+            } catch {
+                guard revision == stateRevision, !working else { return }
+                failed = true
+                message = error.localizedDescription
+            }
+        }
+    }
+
+    func perform(_ payload: [String: String]) {
+        let operation = payload["action"] ?? "state"
+        if operation == "state" { refresh(); return }
         guard !working else { return }
         working = true
-        let operation = payload["action"] ?? "state"
+        stateRevision += 1
         Task {
             do {
-                let reply = try await Task.detached { try callBridge(payload) }.value
+                let reply = try await bridge(payload)
                 if !reply.ok {
                     if operation == "add" {
                         addError = reply.message ?? "Could not add the account."
@@ -93,17 +170,10 @@ func callBridge(_ payload: [String: String]) throws -> Reply {
                         message = reply.message ?? "Could not complete this action."
                     }
                 } else {
-                    if let state = reply.state {
-                        snapshot = state
-                        if let focus, !state.accounts.contains(where: { $0.name == focus }) {
-                            self.focus = nil
-                        }
-                    }
+                    if let state = reply.state { apply(state) }
                     if let newFocus = reply.focus { focus = newFocus }
-                    if !quiet {
-                        message = reply.message ?? ""
-                        failed = false
-                    }
+                    message = reply.message ?? ""
+                    failed = false
                     if operation == "add" {
                         adding = false
                         addError = ""
@@ -119,24 +189,28 @@ func callBridge(_ payload: [String: String]) throws -> Reply {
                 message = error.localizedDescription
             }
             working = false
-            if operation != "state" { refresh(); refreshUsage() }
+            refresh(); refreshUsage()
         }
     }
 
     func refreshUsage(force: Bool = false) {
         guard !refreshingUsage else { return }
         refreshingUsage = true
+        lastUsageRefresh = Date()
         Task {
             do {
                 let payload = ["action": "usage", "force": force ? "true" : "false"]
-                let reply = try await Task.detached { try callBridge(payload) }.value
+                let reply = try await bridge(payload)
                 if reply.ok {
                     if let state = reply.state {
-                        for index in snapshot.accounts.indices {
-                            if let updated = state.accounts.first(where: { $0.name == snapshot.accounts[index].name }) {
-                                snapshot.accounts[index].usage = updated.usage
+                        stateRevision += 1
+                        var updatedSnapshot = snapshot
+                        for index in updatedSnapshot.accounts.indices {
+                            if let updated = state.accounts.first(where: { $0.name == updatedSnapshot.accounts[index].name }) {
+                                updatedSnapshot.accounts[index].usage = updated.usage
                             }
                         }
+                        apply(updatedSnapshot)
                     }
                 } else {
                     failed = true
@@ -201,13 +275,14 @@ func callBridge(_ payload: [String: String]) throws -> Reply {
 struct ContentView: View {
     @EnvironmentObject var model: AppModel
     @State private var hoveredAccount: String?
-    private let stateTimer = Timer.publish(every: 4, on: .main, in: .common).autoconnect()
-    private let usageTimer = Timer.publish(every: 60, on: .main, in: .common).autoconnect()
+    @AppStorage("sidebarVisible") private var sidebarVisible = true
 
     var body: some View {
         HStack(spacing: 0) {
             sidebar.frame(width: 224)
-            Rectangle().fill(Palette.line).frame(width: 1)
+                .frame(width: sidebarVisible ? 224 : 0, alignment: .leading).clipped()
+                .allowsHitTesting(sidebarVisible).accessibilityHidden(!sidebarVisible)
+            Rectangle().fill(Palette.line).frame(width: sidebarVisible ? 1 : 0)
             VStack(spacing: 0) {
                 toolbar
                 Rectangle().fill(Palette.line).frame(height: 1)
@@ -235,25 +310,30 @@ struct ContentView: View {
         } message: { account in
             Text("This removes \(account.name)’s saved login, settings and quota cache from Devin Switch. Shared chats, repository files and the Chrome profile are kept. You will need to sign in again if you add it back.")
         }
-        .task { model.refresh(); if model.autoRefreshUsage { model.refreshUsage() } }
-        .onReceive(stateTimer) { _ in model.refresh() }
-        .onReceive(usageTimer) { _ in if model.autoRefreshUsage { model.refreshUsage() } }
+        .task { model.startRefreshing() }
     }
 
     var toolbar: some View {
         HStack(spacing: 10) {
+            Button {
+                withAnimation(.easeInOut(duration: 0.18)) { sidebarVisible.toggle() }
+            } label: {
+                Image(systemName: "sidebar.left").frame(width: 28, height: 28).contentShape(Rectangle())
+            }.buttonStyle(.plain)
+                .help(sidebarVisible ? "Collapse sidebar" : "Expand sidebar")
+                .accessibilityLabel(sidebarVisible ? "Collapse sidebar" : "Expand sidebar")
+                .keyboardShortcut("s", modifiers: [.command, .control])
             Image(systemName: model.focus == nil ? "square.grid.2x2" : "person.crop.circle")
                 .foregroundStyle(Palette.secondary)
             Text(model.focus ?? "All accounts").font(.system(size: 13, weight: .medium))
             Spacer()
-            if model.refreshingUsage {
+            HStack(spacing: 10) {
                 ProgressView().controlSize(.small)
                 Text("Reading usage…").font(.system(size: 11)).foregroundStyle(Palette.secondary)
-            }
+            }.opacity(model.refreshingUsage ? 1 : 0).accessibilityHidden(!model.refreshingUsage)
             Toggle("Auto refresh", isOn: $model.autoRefreshUsage)
                 .toggleStyle(.switch).controlSize(.mini).tint(Palette.green)
                 .font(.system(size: 11)).foregroundStyle(Palette.secondary)
-                .onChange(of: model.autoRefreshUsage) { _, enabled in if enabled { model.refreshUsage() } }
                 .help("Refresh usage every minute while this app is open")
             Button { model.refreshUsage(force: true) } label: {
                 Label("Refresh usage", systemImage: "arrow.clockwise")
@@ -334,7 +414,7 @@ struct ContentView: View {
                     Text("DAILY LEFT").frame(width: 124, alignment: .leading)
                     Text("WEEKLY LEFT").frame(width: 124, alignment: .leading)
                     Text("STATUS").frame(width: 118, alignment: .leading)
-                    Text("ACTIONS").frame(width: 88, alignment: .trailing)
+                    Text("ACTIONS").frame(width: AccountRowActions.width, alignment: .trailing)
                 }.font(.system(size: 9, weight: .medium)).tracking(0.8)
                     .foregroundStyle(Palette.secondary).padding(.horizontal, 18).padding(.vertical, 14)
                 Rectangle().fill(Palette.line).frame(height: 1)
@@ -386,30 +466,7 @@ struct ContentView: View {
             QuotaMeter(window: account.usage.daily, stale: account.usage.status == "stale", compact: true).frame(width: 124)
             QuotaMeter(window: account.usage.weekly, stale: account.usage.status == "stale", compact: true).frame(width: 124)
             StatusPill(label: account.usage.label, active: account.usage.available).frame(width: 118, alignment: .leading)
-            HStack(spacing: 10) {
-                Group {
-                    Button { model.useForNewChats(account) } label: { Image(systemName: "arrow.triangle.swap") }
-                        .help("Use \(account.name) for new chats; existing sessions stay unchanged")
-                        .accessibilityLabel("Use \(account.name) for new chats")
-                        .disabled(model.snapshot.selected == account.name || !account.saved_login)
-                    Button { model.chooseChat(account) } label: { Image(systemName: "arrow.uturn.right") }
-                        .help("Choose a stopped chat to resume with \(account.name)")
-                        .accessibilityLabel("Resume chat with \(account.name)")
-                        .disabled(!account.saved_login)
-                }.opacity(hoveredAccount == account.name ? 1 : 0)
-                Menu {
-                    Button("Open profile") { model.focus = account.name }
-                    Button("Use for new chats") { model.useForNewChats(account) }
-                        .disabled(!account.saved_login || model.snapshot.selected == account.name)
-                    Button("Resume chat with…") { model.chooseChat(account) }.disabled(!account.saved_login)
-                    Divider()
-                    Button("Remove profile…", role: .destructive) { model.removing = account }
-                        .disabled(model.inUse(account))
-                } label: { Image(systemName: "ellipsis") }
-                    .menuStyle(.borderlessButton).menuIndicator(.hidden).fixedSize()
-                    .accessibilityLabel("Actions for \(account.name)")
-            }.buttonStyle(.plain).font(.system(size: 12)).frame(width: 88, alignment: .trailing)
-                .disabled(model.blocked)
+            AccountRowActions(account: account, revealed: hoveredAccount == account.name)
         }.padding(.horizontal, 18).padding(.vertical, 19).contentShape(Rectangle())
             .background(hoveredAccount == account.name ? Palette.hover.opacity(0.35) : .clear)
     }
@@ -562,6 +619,7 @@ struct AddAccountView: View {
     }
 }
 
+#if !APP_MODEL_TESTS
 @main struct DevinSwitchApp: App {
     @StateObject private var model = AppModel()
     var body: some Scene {
@@ -581,3 +639,4 @@ struct AddAccountView: View {
         }
     }
 }
+#endif

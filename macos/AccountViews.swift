@@ -1,12 +1,12 @@
 import SwiftUI
 
-struct QuotaWindow: Decodable {
+struct QuotaWindow: Decodable, Equatable {
     let used_percent: Double?
     let resets_at: Double?
     let state: String
 }
 
-struct AccountUsage: Decodable {
+struct AccountUsage: Decodable, Equatable {
     let status: String
     let daily: QuotaWindow
     let weekly: QuotaWindow
@@ -27,7 +27,7 @@ struct AccountUsage: Decodable {
     }
 }
 
-struct Account: Decodable, Identifiable {
+struct Account: Decodable, Equatable, Identifiable {
     let name: String
     let chrome_profile: String?
     let saved_login: Bool
@@ -35,7 +35,7 @@ struct Account: Decodable, Identifiable {
     var id: String { name }
 }
 
-struct ChromeProfile: Decodable, Identifiable {
+struct ChromeProfile: Decodable, Equatable, Identifiable {
     let directory: String
     let name: String
     let email: String
@@ -44,7 +44,7 @@ struct ChromeProfile: Decodable, Identifiable {
     var prefix: String { "\(name) \(email)".lowercased().contains("nayanshi") ? "nayanshi" : "ansuman" }
 }
 
-struct SessionRun: Decodable, Identifiable {
+struct SessionRun: Decodable, Equatable, Identifiable {
     let id: String
     let account: String
     let project: String
@@ -54,7 +54,7 @@ struct SessionRun: Decodable, Identifiable {
     let active: Bool
 }
 
-struct SavedSession: Decodable, Identifiable {
+struct SavedSession: Decodable, Equatable, Identifiable {
     let id: String
     let title: String?
     let project: String
@@ -64,7 +64,7 @@ struct SavedSession: Decodable, Identifiable {
     var name: String { title.flatMap { $0.isEmpty ? nil : $0 } ?? id }
 }
 
-struct Snapshot: Decodable {
+struct Snapshot: Decodable, Equatable {
     var accounts: [Account] = []
     var selected: String?
     var profiles: [ChromeProfile] = []
@@ -104,6 +104,51 @@ struct MonoButton: ButtonStyle {
             .foregroundStyle(primary ? Palette.background : Palette.text)
             .background(primary ? Palette.text : Palette.hover, in: RoundedRectangle(cornerRadius: 7))
             .opacity(!enabled ? 0.35 : configuration.isPressed ? 0.65 : 1)
+    }
+}
+
+struct RowActionLabelStyle: LabelStyle {
+    func makeBody(configuration: Configuration) -> some View {
+        VStack(spacing: 4) {
+            configuration.icon
+            configuration.title.font(.system(size: 10, weight: .medium)).lineLimit(1)
+        }.frame(width: 48, height: 40).contentShape(Rectangle())
+    }
+}
+
+struct AccountRowActions: View {
+    @EnvironmentObject var model: AppModel
+    let account: Account
+    let revealed: Bool
+    static let width: CGFloat = 128
+
+    var body: some View {
+        HStack(spacing: 8) {
+            Group {
+                Button { model.useForNewChats(account) } label: {
+                    Label("Switch", systemImage: "arrow.triangle.swap")
+                }.disabled(model.snapshot.selected == account.name || !account.saved_login)
+                    .help(!account.saved_login ? "Switch — sign in to \(account.name) first" : model.snapshot.selected == account.name ? "Switch — \(account.name) is already the default for new chats" : "Switch — use \(account.name) for new chats; existing sessions stay unchanged")
+                    .accessibilityLabel("Switch to \(account.name) for new chats")
+                Button { model.chooseChat(account) } label: {
+                    Label("Resume", systemImage: "arrow.uturn.right")
+                }.disabled(!account.saved_login)
+                    .help(account.saved_login ? "Resume — choose a stopped chat to continue with \(account.name)" : "Resume — sign in to \(account.name) first")
+                    .accessibilityLabel("Resume chat with \(account.name)")
+            }.labelStyle(RowActionLabelStyle()).opacity(revealed ? 1 : 0).allowsHitTesting(revealed)
+            Menu {
+                Button("Open profile") { model.focus = account.name }
+                Button("Use for new chats") { model.useForNewChats(account) }
+                    .disabled(!account.saved_login || model.snapshot.selected == account.name)
+                Button("Resume chat with…") { model.chooseChat(account) }.disabled(!account.saved_login)
+                Divider()
+                Button("Remove profile…", role: .destructive) { model.removing = account }
+                    .disabled(model.inUse(account))
+            } label: { Image(systemName: "ellipsis") }
+                .menuStyle(.borderlessButton).menuIndicator(.hidden).fixedSize()
+                .accessibilityLabel("Actions for \(account.name)")
+        }.buttonStyle(.plain).font(.system(size: 12)).frame(width: Self.width, alignment: .trailing)
+            .disabled(model.blocked)
     }
 }
 

@@ -1,4 +1,4 @@
-.PHONY: format lint test pre-commit
+.PHONY: format lint test pre-commit app
 
 format:
 	uv run ruff format .
@@ -11,3 +11,7 @@ test:
 	uv run pytest -q --tb=short
 
 pre-commit: format lint test
+
+app:
+	uv tool install --force --python 3.11 .
+	uv run python scripts/build_app.py

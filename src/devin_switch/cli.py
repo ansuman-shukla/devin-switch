@@ -18,6 +18,7 @@ def parser() -> argparse.ArgumentParser:
         prog="ds", description="Switch saved Devin CLI accounts and retain local conversations."
     )
     commands = root.add_subparsers(dest="command", required=True)
+    commands.add_parser("gui", help="Open the native Mac account manager")
     add = commands.add_parser("add", help="Register an account; does not sign in")
     add.add_argument("account")
     add.add_argument("--chrome-profile", help='Chrome directory identifier, e.g. "Profile 1"')
@@ -86,6 +87,12 @@ def verify(native: Native, first: Account, second: Account) -> None:
 
 
 def execute(args: argparse.Namespace, store: Store) -> int:
+    if args.command == "gui":
+        app = Path.home() / "Applications" / "Devin Switch.app"
+        if not app.is_dir():
+            raise SwitchError("The Mac app is not installed. Run make app in the source project.")
+        subprocess.run(("/usr/bin/open", str(app)), check=True, timeout=15)
+        return 0
     if args.command == "profiles":
         for profile in browser.profiles():
             print(f"{profile.directory:<14} {profile.name:<24} {profile.email}")

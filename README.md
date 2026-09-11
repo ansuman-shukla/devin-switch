@@ -9,6 +9,48 @@ This version provides explicit switching. It does not automatically detect quota
 exhaustion or retry an interrupted agent. `ds next` cycles through saved logins;
 it does not know whether those accounts have quota remaining.
 
+## Mac app
+
+Open **Devin Switch** from your user Applications folder, or run:
+
+```sh
+ds gui
+```
+
+The app uses the same saved accounts as the CLI. You do not need to enroll them again.
+
+1. Select an account in the sidebar. **Use account** makes it the CLI's active account.
+2. **Choose folder…** selects your project and remembers it for next time.
+3. **Start new** opens a fresh conversation in Terminal. **Resume latest** continues
+   the latest conversation in that folder using the account displayed in the app.
+4. Exit the Terminal session before switching. **Next account** selects another
+   saved login, then you can resume your work.
+
+**Add account** lets you enter a local alias and select a Chrome profile by its name,
+directory identifier, and email. Select the new account and click **Sign in**;
+complete authentication in Terminal. The account list refreshes automatically.
+The email in the picker identifies the Chrome profile, not necessarily the Devin
+account selected during sign-in.
+
+**Login saved** indicates local credentials are present. **Check login** asks the
+native CLI to check that saved login. Neither label reports remaining quota.
+If Resume finds no conversation, it tells you to choose Start new first.
+
+The native SwiftUI app talks to the Python package over stdin/stdout, without a web
+server. It never receives authentication tokens. Coding and login run in normal
+Terminal windows. This app manages CLI accounts; it does not change the Desktop IDE.
+
+To rebuild and install the app locally (requires Apple's Swift command-line tools):
+
+```sh
+make app
+```
+
+This installs the CLI with uv and builds `~/Applications/Devin Switch.app` for the
+current Mac architecture, targeting macOS 14+. The app stores the chosen project
+folder in its preferences and the terminal launch scripts in the private ds state
+directory. Those scripts contain paths and aliases, not credentials.
+
 ## Install
 
 Requires macOS, Python 3.11+, [uv](https://docs.astral.sh/uv/), and Devin CLI.
@@ -169,10 +211,16 @@ Authentication format and commands are based on Devin's
 [command reference](https://docs.devin.ai/cli/reference/commands). Saved-login status
 is not a live quota or billing check.
 
-Validated on macOS with Devin Desktop 3.9.19 and bundled CLI 3000.6.19. The suite
-passed 27 tests including the installed-CLI isolation/history test. On September 11,
+Validated on macOS with Devin Desktop 3.9.19 and bundled CLI 3000.6.19. On September 11,
 2026, a live conversation was started under account A, resumed under account B,
 and resumed again under A. Both resumed requests correctly recalled the phrase
 from the first message without repeating it in the follow-up prompts. No new
 browser login was needed. This verifies a small conversation across the two enrolled
 accounts, not recovery of interrupted tool calls or automatic quota detection.
+
+The GUI was checked with the two saved accounts: switching, Chrome profile selection,
+invalid-alias handling, native folder selection, empty-history feedback, Terminal
+launching, and disabling actions during a running CLI session. The GUI bridge tests
+also cover private state, failed switching, project validation, correct resume
+arguments, and shell quoting for paths containing spaces, quotes, and substitution
+characters.

@@ -209,6 +209,24 @@ def test_usage_refresh_works_while_cli_busy_and_isolates_account_errors(
     assert result["state"]["busy"] is True
 
 
+@pytest.mark.parametrize("elapsed", [59.9, 60.0, 60.1])
+def test_forced_desktop_tick_reads_fresh_usage_near_cache_boundary(
+    store: Store, monkeypatch: pytest.MonkeyPatch, elapsed: float
+) -> None:
+    save_credentials(store)
+    monkeypatch.setattr(desktop.browser, "profiles", lambda: ())
+    monkeypatch.setattr(usage.time, "time", lambda: NOW)
+    monkeypatch.setattr(usage, "fetch_status", lambda _: response())
+    first = desktop.action(store, {"action": "usage", "force": "true"})
+    assert first["state"]["accounts"][0]["usage"]["daily"]["used_percent"] == 25
+    monkeypatch.setattr(usage.time, "time", lambda: NOW + elapsed)
+    monkeypatch.setattr(usage, "fetch_status", lambda _: response(dailyQuotaRemainingPercent=50))
+    refreshed = desktop.action(store, {"action": "usage", "force": "true"})
+    reading = refreshed["state"]["accounts"][0]["usage"]
+    assert reading["daily"]["used_percent"] == 50
+    assert reading["fetched_at"] == NOW + elapsed
+
+
 def test_reset_boundary_marks_even_recent_cache_stale(
     store: Store, monkeypatch: pytest.MonkeyPatch
 ) -> None:

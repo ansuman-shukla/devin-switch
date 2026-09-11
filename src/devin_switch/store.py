@@ -52,14 +52,16 @@ class Store:
     root: Path
 
     @contextmanager
-    def lock(self) -> Iterator[None]:
+    def lock(self, filename: str = "lock") -> Iterator[None]:
         private_directory(self.root)
-        with open(self.root / "lock", "a", opener=private_opener) as handle:
+        with open(self.root / filename, "a", opener=private_opener) as handle:
             try:
                 fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
             except BlockingIOError as exc:
                 raise SwitchError(
-                    "Another ds command is active. Finish it before switching."
+                    "Another usage refresh is active. Try again shortly."
+                    if filename == "usage.lock"
+                    else "Another ds command is active. Finish it before switching."
                 ) from exc
             try:
                 yield
@@ -99,6 +101,20 @@ class Store:
         account = self.account(name)
         self.prepare(account)
         return account
+
+    def rename(self, account: Account, name: str) -> Account:
+        destination = self.directory(name)
+        if destination.exists():
+            raise SwitchError(f"Account {name!r} already exists; its login has been preserved.")
+        try:
+            selected = (self.root / "selected").read_text().strip() == account.name
+        except FileNotFoundError:
+            selected = False
+        self.directory(account.name).rename(destination)
+        renamed = self.account(name)
+        if selected:
+            self.select(renamed)
+        return renamed
 
     def prepare(self, account: Account) -> None:
         base = self.directory(account.name)

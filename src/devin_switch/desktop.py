@@ -10,7 +10,7 @@ import uuid
 from dataclasses import asdict
 from pathlib import Path
 
-from devin_switch import browser
+from devin_switch import browser, enrollment, usage
 from devin_switch.cli import choose_next, selected_name
 from devin_switch.native import Native, find_binary
 from devin_switch.store import Store, SwitchError, private_directory
@@ -42,6 +42,7 @@ def snapshot(store: Store) -> dict[str, object]:
             {
                 "name": account.name,
                 "chrome_profile": account.chrome_profile,
+                "usage": asdict(usage.read_cached(store, account)),
                 "saved_login": (
                     not store.credentials(account).is_symlink()
                     and store.credentials(account).is_file()
@@ -97,7 +98,18 @@ def action(store: Store, request: dict[str, object]) -> dict[str, object]:
     operation = string_field(request, "action")
     if operation == "state":
         return {"state": snapshot(store)}
+    if operation == "usage":
+        usage.refresh_all(store, force=request.get("force") == "true")
+        return {"state": snapshot(store)}
     with store.lock():
+        if operation == "import":
+            added, renamed = enrollment.import_profiles(store, browser.profiles())
+            return {
+                "message": (
+                    f"Added {added} accounts and renamed {renamed}. "
+                    "Sign in to each new account to see usage."
+                )
+            }
         if operation == "add":
             name = string_field(request, "account")
             profile = request.get("chrome_profile")

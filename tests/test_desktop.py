@@ -22,7 +22,7 @@ def test_snapshot_shows_accounts_while_cli_is_busy_without_exposing_tokens(
         state = desktop.snapshot(store)
         assert state["busy"] is True
         assert state["selected"] == "ansuman-2"
-        assert state["accounts"] == (
+        assert tuple({k: v for k, v in a.items() if k != "usage"} for a in state["accounts"]) == (
             {"name": "ansuman-1", "chrome_profile": None, "saved_login": True},
             {"name": "ansuman-2", "chrome_profile": None, "saved_login": True},
         )

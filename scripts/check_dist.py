@@ -16,7 +16,16 @@ def safe_member(name: str) -> PurePosixPath:
     path = PurePosixPath(name)
     if path.is_absolute() or ".." in path.parts or "\\" in name:
         raise ValueError(f"Unsafe archive path: {name}")
-    forbidden = {".git", ".venv", "__pycache__", "credentials.toml", "accounts", "shared", "runs"}
+    forbidden = {
+        ".git",
+        ".venv",
+        "__pycache__",
+        "credentials.toml",
+        "accounts",
+        "shared",
+        "runs",
+        "handoffs",
+    }
     if any(part in forbidden or part.startswith(".env") for part in path.parts):
         raise ValueError(f"Private or generated archive content: {name}")
     if path.suffix in {
@@ -86,7 +95,7 @@ def verify(directory: Path) -> None:
             cwd=root,
         )
         python = root / "tools/devin-switch/bin/python"
-        for module in ("cli", "desktop", "sessions", "usage"):
+        for module in ("cli", "desktop", "sessions", "usage", "handoff"):
             subprocess.run(
                 (str(python), "-c", f"import devin_switch.{module}"),
                 check=True,
@@ -95,6 +104,20 @@ def verify(directory: Path) -> None:
             )
         subprocess.run((str(root / "bin/ds"), "--help"), check=True, env=environment, cwd=root)
         subprocess.run((str(root / "bin/ds"), "list"), check=True, env=environment, cwd=root)
+        subprocess.run(
+            (str(root / "bin/ds"), "switch", "--setup"), check=True, env=environment, cwd=root
+        )
+        subprocess.run(
+            (
+                str(python),
+                "-c",
+                "from pathlib import Path; from devin_switch.handoff import "
+                "enabled; assert enabled(Path.cwd())",
+            ),
+            check=True,
+            env=environment,
+            cwd=root,
+        )
     print("Distributions passed: contents, licenses, secret scan, and isolated uv tool install.")
 
 

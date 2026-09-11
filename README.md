@@ -126,7 +126,51 @@ that profile. Paste the token **only into the native CLI's Terminal prompt**—n
 an issue, screenshot, README, or chat. Switch does not collect it in its own prompts.
 For native default-browser login instead, use `ds login work --default-browser`.
 
-### Switch accounts and resume a conversation
+### Switch inside a chat when an account runs out
+
+Enable the small exit hook once in your project folder, then start an updated Switch CLI:
+
+```sh
+ds switch --setup
+ds run
+```
+
+When you want to change subscriptions:
+
+1. Stop any running agent turn and wait for the input prompt.
+2. Type **`!ds switch`** and press Enter. The `!` enters Devin's local bash mode, so this
+   command needs **no model response or remaining model quota**. It checks the next saved login,
+   cycling from the account bound to this chat—not from the saved default.
+3. Wait for **Switch queued**. Press **Esc** if bash mode remains open, then **Ctrl+D** on
+   an empty input. The CLI exits cleanly and Switch reopens the **exact saved conversation
+   in the same terminal**, using the other account.
+4. Send your next message to continue. Switch does **not** automatically resend the failed
+   prompt or repeat tools; review the last saved step first.
+
+To choose an account instead of cycling, use **`!ds switch work`**. To cancel before exiting,
+use **`!ds switch --cancel`**. Neither operation changes the default for other chats.
+
+This is an intentional two-step handoff, not a force-kill or automatic quota failover.
+A native `SessionEnd` hook supplies the final conversation ID, including if you used `/new`
+or `/resume` during the chat. Missing hooks, an abnormal exit, a missing conversation, or
+another open Switch chat in the same repo stop the handoff rather than guessing “latest.”
+The next account may also have exhausted its quota; saved-login acceptance is not a quota check.
+
+`--setup` adds only Switch's `SessionEnd` entry to `.devin/hooks.v1.json`, preserving existing
+hook entries. It adds no model skill, permission bypass, account data, or machine-specific path;
+outside a Switch-managed chat it does nothing. Run setup in the same folder you use for `ds run`.
+Review this project configuration before sharing it. Native CLI **3000.5.20 or newer** is needed
+for exit hooks; `/hooks` lets you confirm the hook loaded. Setup does not retrofit an already-open
+CLI: exit once and start a fresh `ds run`, optionally with `-- --resume SESSION_ID`.
+
+The saved transcript survives, but unsent text and in-memory state such as tool shells are not
+transferred to the new process. Sandbox, permission-mode, explicit config, and export launch
+options are retained; initial prompts and prompt files are not replayed, and the initial
+`--model` override is dropped so native resume can use the conversation's saved model.
+Non-interactive commands and unsupported native options cannot queue a handoff; ordinary
+`ds run` argument forwarding still works unchanged.
+
+### Switch accounts and resume from the shell
 
 First exit CLI chats running in the target project. Then, from the same project directory:
 
@@ -178,6 +222,9 @@ CLI removal requires explicit confirmation: `ds remove work --yes`.
 | `ds status [ALIAS]` | Check a saved login with the native CLI |
 | `ds use ALIAS` | Change the default for future launches |
 | `ds next` | Select another profile with a saved login; does not measure quota |
+| `ds switch --setup` | Enable the project exit hook before starting a chat |
+| `!ds switch [ALIAS]` | In-chat bash command: queue a same-terminal handoff, then exit with Ctrl+D |
+| `!ds switch --cancel` | Cancel this chat's queued handoff |
 | `ds run [--account ALIAS] -- ARGS` | Launch Devin CLI with the selected profile |
 | `ds sessions` | List shared history for the current project |
 | `ds verify FIRST SECOND` | Check A → B → A login and local-history visibility |
@@ -198,6 +245,7 @@ accounts/<alias>/cache/
 shared/cli/sessions.db
 shared/summaries/
 runs/
+handoffs/
 launchers/
 selected
 ```

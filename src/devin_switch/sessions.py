@@ -154,7 +154,12 @@ def resume_arguments(
 
 @contextmanager
 def managed(
-    native: Native, name: str | None, arguments: tuple[str, ...], *, kind: str = "chat"
+    native: Native,
+    name: str | None,
+    arguments: tuple[str, ...],
+    *,
+    kind: str = "chat",
+    can_handoff: bool = False,
 ) -> Iterator[tuple[Native, Account, tuple[str, ...]]]:
     store = native.store
     with ExitStack() as stack:
@@ -174,6 +179,9 @@ def managed(
             private_directory(directory)
             write_json(directory / f"{run.id}.json", asdict(run))
         try:
-            yield replace(native, lock_fds=(account_fd, run_fd)), account, arguments
+            runner = replace(
+                native, lock_fds=(account_fd, run_fd), run_id=run.id if can_handoff else None
+            )
+            yield runner, account, arguments
         finally:
             write_json(directory / f"{run.id}.json", asdict(replace(run, ended_at=time.time())))

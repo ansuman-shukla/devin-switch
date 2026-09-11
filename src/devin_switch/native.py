@@ -5,6 +5,7 @@ import os
 import re
 import shutil
 import subprocess
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -52,18 +53,29 @@ class Native:
     store: Store
     binary: Path
     lock_fds: tuple[int, ...] = ()
+    run_id: str | None = None
 
     def environment(self, account: Account) -> dict[str, str]:
         self.store.prepare(account)
         base = self.store.directory(account.name)
-        return {
-            **{key: value for key, value in os.environ.items() if key not in AUTH_ENVIRONMENT},
+        excluded = AUTH_ENVIRONMENT | {"DS_RUN_ID", "DS_EXECUTABLE", "DS_FROZEN"}
+        environment = {
+            **{key: value for key, value in os.environ.items() if key not in excluded},
             "XDG_DATA_HOME": str(base / "data"),
             "XDG_CONFIG_HOME": str(base / "config"),
             "XDG_CACHE_HOME": str(base / "cache"),
             "XDG_STATE_HOME": str(base / "state"),
             "CHISEL_SESSION_DB": str(self.store.root / "shared/cli/sessions.db"),
+            "DS_HOME": str(self.store.root),
+            "DS_BINARY": str(self.binary),
         }
+        if self.run_id:
+            environment.update(
+                DS_RUN_ID=self.run_id,
+                DS_EXECUTABLE=sys.executable,
+                DS_FROZEN="1" if getattr(sys, "frozen", False) else "0",
+            )
+        return environment
 
     def capture(
         self, account: Account, arguments: tuple[str, ...], *, cwd: Path | None = None

@@ -8,7 +8,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-from devin_switch import browser, sessions
+from devin_switch import browser, handoff, sessions
 from devin_switch.native import Native, find_binary
 from devin_switch.store import Account, Store, SwitchError
 
@@ -35,6 +35,26 @@ def parser() -> argparse.ArgumentParser:
     use = commands.add_parser("use", help="Select an account with saved credentials")
     use.add_argument("account")
     commands.add_parser("next", help="Cycle to another saved login; does not measure quota")
+    switch = commands.add_parser(
+        "switch",
+        help="Queue an in-chat account handoff; exit with Ctrl+D to resume here",
+        description=(
+            "Inside a ds run chat, type !ds switch [ALIAS], then Ctrl+D on an empty input. "
+            "The exact saved conversation reopens here; the default account is unchanged. "
+            "Without ALIAS, cycle from this chat's account (not a quota check). "
+            "First enable the project hook with ds switch --setup, then start ds run."
+        ),
+    )
+    switch.add_argument("account", nargs="?")
+    switch_mode = switch.add_mutually_exclusive_group()
+    switch_mode.add_argument(
+        "--setup",
+        action="store_true",
+        help="Add the exit hook to this project's .devin/hooks.v1.json",
+    )
+    switch_mode.add_argument(
+        "--cancel", action="store_true", help="Cancel this chat's queued switch"
+    )
     commands.add_parser("list", help="List registered accounts and the current selection")
     commands.add_parser("profiles", help="List existing Chrome profile identifiers")
     status = commands.add_parser("status", help="Check the selected or specified saved login")
@@ -58,9 +78,9 @@ def selected_name(store: Store) -> str | None:
     return store.selected().name
 
 
-def choose_next(store: Store, native: Native) -> Account:
+def choose_next(store: Store, native: Native, *, current: str | None = None) -> Account:
     accounts = store.accounts()
-    current = selected_name(store)
+    current = selected_name(store) if current is None else current
     names = tuple(account.name for account in accounts)
     start = names.index(current) + 1 if current in names else 0
     ordered = accounts[start:] + accounts[:start]
@@ -117,31 +137,77 @@ def execute(args: argparse.Namespace, store: Store) -> int:
         kind = "login" if args.command == "login" else "chat"
         if kind == "chat" and arguments[:1] in (("auth",), ("mcp",), ("list",), ("doctor",)):
             kind = "command"
-        with sessions.managed(native, args.account, arguments, kind=kind) as (
-            runner,
-            account,
-            arguments,
-        ):
-            if args.command == "login":
-                if runner.authenticated(account):
-                    print(f"{account.name} already has a saved login; no browser needed.")
-                    return 0
-                if account.chrome_profile and not args.default_browser:
-                    print(
-                        f"Opening {account.chrome_profile}. Sign in, then paste the token into "
-                        "Devin's terminal prompt. The token is not saved by this wrapper.",
-                        flush=True,
-                    )
-                    browser.open_login(account.chrome_profile)
-                    arguments += ("--force-manual-token-flow",)
-            else:
-                print(f"Using {account.name}", file=sys.stderr, flush=True)
-            code = runner.interactive(account, arguments)
-            if args.command == "login" and not code:
-                runner.require_login(account)
-                print(f"Login saved for {account.name}. Select it with: ds use {account.name}")
-            return code
+        options = handoff.restart_options(arguments) if kind == "chat" else None
+        name = args.account
+        while True:
+            with sessions.managed(
+                native, name, arguments, kind=kind, can_handoff=options is not None
+            ) as (runner, account, arguments):
+                if args.command == "login":
+                    if runner.authenticated(account):
+                        print(f"{account.name} already has a saved login; no browser needed.")
+                        return 0
+                    if account.chrome_profile and not args.default_browser:
+                        print(
+                            f"Opening {account.chrome_profile}. Sign in, then paste the token into "
+                            "Devin's terminal prompt. The token is not saved by this wrapper.",
+                            flush=True,
+                        )
+                        browser.open_login(account.chrome_profile)
+                        arguments += ("--force-manual-token-flow",)
+                else:
+                    print(f"Using {account.name}", file=sys.stderr, flush=True)
+                    if options is not None:
+                        print(
+                            "Switch accounts here: !ds switch [alias], then Ctrl+D. "
+                            "One-time project setup: ds switch --setup",
+                            file=sys.stderr,
+                            flush=True,
+                        )
+                code = runner.interactive(account, arguments)
+                if args.command == "login" and not code:
+                    runner.require_login(account)
+                    print(f"Login saved for {account.name}. Select it with: ds use {account.name}")
+            next_launch = handoff.finish(runner, code, options)
+            if next_launch is None:
+                return code
+            name, arguments = next_launch
+            print(
+                f"Reopening the saved conversation with {name}; default account unchanged.\n"
+                "No prompt is replayed. Send your next message when ready.\n"
+                f"If reopening fails: {handoff.recovery_command(name, arguments)}",
+                file=sys.stderr,
+                flush=True,
+            )
     with store.lock():
+        if args.command == "switch":
+            if args.account and (args.setup or args.cancel):
+                raise SwitchError("Use an account alias, --setup, or --cancel, not both.")
+            if args.setup:
+                handoff.install(Path.cwd().resolve())
+                print("Exit hook enabled in .devin/hooks.v1.json. Start a fresh ds run to use it.")
+                return 0
+            run = handoff.current(store)
+            if args.cancel:
+                handoff.cancel(store, run)
+                print("Queued switch canceled. This chat's account and the default are unchanged.")
+                return 0
+            native = Native(store, find_binary())
+            account = (
+                store.account(args.account)
+                if args.account
+                else choose_next(store, native, current=run["account"])
+            )
+            with store.account_lock(account, shared=True):
+                native.require_login(account)
+                handoff.queue(store, run, account)
+            print(
+                f"Switch queued: {run['account']} → {account.name} (quota not checked).\n"
+                "Press Ctrl+D on an empty input to exit and reopen this conversation here.\n"
+                "If bash mode remains open, press Esc first. Cancel with !ds switch --cancel.\n"
+                "The saved default is unchanged; your last prompt will not be replayed."
+            )
+            return 0
         if args.command == "remove":
             if not args.yes:
                 raise SwitchError("Confirm profile removal with ds remove <alias> --yes.")
@@ -193,10 +259,16 @@ def execute(args: argparse.Namespace, store: Store) -> int:
 
 
 def main() -> int:
-    args = parser().parse_args()
     root = Path(os.environ.get("DS_HOME", "~/.local/share/devin-switch")).expanduser().resolve()
     try:
-        return execute(args, Store(root))
+        if sys.argv[1:] == ["_session-end"]:
+            try:
+                event = json.loads(sys.stdin.read(65536))
+            except ValueError as exc:
+                raise SwitchError("Invalid session-end hook payload.") from exc
+            handoff.record_exit(Store(root), event)
+            return 0
+        return execute(parser().parse_args(), Store(root))
     except SwitchError as exc:
         print(f"ds: {exc}", file=sys.stderr)
         return 1

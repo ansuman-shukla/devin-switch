@@ -30,6 +30,7 @@ credentials.toml
 /accounts/
 /shared/
 /runs/
+/handoffs/
 /launchers/
 /selected
 

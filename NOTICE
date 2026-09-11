@@ -1,0 +1,11 @@
+Devin Switch
+Copyright 2026 Devin Switch contributors
+
+Licensed under the Apache License, Version 2.0.
+
+This is an independent community project, not an official Cognition product.
+Devin and Windsurf are trademarks of their respective owners.
+The Devin CLI is installed separately and is not included in this distribution.
+
+Portable macOS builds include Python and the PyInstaller bootloader under
+ their respective licenses, included in Contents/Resources/Licenses.

@@ -4,6 +4,7 @@ import fcntl
 import json
 import os
 import re
+import shutil
 import tempfile
 from collections.abc import Iterator
 from contextlib import contextmanager
@@ -52,21 +53,37 @@ class Store:
     root: Path
 
     @contextmanager
-    def lock(self, filename: str = "lock") -> Iterator[None]:
+    def lock(self, filename: str = "lock", *, shared: bool = False) -> Iterator[int]:
         private_directory(self.root)
         with open(self.root / filename, "a", opener=private_opener) as handle:
             try:
-                fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                fcntl.flock(handle, (fcntl.LOCK_SH if shared else fcntl.LOCK_EX) | fcntl.LOCK_NB)
             except BlockingIOError as exc:
-                raise SwitchError(
-                    "Another usage refresh is active. Try again shortly."
-                    if filename == "usage.lock"
-                    else "Another ds command is active. Finish it before switching."
-                ) from exc
+                if filename.startswith("account-"):
+                    message = (
+                        "This profile is in use. Close its sessions or wait for usage refresh."
+                    )
+                elif filename == "usage.lock":
+                    message = "Another usage refresh is active. Try again shortly."
+                else:
+                    message = "Another ds command is active. Finish it before switching."
+                raise SwitchError(message) from exc
+            yield handle.fileno()
+
+    def account_lock(self, account: Account, *, shared: bool = False):
+        return self.lock(f"account-{validate_name(account.name)}.lock", shared=shared)
+
+    def locked(self, filename: str) -> bool:
+        try:
+            handle = (self.root / filename).open("r")
+        except FileNotFoundError:
+            return False
+        with handle:
             try:
-                yield
-            finally:
-                fcntl.flock(handle, fcntl.LOCK_UN)
+                fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                return True
+        return False
 
     def directory(self, name: str) -> Path:
         return self.root / "accounts" / validate_name(name)
@@ -103,18 +120,32 @@ class Store:
         return account
 
     def rename(self, account: Account, name: str) -> Account:
-        destination = self.directory(name)
-        if destination.exists():
-            raise SwitchError(f"Account {name!r} already exists; its login has been preserved.")
+        with self.account_lock(account):
+            destination = self.directory(name)
+            if destination.exists():
+                raise SwitchError(f"Account {name!r} already exists; its login has been preserved.")
+            selected = self.is_selected(account)
+            self.directory(account.name).rename(destination)
+            renamed = self.account(name)
+            if selected:
+                self.select(renamed)
+            return renamed
+
+    def is_selected(self, account: Account) -> bool:
         try:
-            selected = (self.root / "selected").read_text().strip() == account.name
+            return (self.root / "selected").read_text().strip() == account.name
         except FileNotFoundError:
-            selected = False
-        self.directory(account.name).rename(destination)
-        renamed = self.account(name)
-        if selected:
-            self.select(renamed)
-        return renamed
+            return False
+
+    def remove(self, account: Account) -> None:
+        with self.account_lock(account):
+            folder = self.directory(account.name)
+            if folder.is_symlink():
+                raise SwitchError("Refusing to remove a linked account directory.")
+            selected = self.is_selected(account)
+            shutil.rmtree(folder)
+            if selected:
+                (self.root / "selected").unlink(missing_ok=True)
 
     def prepare(self, account: Account) -> None:
         base = self.directory(account.name)

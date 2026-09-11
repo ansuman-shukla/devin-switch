@@ -241,7 +241,11 @@ def refresh_account(store: Store, account: Account, *, force: bool = False) -> U
 
 def refresh_all(store: Store, *, force: bool = False) -> None:
     def refresh(account: Account) -> None:
-        refresh_account(store, account, force=force)
+        try:
+            with store.account_lock(account, shared=True):
+                refresh_account(store, account, force=force)
+        except SwitchError:
+            return
 
     with store.lock("usage.lock"), ThreadPoolExecutor(max_workers=4) as executor:
         tuple(executor.map(refresh, store.accounts()))

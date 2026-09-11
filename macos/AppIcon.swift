@@ -12,14 +12,14 @@ func drawIcon(pixels: Int, at url: URL) throws {
     transform.concat()
     let background = NSBezierPath(roundedRect: NSRect(x: 45, y: 45, width: 934, height: 934), xRadius: 210, yRadius: 210)
     NSGradient(colors: [
-        NSColor(srgbRed: 0.09, green: 0.19, blue: 0.17, alpha: 1),
-        NSColor(srgbRed: 0.17, green: 0.40, blue: 0.33, alpha: 1)
+        NSColor(white: 0.08, alpha: 1),
+        NSColor(white: 0.21, alpha: 1)
     ])!.draw(in: background, angle: 65)
     let symbol = NSImage(systemSymbolName: "arrow.triangle.swap", accessibilityDescription: nil)!
         .withSymbolConfiguration(NSImage.SymbolConfiguration(pointSize: 490, weight: .semibold))!
     let colored = NSImage(size: symbol.size)
     colored.lockFocus()
-    NSColor(srgbRed: 0.69, green: 0.91, blue: 0.78, alpha: 1).setFill()
+    NSColor(white: 0.9, alpha: 1).setFill()
     NSRect(origin: .zero, size: symbol.size).fill()
     symbol.draw(at: .zero, from: .zero, operation: .destinationIn, fraction: 1)
     colored.unlockFocus()

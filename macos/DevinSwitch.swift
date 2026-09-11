@@ -1,37 +1,6 @@
 import AppKit
 import SwiftUI
 
-struct Account: Decodable, Identifiable {
-    let name: String
-    let chrome_profile: String?
-    let saved_login: Bool
-    var id: String { name }
-}
-
-struct ChromeProfile: Decodable, Identifiable {
-    let directory: String
-    let name: String
-    let email: String
-    var id: String { directory }
-    var label: String { "\(name) · \(directory)\(email.isEmpty ? "" : " · \(email)")" }
-}
-
-struct Snapshot: Decodable {
-    var accounts: [Account] = []
-    var selected: String?
-    var profiles: [ChromeProfile] = []
-    var chrome_error: String?
-    var busy: Bool = false
-}
-
-struct Reply: Decodable {
-    let ok: Bool
-    let state: Snapshot?
-    let message: String?
-    let launcher: String?
-    let focus: String?
-}
-
 struct BridgeConfiguration: Decodable {
     let python: String
 }
@@ -44,15 +13,20 @@ enum BridgeError: LocalizedError {
 }
 
 func callBridge(_ payload: [String: String]) throws -> Reply {
-    guard let configURL = Bundle.main.url(forResource: "bridge", withExtension: "json") else {
-        throw BridgeError.message("The app is missing its local CLI connection. Run make app again.")
-    }
-    let configuration = try JSONDecoder().decode(
-        BridgeConfiguration.self, from: Data(contentsOf: configURL)
-    )
     let process = Process()
-    process.executableURL = URL(fileURLWithPath: configuration.python)
-    process.arguments = ["-m", "devin_switch.desktop"]
+    let runtime = Bundle.main.bundleURL.appendingPathComponent("Contents/Resources/ds-runtime/ds-runtime")
+    if FileManager.default.isExecutableFile(atPath: runtime.path) {
+        process.executableURL = runtime
+        process.arguments = ["--desktop-bridge"]
+    } else if let configURL = Bundle.main.url(forResource: "bridge", withExtension: "json") {
+        let configuration = try JSONDecoder().decode(
+            BridgeConfiguration.self, from: Data(contentsOf: configURL)
+        )
+        process.executableURL = URL(fileURLWithPath: configuration.python)
+        process.arguments = ["-m", "devin_switch.desktop"]
+    } else {
+        throw BridgeError.message("The app is missing its CLI runtime. Reinstall the app or run make app.")
+    }
     process.currentDirectoryURL = FileManager.default.homeDirectoryForCurrentUser
     let input = Pipe()
     let output = Pipe()
@@ -78,10 +52,26 @@ func callBridge(_ payload: [String: String]) throws -> Reply {
     @Published var failed = false
     @Published var adding = false
     @Published var addError = ""
+    @Published var refreshingUsage = false
+    @Published var removing: Account?
+    @Published var resuming: Account?
+    @AppStorage("autoRefreshUsage") var autoRefreshUsage = true
     @AppStorage("projectFolder") var project = ""
 
     var account: Account? { snapshot.accounts.first { $0.name == focus } }
     var blocked: Bool { working || snapshot.busy }
+    var openChats: [SessionRun] { snapshot.runs.filter { $0.active && $0.kind == "chat" } }
+    func openCount(_ account: Account) -> Int { openChats.filter { $0.account == account.name }.count }
+    func inUse(_ account: Account) -> Bool { snapshot.runs.contains { $0.active && $0.account == account.name } }
+
+    func useForNewChats(_ account: Account) {
+        perform(["action": "select", "account": account.name])
+    }
+
+    func chooseChat(_ account: Account) {
+        failed = false
+        resuming = account
+    }
 
     func refresh() {
         guard !working else { return }
@@ -105,8 +95,8 @@ func callBridge(_ payload: [String: String]) throws -> Reply {
                 } else {
                     if let state = reply.state {
                         snapshot = state
-                        if focus == nil || !state.accounts.contains(where: { $0.name == focus }) {
-                            focus = state.selected ?? state.accounts.first?.name
+                        if let focus, !state.accounts.contains(where: { $0.name == focus }) {
+                            self.focus = nil
                         }
                     }
                     if let newFocus = reply.focus { focus = newFocus }
@@ -119,15 +109,55 @@ func callBridge(_ payload: [String: String]) throws -> Reply {
                         addError = ""
                         focus = payload["account"]
                     }
-                    if let path = reply.launcher { openTerminal(path) }
+                    if let path = reply.launcher {
+                        if operation == "resume_session" { resuming = nil }
+                        openTerminal(path)
+                    }
                 }
             } catch {
                 failed = true
                 message = error.localizedDescription
             }
             working = false
-            if operation != "state" { refresh() }
+            if operation != "state" { refresh(); refreshUsage() }
         }
+    }
+
+    func refreshUsage(force: Bool = false) {
+        guard !refreshingUsage else { return }
+        refreshingUsage = true
+        Task {
+            do {
+                let payload = ["action": "usage", "force": force ? "true" : "false"]
+                let reply = try await Task.detached { try callBridge(payload) }.value
+                if reply.ok {
+                    if let state = reply.state {
+                        for index in snapshot.accounts.indices {
+                            if let updated = state.accounts.first(where: { $0.name == snapshot.accounts[index].name }) {
+                                snapshot.accounts[index].usage = updated.usage
+                            }
+                        }
+                    }
+                } else {
+                    failed = true
+                    message = reply.message ?? "Could not refresh usage."
+                }
+            } catch {
+                failed = true
+                message = error.localizedDescription
+            }
+            refreshingUsage = false
+            refresh()
+        }
+    }
+
+    func email(_ account: Account) -> String {
+        account.usage.email ?? snapshot.profiles.first { $0.directory == account.chrome_profile }?.email ?? ""
+    }
+
+    func suggestedName(_ profile: ChromeProfile) -> String {
+        let names = Set(snapshot.accounts.map(\.name))
+        return (1...(names.count + 1)).map { "\(profile.prefix)-\($0)" }.first { !names.contains($0) }!
     }
 
     func openTerminal(_ path: String) {
@@ -168,189 +198,312 @@ func callBridge(_ payload: [String: String]) throws -> Reply {
     }
 }
 
-let accent = Color(red: 0.20, green: 0.57, blue: 0.45)
-
-struct StatusPill: View {
-    let label: String
-    let active: Bool
-    var body: some View {
-        HStack(spacing: 5) {
-            Circle().fill(active ? accent : Color.secondary).frame(width: 6, height: 6)
-            Text(label).font(.system(size: 12, weight: .medium))
-        }
-        .padding(.horizontal, 9).padding(.vertical, 5)
-        .background((active ? accent : Color.secondary).opacity(0.10), in: Capsule())
-    }
-}
-
 struct ContentView: View {
     @EnvironmentObject var model: AppModel
-    private let timer = Timer.publish(every: 4, on: .main, in: .common).autoconnect()
+    @State private var hoveredAccount: String?
+    private let stateTimer = Timer.publish(every: 4, on: .main, in: .common).autoconnect()
+    private let usageTimer = Timer.publish(every: 60, on: .main, in: .common).autoconnect()
 
     var body: some View {
         HStack(spacing: 0) {
-            sidebar.frame(width: 252)
-            Divider()
-            VStack(alignment: .leading, spacing: 24) {
-                HStack {
-                    Text("Account workspace").font(.system(size: 13, weight: .medium)).foregroundStyle(.secondary)
-                    Spacer()
-                    if model.working { ProgressView().controlSize(.small) }
-                    Button { model.refresh() } label: { Image(systemName: "arrow.clockwise") }
-                        .buttonStyle(.plain).help("Refresh accounts").accessibilityLabel("Refresh accounts")
-                        .disabled(model.working)
+            sidebar.frame(width: 224)
+            Rectangle().fill(Palette.line).frame(width: 1)
+            VStack(spacing: 0) {
+                toolbar
+                Rectangle().fill(Palette.line).frame(height: 1)
+                ScrollView {
+                    VStack(alignment: .leading, spacing: 26) {
+                        if let account = model.account { detail(account) }
+                        else { overview }
+                    }.padding(30).frame(maxWidth: .infinity, alignment: .topLeading)
                 }
-                if let account = model.account {
-                    detail(account)
-                } else {
-                    Spacer()
-                    VStack(spacing: 14) {
-                        Image(systemName: "person.crop.circle.badge.plus").font(.system(size: 42)).foregroundStyle(accent)
-                        Text("Add your first account").font(.title2.weight(.semibold))
-                        Text("Pick a Chrome profile and sign in once to get started.")
-                            .foregroundStyle(.secondary)
-                        Button("Add account") { model.adding = true }.buttonStyle(.borderedProminent)
-                    }.frame(maxWidth: .infinity)
-                    Spacer()
-                }
-                if model.snapshot.busy {
-                    notice("A CLI session is active. Exit it in Terminal before switching accounts.", symbol: "terminal", error: false)
-                } else if !model.message.isEmpty {
-                    notice(model.message, symbol: model.failed ? "exclamationmark.circle" : "checkmark.circle", error: model.failed)
-                }
-            }
-            .padding(32).frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
-            .background(Color(nsColor: .windowBackgroundColor))
+                footer
+            }.frame(maxWidth: .infinity, maxHeight: .infinity)
         }
-        .frame(minWidth: 900, minHeight: 650)
-        .tint(accent)
+        .frame(minWidth: 1040, minHeight: 700)
+        .background(Palette.background).foregroundStyle(Palette.text)
+        .preferredColorScheme(.dark).tint(Color.gray)
         .sheet(isPresented: $model.adding) { AddAccountView().environmentObject(model) }
-        .task { model.refresh() }
-        .onReceive(timer) { _ in model.refresh() }
+        .sheet(item: $model.resuming) { account in ResumeSessionView(account: account).environmentObject(model) }
+        .alert("Remove local profile?", isPresented: Binding(
+            get: { model.removing != nil }, set: { if !$0 { model.removing = nil } }
+        ), presenting: model.removing) { account in
+            Button("Remove \(account.name)", role: .destructive) {
+                model.perform(["action": "remove", "account": account.name, "confirmed": "true"])
+            }
+            Button("Cancel", role: .cancel) { model.removing = nil }
+        } message: { account in
+            Text("This removes \(account.name)’s saved login, settings and quota cache from Devin Switch. Shared chats, repository files and the Chrome profile are kept. You will need to sign in again if you add it back.")
+        }
+        .task { model.refresh(); if model.autoRefreshUsage { model.refreshUsage() } }
+        .onReceive(stateTimer) { _ in model.refresh() }
+        .onReceive(usageTimer) { _ in if model.autoRefreshUsage { model.refreshUsage() } }
+    }
+
+    var toolbar: some View {
+        HStack(spacing: 10) {
+            Image(systemName: model.focus == nil ? "square.grid.2x2" : "person.crop.circle")
+                .foregroundStyle(Palette.secondary)
+            Text(model.focus ?? "All accounts").font(.system(size: 13, weight: .medium))
+            Spacer()
+            if model.refreshingUsage {
+                ProgressView().controlSize(.small)
+                Text("Reading usage…").font(.system(size: 11)).foregroundStyle(Palette.secondary)
+            }
+            Toggle("Auto refresh", isOn: $model.autoRefreshUsage)
+                .toggleStyle(.switch).controlSize(.mini).tint(Palette.green)
+                .font(.system(size: 11)).foregroundStyle(Palette.secondary)
+                .onChange(of: model.autoRefreshUsage) { _, enabled in if enabled { model.refreshUsage() } }
+                .help("Refresh usage every minute while this app is open")
+            Button { model.refreshUsage(force: true) } label: {
+                Label("Refresh usage", systemImage: "arrow.clockwise")
+            }.buttonStyle(MonoButton()).disabled(model.refreshingUsage)
+        }.padding(.horizontal, 24).frame(height: 60)
     }
 
     var sidebar: some View {
         VStack(alignment: .leading, spacing: 0) {
             HStack(spacing: 10) {
-                Image(systemName: "arrow.triangle.swap").font(.system(size: 23, weight: .semibold)).foregroundStyle(accent)
-                Text("Devin Switch").font(.system(size: 19, weight: .semibold))
-            }.padding(.horizontal, 22).padding(.top, 35).padding(.bottom, 30)
-            HStack {
-                Text("ACCOUNTS").font(.system(size: 11, weight: .semibold)).tracking(1.2)
+                Image(systemName: "arrow.triangle.swap").font(.system(size: 18, weight: .medium))
+                Text("Devin Switch").font(.system(size: 15, weight: .semibold))
                 Spacer()
-                Text("\(model.snapshot.accounts.count)").font(.system(size: 12, design: .monospaced))
-            }.foregroundStyle(.secondary).padding(.horizontal, 24).padding(.bottom, 12)
+            }.padding(.horizontal, 20).padding(.top, 34).padding(.bottom, 25)
+            Button { model.focus = nil } label: {
+                HStack(spacing: 10) {
+                    Image(systemName: "square.grid.2x2")
+                    Text("All accounts")
+                    Spacer()
+                    Text("\(model.snapshot.accounts.count)").foregroundStyle(Palette.secondary)
+                }.font(.system(size: 12, weight: .medium)).padding(11)
+                    .background(model.focus == nil ? Palette.hover : .clear, in: RoundedRectangle(cornerRadius: 7))
+            }.buttonStyle(.plain).padding(.horizontal, 10)
+            HStack {
+                Text("Accounts").font(.system(size: 11, weight: .medium))
+                Spacer()
+                Button { model.addError = ""; model.adding = true } label: { Image(systemName: "plus") }
+                    .buttonStyle(.plain).disabled(model.blocked).accessibilityLabel("Add account")
+            }.foregroundStyle(Palette.secondary).padding(.horizontal, 20).padding(.top, 26).padding(.bottom, 10)
             ScrollView {
-                VStack(spacing: 6) {
+                VStack(spacing: 3) {
                     ForEach(model.snapshot.accounts) { account in
                         Button { model.focus = account.name } label: {
-                            HStack(spacing: 11) {
-                                ZStack {
-                                    RoundedRectangle(cornerRadius: 10).fill(accent.opacity(0.12)).frame(width: 36, height: 36)
-                                    Text(String(account.name.prefix(1)).uppercased()).font(.system(size: 16, weight: .semibold)).foregroundStyle(accent)
-                                }
-                                VStack(alignment: .leading, spacing: 4) {
-                                    Text(account.name).font(.system(size: 14, weight: .semibold)).lineLimit(1)
-                                    Text(account.saved_login ? "Login saved" : "Sign-in needed").font(.system(size: 12)).foregroundStyle(.secondary)
-                                }
+                            HStack(spacing: 10) {
+                                Image(systemName: "person.crop.circle").foregroundStyle(Palette.secondary)
+                                Text(account.name).font(.system(size: 12)).lineLimit(1)
                                 Spacer(minLength: 0)
                                 if model.snapshot.selected == account.name {
-                                    Image(systemName: "checkmark.circle.fill").foregroundStyle(accent).help("Active account")
+                                    Circle().fill(Palette.green).frame(width: 5, height: 5)
+                                        .accessibilityLabel("Default for new chats")
                                 }
-                            }
-                            .padding(11).contentShape(Rectangle())
-                            .background(model.focus == account.name ? Color.primary.opacity(0.06) : Color.clear, in: RoundedRectangle(cornerRadius: 12))
+                            }.padding(.horizontal, 11).padding(.vertical, 10)
+                                .contentShape(Rectangle())
+                                .background(model.focus == account.name ? Palette.hover : .clear, in: RoundedRectangle(cornerRadius: 7))
                         }.buttonStyle(.plain).accessibilityLabel("Account \(account.name)")
                     }
-                }.padding(.horizontal, 12)
+                }.padding(.horizontal, 10)
             }
-            Button { model.addError = ""; model.adding = true } label: {
-                Label("Add account", systemImage: "plus").frame(maxWidth: .infinity).padding(.vertical, 4)
-            }.buttonStyle(.bordered).disabled(model.blocked).padding(20)
-            Divider().padding(.horizontal, 20)
-            HStack(spacing: 6) {
-                Image(systemName: "internaldrive")
-                Text("Saved on this Mac")
-            }.font(.system(size: 12)).foregroundStyle(.secondary).padding(22)
-        }.background(Color(nsColor: .controlBackgroundColor).opacity(0.55))
+            VStack(alignment: .leading, spacing: 16) {
+                Button { model.perform(["action": "import"]) } label: {
+                    Label("Import Chrome profiles", systemImage: "square.and.arrow.down")
+                }.buttonStyle(.plain).font(.system(size: 11)).disabled(model.blocked)
+                    .help("Add missing profiles. Nayanshi accounts use nayanshi-* names. Sign in to each new account once.")
+                HStack(spacing: 7) {
+                    Image(systemName: "internaldrive")
+                    Text("Local workspace")
+                }.font(.system(size: 10)).foregroundStyle(Palette.secondary)
+            }.padding(20)
+        }.background(Palette.sidebar)
     }
 
-    func detail(_ account: Account) -> some View {
+    var overview: some View {
         VStack(alignment: .leading, spacing: 24) {
-            VStack(alignment: .leading, spacing: 12) {
-                HStack(alignment: .center) {
-                    Text(account.name).font(.system(size: 30, weight: .semibold)).textSelection(.enabled)
-                    Spacer()
-                    if model.snapshot.selected == account.name { StatusPill(label: "Active", active: true) }
+            VStack(alignment: .leading, spacing: 8) {
+                Text("Sessions & accounts").font(.system(size: 27, weight: .semibold))
+                Text("Run chats across repositories and manage the account each launch uses.")
+                    .font(.system(size: 13)).foregroundStyle(Palette.secondary)
+            }
+            HStack(spacing: 14) {
+                summary("Accounts", value: model.snapshot.accounts.count, symbol: "person.2")
+                summary("Open chats", value: model.openChats.count, symbol: "terminal")
+                summary("Quota available", value: model.snapshot.accounts.filter { $0.usage.available }.count, symbol: "chart.bar")
+            }
+            OpenSessionsPanel()
+            VStack(spacing: 0) {
+                HStack(spacing: 22) {
+                    Text("ACCOUNT").frame(maxWidth: .infinity, alignment: .leading)
+                    Text("DAILY LEFT").frame(width: 124, alignment: .leading)
+                    Text("WEEKLY LEFT").frame(width: 124, alignment: .leading)
+                    Text("STATUS").frame(width: 118, alignment: .leading)
+                    Text("ACTIONS").frame(width: 88, alignment: .trailing)
+                }.font(.system(size: 9, weight: .medium)).tracking(0.8)
+                    .foregroundStyle(Palette.secondary).padding(.horizontal, 18).padding(.vertical, 14)
+                Rectangle().fill(Palette.line).frame(height: 1)
+                if model.snapshot.accounts.isEmpty {
+                    Text("Import your Chrome profiles or add your first account.")
+                        .font(.system(size: 13)).foregroundStyle(Palette.secondary).padding(35)
                 }
-                HStack(spacing: 8) {
-                    Image(systemName: account.saved_login ? "checkmark.shield" : "person.badge.key")
-                    Text(account.saved_login ? "Login saved" : "Sign in to use this account")
-                    Text("·").foregroundStyle(.tertiary)
-                    Text(account.chrome_profile ?? "Default browser")
-                }.font(.system(size: 13)).foregroundStyle(.secondary)
-                HStack(spacing: 10) {
-                    if !account.saved_login {
-                        Button("Sign in") { model.act("login") }.buttonStyle(.borderedProminent)
-                    } else {
-                        Button(model.snapshot.selected == account.name ? "Account active" : "Use account") { model.act("select") }
-                            .buttonStyle(.borderedProminent).disabled(model.snapshot.selected == account.name)
-                        Button("Check login") { model.act("check") }.buttonStyle(.bordered)
+                ForEach(model.snapshot.accounts) { account in
+                    accountRow(account)
+                        .onHover { hoveredAccount = $0 ? account.name : nil }
+                    if account.id != model.snapshot.accounts.last?.id {
+                        Rectangle().fill(Palette.line).frame(height: 1).padding(.horizontal, 18)
                     }
-                }.controlSize(.large).disabled(model.blocked)
-            }
-            Divider()
-            VStack(alignment: .leading, spacing: 18) {
-                HStack {
-                    Text("Project").font(.system(size: 17, weight: .semibold))
-                    Spacer()
-                    Label("Opens in Terminal", systemImage: "terminal").font(.system(size: 12)).foregroundStyle(.secondary)
                 }
-                HStack(spacing: 14) {
-                    Image(systemName: "folder").font(.system(size: 26)).foregroundStyle(accent)
-                    VStack(alignment: .leading, spacing: 5) {
-                        Text(model.project.isEmpty ? "Choose a project folder" : URL(fileURLWithPath: model.project).lastPathComponent)
-                            .font(.system(size: 14, weight: .semibold))
-                        Text(model.project.isEmpty ? "Start with the folder you want to work in." : model.project)
-                            .font(.system(size: 12)).foregroundStyle(.secondary).lineLimit(2).textSelection(.enabled)
-                    }
-                    Spacer(minLength: 10)
-                    Button("Choose folder…") { model.chooseProject() }.disabled(model.blocked)
-                }.padding(18).background(Color.primary.opacity(0.035), in: RoundedRectangle(cornerRadius: 12))
-                HStack(spacing: 10) {
-                    Button { model.act("start") } label: {
-                        Label("Start new", systemImage: "plus").frame(maxWidth: .infinity)
-                    }.buttonStyle(.borderedProminent)
-                    Button { model.act("resume") } label: {
-                        Label("Resume latest", systemImage: "arrow.uturn.right").frame(maxWidth: .infinity)
-                    }.buttonStyle(.bordered)
-                }.controlSize(.large)
-                    .disabled(model.blocked || !account.saved_login || model.project.isEmpty)
-                Text("First time in this folder? Start new and send a message. After that, you can resume with another account.")
-                    .font(.system(size: 13)).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
-            }
-            Divider()
-            HStack(alignment: .top, spacing: 20) {
-                VStack(alignment: .leading, spacing: 7) {
-                    Text("Ready to switch?").font(.system(size: 15, weight: .semibold))
-                    Text("Choose another saved login when you need it. Remaining quota isn’t checked.")
-                        .font(.system(size: 13)).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
-                }
-                Spacer(minLength: 0)
-                Button { model.perform(["action": "next"]) } label: { Label("Next account", systemImage: "arrow.right") }
-                    .controlSize(.large).disabled(model.blocked || model.snapshot.accounts.count < 2)
-            }
-            Spacer(minLength: 0)
+            }.background(Palette.panel, in: RoundedRectangle(cornerRadius: 10))
+                .overlay(RoundedRectangle(cornerRadius: 10).stroke(Palette.line))
+            Text("Quota is shared by chats on the same account. Percentages show allowance remaining, not a per-session budget. Hover for quick actions, or use the actions menu.")
+                .font(.system(size: 11)).foregroundStyle(Palette.secondary)
         }
     }
 
-    func notice(_ text: String, symbol: String, error: Bool) -> some View {
-        HStack(alignment: .top, spacing: 9) {
-            Image(systemName: symbol)
-            Text(text).fixedSize(horizontal: false, vertical: true)
-            Spacer(minLength: 0)
-        }.font(.system(size: 13)).foregroundStyle(error ? Color.red : .secondary)
-            .padding(13).background((error ? Color.red : accent).opacity(0.07), in: RoundedRectangle(cornerRadius: 10))
+    func summary(_ label: String, value: Int, symbol: String) -> some View {
+        VStack(alignment: .leading, spacing: 14) {
+            HStack {
+                Text(label).font(.system(size: 11))
+                Spacer()
+                Image(systemName: symbol).font(.system(size: 12))
+            }.foregroundStyle(Palette.secondary)
+            Text("\(value)").font(.system(size: 26, weight: .medium)).monospacedDigit()
+        }.padding(18).frame(maxWidth: .infinity, alignment: .leading)
+            .background(Palette.panel, in: RoundedRectangle(cornerRadius: 10))
+            .overlay(RoundedRectangle(cornerRadius: 10).stroke(Palette.line))
+    }
+
+    func accountRow(_ account: Account) -> some View {
+        HStack(spacing: 22) {
+            Button { model.focus = account.name } label: {
+                VStack(alignment: .leading, spacing: 6) {
+                    Text(account.name).font(.system(size: 12, weight: .medium)).lineLimit(1)
+                    Text(model.email(account)).font(.system(size: 10)).foregroundStyle(Palette.secondary).lineLimit(1)
+                    HStack(spacing: 7) {
+                        if model.snapshot.selected == account.name {
+                            Text("Default").foregroundStyle(Palette.green)
+                        }
+                        Text("\(model.openCount(account)) open").foregroundStyle(Palette.secondary)
+                    }.font(.system(size: 10))
+                }.frame(maxWidth: .infinity, alignment: .leading).contentShape(Rectangle())
+            }.buttonStyle(.plain).accessibilityLabel("Open profile \(account.name)")
+            QuotaMeter(window: account.usage.daily, stale: account.usage.status == "stale", compact: true).frame(width: 124)
+            QuotaMeter(window: account.usage.weekly, stale: account.usage.status == "stale", compact: true).frame(width: 124)
+            StatusPill(label: account.usage.label, active: account.usage.available).frame(width: 118, alignment: .leading)
+            HStack(spacing: 10) {
+                Group {
+                    Button { model.useForNewChats(account) } label: { Image(systemName: "arrow.triangle.swap") }
+                        .help("Use \(account.name) for new chats; existing sessions stay unchanged")
+                        .accessibilityLabel("Use \(account.name) for new chats")
+                        .disabled(model.snapshot.selected == account.name || !account.saved_login)
+                    Button { model.chooseChat(account) } label: { Image(systemName: "arrow.uturn.right") }
+                        .help("Choose a stopped chat to resume with \(account.name)")
+                        .accessibilityLabel("Resume chat with \(account.name)")
+                        .disabled(!account.saved_login)
+                }.opacity(hoveredAccount == account.name ? 1 : 0)
+                Menu {
+                    Button("Open profile") { model.focus = account.name }
+                    Button("Use for new chats") { model.useForNewChats(account) }
+                        .disabled(!account.saved_login || model.snapshot.selected == account.name)
+                    Button("Resume chat with…") { model.chooseChat(account) }.disabled(!account.saved_login)
+                    Divider()
+                    Button("Remove profile…", role: .destructive) { model.removing = account }
+                        .disabled(model.inUse(account))
+                } label: { Image(systemName: "ellipsis") }
+                    .menuStyle(.borderlessButton).menuIndicator(.hidden).fixedSize()
+                    .accessibilityLabel("Actions for \(account.name)")
+            }.buttonStyle(.plain).font(.system(size: 12)).frame(width: 88, alignment: .trailing)
+                .disabled(model.blocked)
+        }.padding(.horizontal, 18).padding(.vertical, 19).contentShape(Rectangle())
+            .background(hoveredAccount == account.name ? Palette.hover.opacity(0.35) : .clear)
+    }
+
+    func detail(_ account: Account) -> some View {
+        VStack(alignment: .leading, spacing: 25) {
+            HStack(alignment: .top) {
+                VStack(alignment: .leading, spacing: 9) {
+                    Text(account.name).font(.system(size: 27, weight: .semibold)).textSelection(.enabled)
+                    Text(model.email(account)).font(.system(size: 12)).foregroundStyle(Palette.secondary).textSelection(.enabled)
+                    Text([account.usage.plan, account.chrome_profile].compactMap { $0 }.joined(separator: " · "))
+                        .font(.system(size: 11)).foregroundStyle(Palette.secondary)
+                }
+                Spacer()
+                VStack(alignment: .trailing, spacing: 10) {
+                    StatusPill(label: account.usage.label, active: account.usage.available)
+                    if model.snapshot.selected == account.name { StatusPill(label: "Default for new chats", active: true) }
+                    Text("\(model.openCount(account)) open chats").font(.system(size: 11)).foregroundStyle(Palette.secondary)
+                }
+            }
+            HStack(spacing: 10) {
+                if account.saved_login {
+                    Button(model.snapshot.selected == account.name ? "Default for new chats" : "Use for new chats") { model.useForNewChats(account) }
+                        .buttonStyle(MonoButton(primary: true)).disabled(model.snapshot.selected == account.name)
+                    Button("Resume chat with…") { model.chooseChat(account) }.buttonStyle(MonoButton())
+                    Button("Check login") { model.act("check") }.buttonStyle(MonoButton())
+                } else {
+                    Button("Sign in") { model.act("login") }.buttonStyle(MonoButton(primary: true))
+                    Text("One sign-in to save this account on your Mac.").font(.system(size: 11)).foregroundStyle(Palette.secondary)
+                }
+                Spacer()
+                Button { model.removing = account } label: { Image(systemName: "trash") }
+                    .buttonStyle(MonoButton()).disabled(model.inUse(account))
+                    .help(model.inUse(account) ? "Close this profile’s sessions before removing it" : "Remove local profile…")
+                    .accessibilityLabel("Remove local profile")
+            }.disabled(model.blocked)
+            OpenSessionsPanel(account: account.name)
+            HStack(spacing: 16) {
+                QuotaCard(title: "Daily allowance left", window: account.usage.daily, stale: account.usage.status == "stale")
+                QuotaCard(title: "Weekly allowance left", window: account.usage.weekly, stale: account.usage.status == "stale")
+            }
+            VStack(alignment: .leading, spacing: 6) {
+                if !account.usage.message.isEmpty {
+                    Text(account.usage.message).font(.system(size: 11)).foregroundStyle(Palette.secondary)
+                }
+                if let fetched = account.usage.fetched_at {
+                    Text("Last read \(Date(timeIntervalSince1970: fetched).formatted(date: .abbreviated, time: .shortened)) · Percentages show allowance remaining")
+                        .font(.system(size: 10)).foregroundStyle(Palette.secondary)
+                }
+            }
+            Rectangle().fill(Palette.line).frame(height: 1)
+            VStack(alignment: .leading, spacing: 17) {
+                HStack {
+                    Text("Project").font(.system(size: 15, weight: .semibold))
+                    Spacer()
+                    Label("Opens in Terminal", systemImage: "terminal").font(.system(size: 10)).foregroundStyle(Palette.secondary)
+                }
+                HStack(spacing: 12) {
+                    Image(systemName: "folder").font(.system(size: 21)).foregroundStyle(Palette.secondary)
+                    VStack(alignment: .leading, spacing: 5) {
+                        Text(model.project.isEmpty ? "Choose a project" : URL(fileURLWithPath: model.project).lastPathComponent)
+                            .font(.system(size: 12, weight: .medium))
+                        Text(model.project.isEmpty ? "Select the folder you want to work in." : model.project)
+                            .font(.system(size: 10)).foregroundStyle(Palette.secondary).lineLimit(2)
+                    }
+                    Spacer()
+                    Button("Choose folder…") { model.chooseProject() }.buttonStyle(MonoButton()).disabled(model.blocked)
+                }.padding(17).background(Palette.panel, in: RoundedRectangle(cornerRadius: 9))
+                HStack(spacing: 10) {
+                    Button { model.act("start") } label: { Label("Start new", systemImage: "plus") }
+                        .buttonStyle(MonoButton(primary: true))
+                    Button { model.act("resume") } label: { Label("Resume latest", systemImage: "arrow.uturn.right") }
+                        .buttonStyle(MonoButton())
+                    Spacer()
+                    Button { model.perform(["action": "next"]) } label: { Label("Next account", systemImage: "arrow.right") }
+                        .buttonStyle(MonoButton()).disabled(model.snapshot.accounts.filter(\.saved_login).count < 2)
+                }.disabled(model.blocked || !account.saved_login || model.project.isEmpty)
+                Text("Start new can run alongside other chats. These buttons launch with \(account.name). Use Resume chat with… to hand off a specific stopped chat.")
+                    .font(.system(size: 11)).foregroundStyle(Palette.secondary)
+            }
+        }
+    }
+
+    var footer: some View {
+        VStack(spacing: 0) {
+            Rectangle().fill(Palette.line).frame(height: 1)
+            HStack(spacing: 8) {
+                Image(systemName: model.failed ? "exclamationmark.circle" : "terminal")
+                Text(model.snapshot.busy ? "Another command holds the legacy lock. If an older session is open, exit it once to enable concurrent launches." : model.message.isEmpty ? "\(model.openChats.count) open chats · Usage refreshes every minute when Auto refresh is on" : model.message)
+                    .lineLimit(2)
+                Spacer()
+                Text("LOCAL").font(.system(size: 9, weight: .medium)).tracking(0.7)
+            }.font(.system(size: 10)).foregroundStyle(Palette.secondary).padding(.horizontal, 24).padding(.vertical, 12)
+        }
     }
 }
 
@@ -358,43 +511,54 @@ struct AddAccountView: View {
     @EnvironmentObject var model: AppModel
     @State private var name = ""
     @State private var profile = ""
+    @State private var previousSuggestion = ""
     @FocusState private var nameFocused: Bool
 
     var body: some View {
         VStack(alignment: .leading, spacing: 22) {
-            Text("Add an account").font(.system(size: 23, weight: .semibold))
-            Text("Give it a name, then choose the Chrome profile you use to sign in.")
-                .foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+            Text("Add account").font(.system(size: 23, weight: .semibold))
+            Text("Choose a Chrome profile and give this login a name.")
+                .font(.system(size: 12)).foregroundStyle(Palette.secondary)
             VStack(alignment: .leading, spacing: 8) {
-                Text("Account name").fontWeight(.medium)
-                TextField("e.g. ansuman-3", text: $name).textFieldStyle(.roundedBorder).focused($nameFocused)
-                Text("Lowercase letters, numbers, hyphens or underscores.").font(.system(size: 12)).foregroundStyle(.secondary)
-            }
-            VStack(alignment: .leading, spacing: 8) {
-                Text("Chrome profile").fontWeight(.medium)
+                Text("Chrome profile").font(.system(size: 12, weight: .medium))
                 Picker("Chrome profile", selection: $profile) {
                     Text("Default browser").tag("")
                     ForEach(model.snapshot.profiles) { item in Text(item.label).tag(item.directory) }
                 }.labelsHidden().frame(maxWidth: .infinity)
+                    .onChange(of: profile) { _, value in
+                        if let selected = model.snapshot.profiles.first(where: { $0.directory == value }) {
+                            let suggestion = model.suggestedName(selected)
+                            if name.isEmpty || name == previousSuggestion { name = suggestion }
+                            previousSuggestion = suggestion
+                        }
+                    }
                 if let error = model.snapshot.chrome_error {
-                    Text(error).font(.system(size: 12)).foregroundStyle(.secondary)
+                    Text(error).font(.system(size: 11)).foregroundStyle(Palette.secondary)
                 }
             }
-            if !model.addError.isEmpty { Text(model.addError).foregroundStyle(.red).font(.system(size: 13)) }
-            Text("Sign-in opens in Terminal. Complete Google sign-in and paste the returned code there once.")
-                .font(.system(size: 13)).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+            VStack(alignment: .leading, spacing: 8) {
+                Text("Account name").font(.system(size: 12, weight: .medium))
+                TextField("ansuman-3 or nayanshi-1", text: $name).textFieldStyle(.roundedBorder).focused($nameFocused)
+                Text("Nayanshi’s profiles use nayanshi-*. Other profiles use ansuman-*.")
+                    .font(.system(size: 10)).foregroundStyle(Palette.secondary)
+            }
+            if !model.addError.isEmpty {
+                Label(model.addError, systemImage: "exclamationmark.circle").font(.system(size: 11))
+            }
+            Text("Sign in once through Terminal and Chrome. Daily and weekly usage will appear after the login is saved.")
+                .font(.system(size: 12)).foregroundStyle(Palette.secondary).fixedSize(horizontal: false, vertical: true)
             HStack {
                 Spacer()
-                Button("Cancel") { model.adding = false }.keyboardShortcut(.cancelAction)
+                Button("Cancel") { model.adding = false }.buttonStyle(MonoButton()).keyboardShortcut(.cancelAction)
                 Button("Add account") {
                     var request = ["action": "add", "account": name.trimmingCharacters(in: .whitespaces)]
                     if !profile.isEmpty { request["chrome_profile"] = profile }
                     model.perform(request)
-                }.buttonStyle(.borderedProminent).keyboardShortcut(.defaultAction)
+                }.buttonStyle(MonoButton(primary: true)).keyboardShortcut(.defaultAction)
                     .disabled(name.trimmingCharacters(in: .whitespaces).isEmpty || model.blocked)
             }
-        }.padding(30).frame(width: 490).controlSize(.large).tint(accent)
-            .onAppear { nameFocused = true }
+        }.padding(30).frame(width: 490).background(Palette.background).foregroundStyle(Palette.text)
+            .preferredColorScheme(.dark).tint(.gray).onAppear { nameFocused = true }
     }
 }
 
@@ -405,13 +569,14 @@ struct AddAccountView: View {
             ContentView().environmentObject(model)
                 .onAppear { NSApplication.shared.activate(ignoringOtherApps: true) }
         }
-        .defaultSize(width: 980, height: 700)
+        .defaultSize(width: 1180, height: 820)
         .windowStyle(.hiddenTitleBar)
         .commands {
             CommandGroup(replacing: .newItem) {
                 Button("Add Account…") { model.addError = ""; model.adding = true }
                     .keyboardShortcut("n").disabled(model.blocked)
-                Button("Refresh Accounts") { model.refresh() }.keyboardShortcut("r")
+                Button("Refresh Usage") { model.refreshUsage(force: true) }.keyboardShortcut("r")
+                    .disabled(model.refreshingUsage)
             }
         }
     }

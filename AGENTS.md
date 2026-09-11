@@ -1,0 +1,13 @@
+# Verification and runtime constraints
+
+- Run `make lint` and `make test`. Set `DS_TEST_NATIVE=/Applications/Devin.app/Contents/Resources/app/extensions/windsurf/devin/bin/devin` when running tests to also check compatibility with the installed CLI, using an isolated temporary database and no model requests.
+- Typecheck the Mac UI with `swiftc -typecheck -parse-as-library -target arm64-apple-macos14.0 -framework SwiftUI -framework AppKit macos/DevinSwitch.swift macos/AccountViews.swift` on Apple Silicon.
+- When building from inside a `ds` session, use `env -u XDG_DATA_HOME -u XDG_CONFIG_HOME -u XDG_CACHE_HOME -u XDG_STATE_HOME make app`. Otherwise uv's tool installation can end up inside the current account's private data directory instead of the stable user-level installation.
+- Keep `--reinstall-package devin-switch` in the app install target: `uv tool install --force .` alone can reuse a cached wheel after Python source-only changes. Verify installed modules, not just the source-tree tests.
+- A nested CLI can inherit `CHISEL_SESSION_DB`. Keep the native environment explicitly pinned to Switch's shared database; XDG isolation alone is insufficient.
+- Runtime leases must survive into the native child via `pass_fds`. Release them by closing descriptors, not by explicitly unlocking a descriptor shared with a still-running child.
+- The saved default profile and the profile bound to an open CLI process are different concepts. Never silently change the latter when updating the default.
+- Session tracking covers wrapper launches, not in-terminal `/new` or `/resume` changes. Do not label process liveness as agent activity or guess which newly created conversation belongs to a process.
+- Portable builds use `make dmg` and `make smoke-app`; audit wheels and source archives with `uv run --locked python scripts/check_dist.py` after `make build`. These checks use temporary state, not real accounts.
+- Keep the PyInstaller runtime under `Contents/Resources/ds-runtime`, not `Contents/Helpers`: the latter makes macOS code signing interpret its data files as nested code. The frozen launcher must invoke its executable directly, without Python's `-m` arguments.
+- Run `actionlint` when changing GitHub workflows. Release tags create drafts only after the reusable CI workflow passes; Apple Developer ID signing and notarization are not configured.

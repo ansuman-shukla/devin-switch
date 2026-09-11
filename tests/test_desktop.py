@@ -76,23 +76,25 @@ def test_resume_missing_session_does_not_create_launcher(
     assert not (signed_in.store.root / "launchers").exists()
 
 
-def test_resume_checks_chosen_folder_and_forwards_continue(
+def test_resume_latest_resolves_exact_session_in_chosen_folder(
     signed_in: Native, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     monkeypatch.setattr(desktop, "find_binary", lambda: signed_in.binary)
-
-    def sessions(self: Native, account: object, *, cwd: Path | None = None) -> list[object]:
-        assert cwd == tmp_path
-        return [{"id": "existing-session"}]
-
-    monkeypatch.setattr(Native, "sessions", sessions)
+    monkeypatch.setattr(
+        desktop.sessions,
+        "history",
+        lambda _: [
+            {"id": "other-project", "project": str(tmp_path / "other")},
+            {"id": "existing-session", "project": str(tmp_path)},
+        ],
+    )
     result = desktop.action(
         signed_in.store,
         {"action": "resume", "account": "ansuman-2", "project": str(tmp_path)},
     )
     launcher = Path(result["launcher"])
     command = shlex.split(launcher.read_text().splitlines()[2])
-    assert command[-5:] == ["run", "--account", "ansuman-2", "--", "--continue"]
+    assert command[-6:] == ["run", "--account", "ansuman-2", "--", "--resume", "existing-session"]
     assert "valid-" not in launcher.read_text()
 
 

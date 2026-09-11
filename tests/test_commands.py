@@ -22,6 +22,11 @@ def test_run_forwards_arguments_directory_and_exit_code_without_switching(
     monkeypatch.chdir(tmp_path)
     monkeypatch.setenv("FAKE_EXIT", "7")
     monkeypatch.setattr(cli, "find_binary", lambda: signed_in.binary)
+    monkeypatch.setattr(
+        cli.sessions,
+        "history",
+        lambda _: [{"id": "existing-session", "project": str(tmp_path)}],
+    )
     args = cli.parser().parse_args(
         [
             "run",
@@ -169,5 +174,9 @@ def test_installed_cli_isolation_and_existing_session_visibility(
         sessions = native.sessions(account)
         assert len(sessions) == 1
         assert "switch-test-session" in json.dumps(sessions)
+    from devin_switch.sessions import history
+
+    assert history(store)[0]["id"] == "switch-test-session"
+    assert history(store)[0]["project"] == str(tmp_path)
     assert not store.credentials(first).exists()
     assert not store.credentials(second).exists()

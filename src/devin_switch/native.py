@@ -31,16 +31,27 @@ ANSI_ESCAPE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
 
 def find_binary() -> Path:
     candidate = os.environ.get("DS_BINARY") or shutil.which("devin")
-    binary = Path(candidate) if candidate else BUNDLED_CLI
-    if not binary.is_file() or not os.access(binary, os.X_OK):
-        raise SwitchError("Devin CLI was not found. Install it or set DS_BINARY to its executable.")
-    return binary.resolve()
+    candidates = (
+        (Path(candidate),)
+        if candidate
+        else (
+            BUNDLED_CLI,
+            Path.home() / ".local/bin/devin",
+            Path("/opt/homebrew/bin/devin"),
+            Path("/usr/local/bin/devin"),
+        )
+    )
+    for binary in candidates:
+        if binary.is_file() and os.access(binary, os.X_OK):
+            return binary.resolve()
+    raise SwitchError("Devin CLI was not found. Install it or set DS_BINARY to its executable.")
 
 
 @dataclass(frozen=True)
 class Native:
     store: Store
     binary: Path
+    lock_fds: tuple[int, ...] = ()
 
     def environment(self, account: Account) -> dict[str, str]:
         self.store.prepare(account)
@@ -51,6 +62,7 @@ class Native:
             "XDG_CONFIG_HOME": str(base / "config"),
             "XDG_CACHE_HOME": str(base / "cache"),
             "XDG_STATE_HOME": str(base / "state"),
+            "CHISEL_SESSION_DB": str(self.store.root / "shared/cli/sessions.db"),
         }
 
     def capture(
@@ -91,7 +103,10 @@ class Native:
         previous_umask = os.umask(0o077)
         try:
             result = subprocess.run(
-                (str(self.binary), *arguments), env=self.environment(account), check=False
+                (str(self.binary), *arguments),
+                env=self.environment(account),
+                check=False,
+                pass_fds=self.lock_fds,
             )
             return result.returncode if result.returncode >= 0 else 128 - result.returncode
         finally:

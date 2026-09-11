@@ -8,7 +8,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-from devin_switch import browser
+from devin_switch import browser, sessions
 from devin_switch.native import Native, find_binary
 from devin_switch.store import Account, Store, SwitchError
 
@@ -22,6 +22,11 @@ def parser() -> argparse.ArgumentParser:
     add = commands.add_parser("add", help="Register an account; does not sign in")
     add.add_argument("account")
     add.add_argument("--chrome-profile", help='Chrome directory identifier, e.g. "Profile 1"')
+    remove = commands.add_parser("remove", help="Remove a local profile, keeping shared chats")
+    remove.add_argument("account")
+    remove.add_argument(
+        "--yes", action="store_true", help="Confirm removal of saved login and settings"
+    )
     login = commands.add_parser(
         "login", help="Sign into an account once using native authentication"
     )
@@ -88,16 +93,61 @@ def verify(native: Native, first: Account, second: Account) -> None:
 
 def execute(args: argparse.Namespace, store: Store) -> int:
     if args.command == "gui":
-        app = Path.home() / "Applications" / "Devin Switch.app"
-        if not app.is_dir():
-            raise SwitchError("The Mac app is not installed. Run make app in the source project.")
+        app = next(
+            (
+                directory / "Devin Switch.app"
+                for directory in (Path.home() / "Applications", Path("/Applications"))
+                if (directory / "Devin Switch.app").is_dir()
+            ),
+            None,
+        )
+        if app is None:
+            raise SwitchError("Install the Mac app from a release, or run make app from source.")
         subprocess.run(("/usr/bin/open", str(app)), check=True, timeout=15)
         return 0
     if args.command == "profiles":
         for profile in browser.profiles():
             print(f"{profile.directory:<14} {profile.name:<24} {profile.email}")
         return 0
+    if args.command in {"run", "login"}:
+        native = Native(store, find_binary())
+        arguments = tuple(args.arguments) if args.command == "run" else ("auth", "login")
+        if arguments[:1] == ("--",):
+            arguments = arguments[1:]
+        kind = "login" if args.command == "login" else "chat"
+        if kind == "chat" and arguments[:1] in (("auth",), ("mcp",), ("list",), ("doctor",)):
+            kind = "command"
+        with sessions.managed(native, args.account, arguments, kind=kind) as (
+            runner,
+            account,
+            arguments,
+        ):
+            if args.command == "login":
+                if runner.authenticated(account):
+                    print(f"{account.name} already has a saved login; no browser needed.")
+                    return 0
+                if account.chrome_profile and not args.default_browser:
+                    print(
+                        f"Opening {account.chrome_profile}. Sign in, then paste the token into "
+                        "Devin's terminal prompt. The token is not saved by this wrapper.",
+                        flush=True,
+                    )
+                    browser.open_login(account.chrome_profile)
+                    arguments += ("--force-manual-token-flow",)
+            else:
+                print(f"Using {account.name}", file=sys.stderr, flush=True)
+            code = runner.interactive(account, arguments)
+            if args.command == "login" and not code:
+                runner.require_login(account)
+                print(f"Login saved for {account.name}. Select it with: ds use {account.name}")
+            return code
     with store.lock():
+        if args.command == "remove":
+            if not args.yes:
+                raise SwitchError("Confirm profile removal with ds remove <alias> --yes.")
+            store.remove(store.account(args.account))
+            print(f"Removed {args.account}. Shared conversations and project files were preserved.")
+            return 0
         if args.command == "add":
             if args.chrome_profile and args.chrome_profile not in {
                 item.directory for item in browser.profiles()
@@ -129,25 +179,7 @@ def execute(args: argparse.Namespace, store: Store) -> int:
             print(f"Selected {account.name}. Run: ds run")
             return 0
         account = store.account(args.account) if args.account else store.selected()
-        if args.command == "login":
-            if native.authenticated(account):
-                print(f"{account.name} already has a saved login; no browser needed.")
-                return 0
-            arguments = ("auth", "login")
-            if account.chrome_profile and not args.default_browser:
-                print(
-                    f"Opening {account.chrome_profile}. Sign in, then paste the token into "
-                    "Devin's terminal prompt. The token is not saved by this wrapper.",
-                    flush=True,
-                )
-                browser.open_login(account.chrome_profile)
-                arguments += ("--force-manual-token-flow",)
-            code = native.interactive(account, arguments)
-            if code:
-                return code
-            native.require_login(account)
-            print(f"Login saved for {account.name}. Select it with: ds use {account.name}")
-        elif args.command == "status":
+        if args.command == "status":
             logged_in = native.authenticated(account)
             print(f"{account.name}: {'saved login accepted' if logged_in else 'needs login'}")
             return 0 if logged_in else 1
@@ -157,13 +189,6 @@ def execute(args: argparse.Namespace, store: Store) -> int:
             print(f"Selected {account.name}. Run: ds run")
         elif args.command == "sessions":
             print(json.dumps(native.sessions(account), indent=2))
-        elif args.command == "run":
-            native.require_login(account)
-            arguments = tuple(args.arguments)
-            if arguments[:1] == ("--",):
-                arguments = arguments[1:]
-            print(f"Using {account.name}", file=sys.stderr, flush=True)
-            return native.interactive(account, arguments)
     return 0
 
 

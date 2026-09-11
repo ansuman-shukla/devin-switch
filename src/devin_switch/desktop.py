@@ -10,7 +10,7 @@ import uuid
 from dataclasses import asdict
 from pathlib import Path
 
-from devin_switch import browser, enrollment, usage
+from devin_switch import browser, enrollment, sessions, usage
 from devin_switch.cli import choose_next, selected_name
 from devin_switch.native import Native, find_binary
 from devin_switch.store import Store, SwitchError, private_directory
@@ -55,6 +55,7 @@ def snapshot(store: Store) -> dict[str, object]:
         "profiles": chrome_profiles,
         "chrome_error": chrome_error,
         "busy": is_busy(store),
+        **sessions.overview(store),
     }
 
 
@@ -75,8 +76,7 @@ def terminal_launcher(store: Store, arguments: tuple[str, ...], project: Path) -
             f"DS_HOME={store.root}",
             f"DS_BINARY={find_binary()}",
             sys.executable,
-            "-m",
-            "devin_switch.cli",
+            *(() if getattr(sys, "frozen", False) else ("-m", "devin_switch.cli")),
             *arguments,
         )
     )
@@ -120,16 +120,27 @@ def action(store: Store, request: dict[str, object]) -> dict[str, object]:
                 raise SwitchError("Choose an existing Chrome profile, or use the default browser.")
             account = store.add(name, profile)
             return {"message": f"Added {account.name}. Select Sign in to save its login."}
+        if operation == "remove":
+            if request.get("confirmed") != "true":
+                raise SwitchError("Confirm removal of this profile's saved login and settings.")
+            account = store.account(string_field(request, "account"))
+            store.remove(account)
+            return {
+                "message": f"Removed {account.name}. Shared chats and project files were preserved."
+            }
         native = Native(store, find_binary())
         if operation == "next":
             account = choose_next(store, native)
             store.select(account)
-            return {"message": f"{account.name} is now active.", "focus": account.name}
+            return {
+                "message": f"Default: {account.name}. Existing sessions are unchanged.",
+                "focus": account.name,
+            }
         account = store.account(string_field(request, "account"))
         if operation == "select":
             native.require_login(account)
             store.select(account)
-            return {"message": f"{account.name} is now active."}
+            return {"message": f"Default: {account.name}. Existing sessions are unchanged."}
         if operation == "check":
             native.require_login(account)
             return {"message": f"Saved login accepted for {account.name}."}
@@ -141,22 +152,38 @@ def action(store: Store, request: dict[str, object]) -> dict[str, object]:
                 "launcher": str(launcher),
                 "message": "Finish sign-in in Terminal, then return here.",
             }
-        if operation in {"start", "resume"}:
-            project = Path(string_field(request, "project")).expanduser().resolve()
-            if not project.is_dir():
-                raise SwitchError("Choose an existing project folder.")
+        if operation in {"start", "resume", "resume_session"}:
             native.require_login(account)
-            if operation == "resume" and not native.sessions(account, cwd=project):
-                raise SwitchError(
-                    "No conversation in this folder yet. Choose Start new and send a message first."
-                )
+            chat = None
+            if operation == "resume_session":
+                chat = sessions.resumable(store, string_field(request, "session"))
+                project = Path(chat["project"])
+            else:
+                project = Path(string_field(request, "project")).expanduser().resolve()
+                if not project.is_dir():
+                    raise SwitchError("Choose an existing project folder.")
+                if operation == "resume":
+                    latest = next(
+                        (
+                            chat
+                            for chat in sessions.history(store)
+                            if chat["project"] == str(project)
+                        ),
+                        None,
+                    )
+                    if latest is None:
+                        raise SwitchError(
+                            "No conversation in this folder yet. "
+                            "Choose Start new and send a message first."
+                        )
+                    chat = sessions.resumable(store, latest["id"])
             arguments = ("run", "--account", account.name)
-            if operation == "resume":
-                arguments += ("--", "--continue")
+            if chat:
+                arguments += ("--", "--resume", chat["id"])
             launcher = terminal_launcher(store, arguments, project)
             return {
                 "launcher": str(launcher),
-                "message": f"Opening {account.name} in Terminal. Exit before switching accounts.",
+                "message": f"Opening {account.name} in Terminal. Other sessions are unchanged.",
             }
         raise SwitchError("Unknown desktop action.")
 

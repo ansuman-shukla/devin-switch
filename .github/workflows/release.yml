@@ -1,0 +1,54 @@
+name: Release
+
+on:
+  push:
+    tags: ["v[0-9]*"]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  verify:
+    uses: ./.github/workflows/ci.yml
+
+  release:
+    needs: verify
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4.2.2
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@v6.0.1
+        with:
+          version: "0.11.19"
+          python-version: "3.11"
+      - name: Verify tag matches package version
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          uv run --locked python -c 'import os, tomllib; from pathlib import Path; version = tomllib.loads(Path("pyproject.toml").read_text())["project"]["version"]; assert os.environ["RELEASE_TAG"] == f"v{version}", "Tag must match pyproject.toml version"'
+      - run: make build
+      - uses: actions/download-artifact@v4.3.0
+        with:
+          pattern: macos-*
+          merge-multiple: true
+          path: dist
+      - name: Calculate artifact checksums
+        working-directory: dist
+        run: shasum -a 256 -- *.dmg *.whl *.tar.gz > SHA256SUMS
+      - name: Create draft release for review
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          gh release create "$RELEASE_TAG" \
+            dist/*.dmg dist/*.dmg.sha256 dist/*.whl dist/*.tar.gz dist/SHA256SUMS \
+            --verify-tag --draft --title "Devin Switch $RELEASE_TAG" --generate-notes \
+            --notes "Requires macOS 14 or later and a separately installed Devin CLI. Choose arm64 for Apple Silicon or x86_64 for Intel. The DMGs bundle Python but are ad-hoc signed, not Apple-notarized. Review the README for first-launch instructions. SHA256SUMS covers the downloadable packages."

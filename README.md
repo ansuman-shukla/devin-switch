@@ -1,226 +1,350 @@
 # Devin Switch
 
-A local macOS prototype for switching saved Devin CLI logins. Run `ds use ansuman-2`
-and launch `ds run` without signing into Google again while that login remains valid.
-Each account has separate credentials and settings. Conversations started through
-`ds` use one shared local history store, so switching accounts keeps them visible.
+**Your accounts, one workspace.** A native macOS app and lightweight CLI for managing
+saved Devin CLI logins, checking reported usage, and reopening shared local conversations.
 
-This version provides explicit switching. It does not automatically detect quota
-exhaustion or retry an interrupted agent. `ds next` cycles through saved logins;
-it does not know whether those accounts have quota remaining.
+[Get started](#quick-start) · [Download releases](../../releases) ·
+[CLI reference](#cli-reference) · [Development](#development) · [License](LICENSE)
 
-## Mac app
+> **Independent community project · Beta · macOS 14+**
+> Not affiliated with or endorsed by Cognition. Devin CLI is installed separately.
+> Use only accounts you are authorized to access, in accordance with your organization's policies.
 
-Open **Devin Switch** from your user Applications folder, or run:
+## What it does
+
+- **Separate account profiles.** Keep each saved login, CLI configuration, and cache isolated.
+- **A shared local history.** Reopen conversations created through Switch with a chosen account.
+- **A native SwiftUI interface.** Manage profiles, choose a project, and launch chats in Terminal.
+- **Usage at a glance.** Show daily and weekly allowance when the service reports it, including
+  reset times and explicit stale or unavailable states.
+- **Predictable switching.** Changing the default affects future launches—not an already-open CLI.
+- **Concurrent launches.** Open multiple sessions while protecting profiles from removal or
+  replacement login while in use.
+
+There is no automatic quota failover, interrupted-request retry, or guarantee that a different
+account can continue every conversation. `ds next` cycles through saved logins; it does not
+select an account based on remaining quota. Switch does not change the Devin Desktop IDE account.
+
+## Quick start
+
+### Option A: Download the Mac app
+
+1. Install [Devin CLI](https://docs.devin.ai/cli) if you do not already have it.
+   With Homebrew: `brew install --cask devin-cli`. An installation bundled with
+   `/Applications/Devin.app` is also detected automatically.
+2. Open this repository's **[Releases](../../releases)** page and download a DMG:
+
+   | Your Mac | Download |
+   | --- | --- |
+   | Apple Silicon (M1 or later) | `Devin-Switch-VERSION-macos-arm64.dmg` |
+   | Intel | `Devin-Switch-VERSION-macos-x86_64.dmg` |
+
+3. Open the disk image and drag **Devin Switch** to **Applications**. Eject the image,
+   then open the installed app—not the copy inside the disk image.
+4. Choose **Add account**, give it a local alias, and select **Sign in**. Complete
+   authentication in Terminal. Repeat for any additional authorized accounts.
+5. Select an account, choose your project folder, and click **Start new**.
+
+The portable app includes its Python runtime. **No Python, uv, or developer tools are
+required to use the downloaded app.** Devin CLI and access to a valid account are still required.
+A DMG does not install the `ds` command on your shell's PATH; use Option B if you want it.
+
+**First launch on macOS:** builds are ad-hoc signed for local integrity, **not signed with
+an Apple Developer ID or notarized by Apple**. macOS may block the first launch. After
+checking the source and download checksum, try opening the app once, then use
+**System Settings → Privacy & Security → Open Anyway** if offered. Do not disable Gatekeeper.
+Managed Macs may require administrator approval. Building from source is another option.
+
+Release downloads become available after a maintainer publishes the draft produced by CI.
+
+### Option B: Install the CLI with uv
+
+Install [uv](https://docs.astral.sh/uv/getting-started/installation/) (`brew install uv` on macOS)
+and Devin CLI. Then download the wheel from a published release:
 
 ```sh
-ds gui
+uv tool install --python 3.11 ~/Downloads/devin_switch-0.3.0-py3-none-any.whl
+uv tool update-shell
 ```
 
-The app uses the same saved accounts as the CLI. You do not need to enroll them again.
-
-1. Select an account in the sidebar. **Use account** makes it the CLI's active account.
-2. **Choose folder…** selects your project and remembers it for next time.
-3. **Start new** opens a fresh conversation in Terminal. **Resume latest** continues
-   the latest conversation in that folder using the account displayed in the app.
-4. Exit the Terminal session before switching. **Next account** selects another
-   saved login, then you can resume your work.
-
-**Add account** lets you enter a local alias and select a Chrome profile by its name,
-directory identifier, and email. Select the new account and click **Sign in**;
-complete authentication in Terminal. The account list refreshes automatically.
-The email in the picker identifies the Chrome profile, not necessarily the Devin
-account selected during sign-in.
-
-**Login saved** indicates local credentials are present. **Check login** asks the
-native CLI to check that saved login. Neither label reports remaining quota.
-If Resume finds no conversation, it tells you to choose Start new first.
-
-The native SwiftUI app talks to the Python package over stdin/stdout, without a web
-server. It never receives authentication tokens. Coding and login run in normal
-Terminal windows. This app manages CLI accounts; it does not change the Desktop IDE.
-
-To rebuild and install the app locally (requires Apple's Swift command-line tools):
+Open a new terminal, then register and sign into your first account:
 
 ```sh
-make app
-```
-
-This installs the CLI with uv and builds `~/Applications/Devin Switch.app` for the
-current Mac architecture, targeting macOS 14+. The app stores the chosen project
-folder in its preferences and the terminal launch scripts in the private ds state
-directory. Those scripts contain paths and aliases, not credentials.
-
-## Install
-
-Requires macOS, Python 3.11+, [uv](https://docs.astral.sh/uv/), and Devin CLI.
-The CLI bundled in `/Applications/Devin.app` is detected automatically when `devin`
-is not on PATH. To choose another executable, set `DS_BINARY` to its absolute path.
-
-```sh
-uv tool install /absolute/path/to/devin-switch
 ds --help
+ds add personal
+ds login personal
+ds use personal
+ds run
 ```
 
-If uv's tool directory is not on PATH, run `uv tool update-shell`, then open a new terminal.
+Run `ds run` from the project directory you want to work in. To install from a clone or
+an extracted source archive instead, run `uv tool install --python 3.11 .` inside that folder.
+`uv` manages the Python environment; the installed package has no third-party Python runtime
+dependencies. The package is not currently published to PyPI.
 
-## Enroll two accounts
+### Verify a download
+
+Download the release's `SHA256SUMS` alongside the files you want, then run from that folder:
 
 ```sh
-ds profiles
-ds add ansuman-1 --chrome-profile "Profile 1"
-ds add ansuman-2 --chrome-profile "Profile 11"
-ds login ansuman-1
-ds login ansuman-2
+shasum -a 256 --check --ignore-missing SHA256SUMS
 ```
 
-`ds profiles` shows Chrome's internal directory identifiers alongside the familiar
-profile names and email addresses. It only reads Chrome's profile index.
+Each DMG also has an individual `.dmg.sha256` file. Checksums detect download corruption;
+they are not a substitute for trusting the publisher or an Apple signing identity.
 
-When a Chrome profile is assigned, login opens Devin's manual token page in that
-profile and runs the CLI's built-in manual login flow. Complete Google sign-in,
-copy the token from the page, and paste it **only into the native terminal prompt**.
-This enrollment step is needed once per account, and again if the login is revoked
-or expires. The wrapper does not collect tokens in its own prompts or logs.
+## Everyday workflow
 
-For the normal native callback login instead, run `ds login ansuman-1 --default-browser`.
-That uses your default browser rather than the assigned Chrome profile.
-
-To replace an existing login, run `ds run --account ansuman-1 -- auth logout`, then
-`ds login ansuman-1`. Logout removes that profile's credentials, so a canceled
-replacement login leaves it signed out.
-
-## Add the rest of your accounts
-
-There is no two-account limit. Register each additional account with a unique alias,
-then sign into it once. Choose profile identifiers from `ds profiles`:
+### Add another account
 
 ```sh
-ds profiles
-ds add ansuman-3 --chrome-profile "Profile 12"
-ds login ansuman-3
-ds add ansuman-4 --chrome-profile "Profile 13"
-ds login ansuman-4
+ds add work
+ds login work
 ds list
+ds use work
+ds run
 ```
 
-The alias is your local label, not your Google email or Devin organization name.
-Two aliases may use the same Chrome profile if that profile has multiple Google
-accounts; select the intended account during each login. A Chrome profile by itself
-does not establish which Devin subscription was authenticated. Check the identity
-and organization shown by the native CLI when you launch it.
+Aliases such as `personal` and `work` are local labels, not verified account identities.
+Confirm the intended user and organization during sign-in. A saved login can be reused
+until it expires or is revoked; you do not need to run `ds login` every time you switch.
 
-## Switch and continue
+### Choose a Chrome profile for sign-in
 
 ```sh
-ds use ansuman-1
-ds run
-# Exit Devin before switching.
-ds use ansuman-2
+ds profiles
+ds add work --chrome-profile "Profile 1"
+ds login work
+```
+
+`ds profiles` reads Chrome's profile index, not its cookies or password store. It shows
+internal directory identifiers alongside profile names and email addresses. A Chrome
+profile's email does not prove which Devin account was chosen during authentication.
+
+When a Chrome profile is assigned, Switch opens the native manual-token login page in
+that profile. Paste the token **only into the native CLI's Terminal prompt**—never into
+an issue, screenshot, README, or chat. Switch does not collect it in its own prompts.
+For native default-browser login instead, use `ds login work --default-browser`.
+
+### Switch accounts and resume a conversation
+
+First exit CLI chats running in the target project. Then, from the same project directory:
+
+```sh
+ds use work
 ds run -- --continue
-# Or choose a particular conversation:
+```
+
+Or select an exact conversation:
+
+```sh
 ds sessions
-ds run -- --resume SESSION_ID
-ds next
-ds run
+ds run --account personal -- --resume SESSION_ID
 ```
 
-Commands after `ds run --` are forwarded without shell interpretation. Your current
-working directory is preserved. `ds run --account ansuman-2 -- --continue` uses an
-account for that invocation without changing your saved selection.
+`--account` chooses a profile for just that launch; it does not change the saved default.
+Arguments after `--` are forwarded to Devin CLI without shell interpretation. `--continue`
+is resolved to an exact conversation ID, and `--resume` requires an explicit ID.
 
-One command holds the profile lock while an interactive session is running. A second
-switch or runner fails with a clear message instead of racing with the first.
+In the app, **Resume chat with…** opens the shared-history picker. **Resume latest** selects
+the latest conversation in the chosen folder. Resume is conservatively blocked while
+Switch-managed CLI chats remain open in that repository. Other repositories can keep running.
 
-### "No sessions to continue in this directory"
+The session overview tracks **wrapper launches and open processes**, not whether an agent
+is actively working. In-terminal `/new` and `/resume` changes are not tracked or guessed.
+Use separate Git worktrees if concurrent sessions would otherwise edit the same files.
 
-Start your first conversation in that project using `ds run` with no `--continue`.
-Send at least one message. Exit the CLI, select another account, and run
-`ds run -- --continue` from the **same project directory**. Existing conversations
-from your ordinary Devin CLI or Desktop are not imported into this prototype.
+### Manage saved profiles
 
-When you hit a quota limit, exit the CLI before running:
+- **Use for new chats** updates the default, leaving existing sessions unchanged.
+- **Check login** checks native saved-login status; it is not a quota check.
+- **Auto refresh** polls reported usage approximately once per minute. Usage is shared by
+  all chats on the same account, not allocated independently per session.
+- **Remove profile…** deletes that profile's local login, settings, and usage cache after
+  confirmation. It preserves shared conversations, repositories, and the Chrome profile.
+  Removal and renaming are blocked while the profile is in use.
 
-```sh
-ds next
-ds run -- --continue
-```
+CLI removal requires explicit confirmation: `ds remove work --yes`.
 
-Alternatively, choose a specific account with `ds use <alias>`. `ds next` only checks
-for a saved login; if that account is also exhausted, choose another. Do not use
-`ds login` for every switch: `ds use` reuses the credentials already saved.
+## CLI reference
 
-## Verify A → B → A
+| Command | Purpose |
+| --- | --- |
+| `ds gui` | Open the app from `~/Applications` or `/Applications` |
+| `ds add ALIAS` | Register a local profile |
+| `ds profiles` | List available Chrome profile identifiers |
+| `ds login ALIAS` | Enroll or check a saved login |
+| `ds list` | List profiles and the selected default |
+| `ds status [ALIAS]` | Check a saved login with the native CLI |
+| `ds use ALIAS` | Change the default for future launches |
+| `ds next` | Select another profile with a saved login; does not measure quota |
+| `ds run [--account ALIAS] -- ARGS` | Launch Devin CLI with the selected profile |
+| `ds sessions` | List shared history for the current project |
+| `ds verify FIRST SECOND` | Check A → B → A login and local-history visibility |
+| `ds remove ALIAS --yes` | Remove a local profile, preserving shared history |
 
-```sh
-ds verify ansuman-1 ansuman-2
-```
+`ds verify` makes no model request. Matching history across accounts is separate from a
+successful inference request; different credential files alone do not prove distinct users
+or independent allowances. Testing live cross-account continuation consumes account usage.
 
-This checks both saved logins, rejects identical credential files, and verifies that
-the same local session list is visible through A, B, and A again. It makes no model
-request and does not change the selected account. Different tokens are not, by
-themselves, proof of different Google users or independent paid allowances: confirm
-the intended identity during each enrollment.
+## Privacy and storage
 
-Local history visibility is separate from successful inference across accounts.
-To test the latter, start a disposable conversation through A, ask it to remember
-a unique phrase, exit, switch to B, and resume it with `--continue`. Ask it to recall
-the phrase, then repeat on A. This uses a small amount of each account's allowance.
-Do this in an empty scratch directory before using the tool for real work.
-
-## Storage
-
-State defaults to `~/.local/share/devin-switch` (override with `DS_HOME`):
+Switch stores its state outside this repository, in `~/.local/share/devin-switch` by default:
 
 ```text
-accounts/ansuman-1/data/devin/credentials.toml  # native saved login A
-accounts/ansuman-2/data/devin/credentials.toml  # native saved login B
-accounts/<alias>/config/                      # account-specific CLI configuration
-shared/cli/                                  # new shared session database and state
-shared/summaries/                             # new shared session summaries
-selected                                     # alias only
+accounts/<alias>/data/devin/credentials.toml
+accounts/<alias>/config/
+accounts/<alias>/cache/
+shared/cli/sessions.db
+shared/summaries/
+runs/
+launchers/
+selected
 ```
 
-The wrapper scopes XDG directories per account and removes known environment token
-overrides before invoking Devin. Your normal `HOME` and existing Devin storage are
-untouched. Existing conversations in your normal CLI or IDE are not imported.
-Credentials stay outside this project's source tree; account directories are private
-and the native credentials files are restricted to the current user.
+- Native credentials are local files restricted to the current user, **not Keychain-encrypted**.
+  Protect this directory and its backups as sensitive data.
+- Each account receives isolated XDG directories. `CHISEL_SESSION_DB` is explicitly pinned
+  to shared history, and known authentication environment overrides are removed.
+- Usage refresh sends the saved credential to the service's status endpoint over HTTPS.
+  Custom API servers are not supported for usage reporting; credential-bearing redirects
+  are rejected. The usage cache can contain account email and plan information.
+- The Swift app communicates with Python over stdin/stdout; there is no local web server.
+  Authentication tokens are not included in bridge responses.
+- Launch metadata contains account aliases, project paths, and IDs—not prompts or credentials.
+  Local conversations themselves can contain sensitive project material.
+- Existing CLI/Desktop conversations are not imported. Your normal `HOME`, ordinary CLI
+  storage, external-tool credentials, and project-local configuration are not migrated.
 
-Settings and MCP configuration are initially fresh in each account. Credentials for
-external tools and project-local configuration are still governed by those tools.
-The prototype does not switch the Desktop IDE's account.
+| Variable | Purpose |
+| --- | --- |
+| `DS_HOME` | Override Switch's private state directory; keep it outside the repository |
+| `DS_BINARY` | Choose the native Devin executable explicitly |
+| `DS_TEST_NATIVE` | Enable isolated, offline native-CLI compatibility tests |
+
+Never commit your state directory, environment files, signing certificates, or credentials.
+Ignore rules and secret scans provide safeguards, not a guarantee against every possible leak.
+
+## Troubleshooting
+
+**`ds` is not found:** run `uv tool update-shell`, then open a new terminal.
+
+**Devin CLI is not found:** install it separately. Switch checks PATH, the Desktop bundle,
+`~/.local/bin`, and standard Homebrew locations. For a custom location, set `DS_BINARY` to
+its executable path. Finder-launched apps do not inherit your terminal's shell configuration;
+use a standard installation location for the app.
+
+**No sessions to continue:** start a conversation using `ds run`, send a message, exit,
+and resume from the same project directory. Ordinary CLI/Desktop history is not imported.
+
+**A profile is busy:** close the CLI sessions using it before removing, renaming, or replacing
+its login. Changing the saved default does not switch an already-running process.
+
+**Usage is unavailable:** the account may require sign-in, the service may be unreachable,
+or the plan may not expose daily/weekly quotas. Unavailable does not mean unlimited usage.
+
+**Replacing a login:** `ds run --account work -- auth logout` signs that profile out;
+then run `ds login work`. If the new login is canceled, the old credentials are not restored.
 
 ## Development
 
+Requirements: macOS 14+, [uv](https://docs.astral.sh/uv/), Apple's Command Line Tools
+(`xcode-select --install`), and Gitleaks (`brew install gitleaks`).
+
 ```sh
-uv sync --python 3.11
-make format && make lint && make test
-# Optional offline checks against the actual installed CLI:
+make setup
+make check
+```
+
+| Target | Action |
+| --- | --- |
+| `make format` | Format Python with Ruff |
+| `make format-check` | Check formatting without changing files |
+| `make lint` | Ruff lint plus formatting check |
+| `make test` | Run isolated pytest tests |
+| `make typecheck` | Typecheck both SwiftUI source files for the current architecture |
+| `make secrets` | Scan all local Git history and publishable working-tree files with Gitleaks |
+| `make check` | Run lint, formatting, tests, Swift typechecking, and secret checks |
+| `make app` | Install `ds` with uv and build `~/Applications/Devin Switch.app` |
+| `make build` | Build a Python wheel and source archive in `dist/` |
+| `make dmg` | Build a portable app, DMG, and SHA-256 checksum in `dist/` |
+| `make smoke-app` | Test the portable app after relocation using isolated state and a fake CLI |
+
+`uv.lock` is committed, and development commands require it to be up to date. Python is
+formatted and linted with Ruff; Swift is typechecked, not automatically reformatted.
+The portable runtime is built with a pinned PyInstaller version and Python 3.11.
+
+To also check the installed native CLI without real credentials or model requests:
+
+```sh
 DS_TEST_NATIVE="/Applications/Devin.app/Contents/Resources/app/extensions/windsurf/devin/bin/devin" make test
 ```
 
-Tests cover failed logins, credential separation, environment overrides, browser
-selection, concurrent commands, argument forwarding, and shared session visibility.
-The optional native test uses an isolated temporary database and no real credentials
-or model requests. It is deliberately sensitive to changes in the native database
-layout so an incompatible CLI update is detected.
+The native test uses a disposable database and checks the database layout expected by the
+wrapper. Compatibility was originally validated with Desktop 3.9.19 / CLI 3000.6.19;
+upstream authentication, session schemas, and usage APIs can change.
 
-Authentication format and commands are based on Devin's
-[authentication documentation](https://docs.devin.ai/cli/enterprise/devin-auth) and
-[command reference](https://docs.devin.ai/cli/reference/commands). Saved-login status
-is not a live quota or billing check.
+For builds from inside a Switch-managed session:
 
-Validated on macOS with Devin Desktop 3.9.19 and bundled CLI 3000.6.19. On September 11,
-2026, a live conversation was started under account A, resumed under account B,
-and resumed again under A. Both resumed requests correctly recalled the phrase
-from the first message without repeating it in the follow-up prompts. No new
-browser login was needed. This verifies a small conversation across the two enrolled
-accounts, not recovery of interrupted tool calls or automatic quota detection.
+```sh
+env -u XDG_DATA_HOME -u XDG_CONFIG_HOME -u XDG_CACHE_HOME -u XDG_STATE_HOME make app
+```
 
-The GUI was checked with the two saved accounts: switching, Chrome profile selection,
-invalid-alias handling, native folder selection, empty-history feedback, Terminal
-launching, and disabling actions during a running CLI session. The GUI bridge tests
-also cover private state, failed switching, project validation, correct resume
-arguments, and shell quoting for paths containing spaces, quotes, and substitution
-characters.
+The install target also clears these overrides and explicitly reinstalls the package so
+source-only changes cannot silently reuse an old wheel. It does not alter account state.
+A local `make app` build references the installed uv environment; **only `make dmg` builds
+are portable**. Close the app before replacing an installed copy.
+
+Portable builds refuse to overwrite an existing output. Choose a fresh output directory
+when rebuilding without removing the previous release:
+
+```sh
+uv run --locked --group build --python 3.11 python scripts/build_app.py --standalone --dmg --output "dist/rebuild/Devin Switch.app"
+```
+
+Audit built Python packages and verify an isolated `uv tool install`:
+
+```sh
+make build
+uv run --locked python scripts/check_dist.py
+```
+
+Tests cover account isolation, concurrent leases, session handoffs, argument quoting,
+usage failures, private bridge responses, native discovery, and packaged launch behavior.
+The portable-app smoke test relocates the bundle to a path containing spaces and exercises
+the bundled runtime and Terminal launcher without accessing your real accounts.
+
+## CI and releases
+
+GitHub Actions runs lint, format checks, tests, Swift typechecking, secret scanning, and
+package-install checks on Apple Silicon and Intel runners. Python tests cover 3.11 and 3.13.
+Both architectures also build and smoke-test portable DMGs. PR workflows use read-only
+repository permissions and do not receive signing or account credentials.
+
+To release:
+
+1. Update the version in `pyproject.toml` and refresh `uv.lock` with `uv lock`. Run `make check`,
+   review the changes, and commit them. The app version is read from package metadata.
+2. Push the reviewed commit, then tag that commit with the same version:
+
+   ```sh
+   git tag v0.3.0
+   git push origin v0.3.0
+   ```
+
+3. The **Release** workflow reruns CI, verifies the tag against the package version, and
+   creates a **draft** containing Apple Silicon and Intel DMGs, individual DMG checksums,
+   a wheel, a source archive, and `SHA256SUMS`.
+4. Review the artifacts and release notes in GitHub, then publish the draft. The Releases
+   page is the download landing page; no separate web hosting is required.
+
+Only the final release job has write permission. No personal access token, Apple signing
+secret, or PyPI credential is required. CI configuration is provided here; successful local
+checks do not imply it has already run on GitHub. Apple Developer ID signing and notarization
+are not configured in this release pipeline.
+
+## License
+
+[Apache License 2.0](LICENSE). See [NOTICE](NOTICE) for project notices.
+Bundled runtime components retain their own licenses. Devin CLI is neither bundled nor
+relicensed by this project.

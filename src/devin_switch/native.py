@@ -53,7 +53,9 @@ class Native:
             "XDG_STATE_HOME": str(base / "state"),
         }
 
-    def capture(self, account: Account, arguments: tuple[str, ...]) -> str:
+    def capture(
+        self, account: Account, arguments: tuple[str, ...], *, cwd: Path | None = None
+    ) -> str:
         result = subprocess.run(
             (str(self.binary), *arguments),
             env=self.environment(account),
@@ -61,6 +63,7 @@ class Native:
             text=True,
             timeout=30,
             check=False,
+            cwd=cwd,
         )
         if result.returncode:
             # Native authentication errors can include credential material.
@@ -94,8 +97,8 @@ class Native:
         finally:
             os.umask(previous_umask)
 
-    def sessions(self, account: Account) -> list[object]:
-        output = self.capture(account, ("list", "--format", "json"))
+    def sessions(self, account: Account, *, cwd: Path | None = None) -> list[object]:
+        output = self.capture(account, ("list", "--format", "json"), cwd=cwd)
         try:
             sessions = json.loads(output)
         except json.JSONDecodeError as exc:

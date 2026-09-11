@@ -48,6 +48,26 @@ To replace an existing login, run `ds run --account ansuman-1 -- auth logout`, t
 `ds login ansuman-1`. Logout removes that profile's credentials, so a canceled
 replacement login leaves it signed out.
 
+## Add the rest of your accounts
+
+There is no two-account limit. Register each additional account with a unique alias,
+then sign into it once. Choose profile identifiers from `ds profiles`:
+
+```sh
+ds profiles
+ds add ansuman-3 --chrome-profile "Profile 12"
+ds login ansuman-3
+ds add ansuman-4 --chrome-profile "Profile 13"
+ds login ansuman-4
+ds list
+```
+
+The alias is your local label, not your Google email or Devin organization name.
+Two aliases may use the same Chrome profile if that profile has multiple Google
+accounts; select the intended account during each login. A Chrome profile by itself
+does not establish which Devin subscription was authenticated. Check the identity
+and organization shown by the native CLI when you launch it.
+
 ## Switch and continue
 
 ```sh
@@ -69,6 +89,24 @@ account for that invocation without changing your saved selection.
 
 One command holds the profile lock while an interactive session is running. A second
 switch or runner fails with a clear message instead of racing with the first.
+
+### "No sessions to continue in this directory"
+
+Start your first conversation in that project using `ds run` with no `--continue`.
+Send at least one message. Exit the CLI, select another account, and run
+`ds run -- --continue` from the **same project directory**. Existing conversations
+from your ordinary Devin CLI or Desktop are not imported into this prototype.
+
+When you hit a quota limit, exit the CLI before running:
+
+```sh
+ds next
+ds run -- --continue
+```
+
+Alternatively, choose a specific account with `ds use <alias>`. `ds next` only checks
+for a saved login; if that account is also exhausted, choose another. Do not use
+`ds login` for every switch: `ds use` reuses the credentials already saved.
 
 ## Verify A → B → A
 
@@ -132,6 +170,9 @@ Authentication format and commands are based on Devin's
 is not a live quota or billing check.
 
 Validated on macOS with Devin Desktop 3.9.19 and bundled CLI 3000.6.19. The suite
-passed 27 tests including the installed-CLI isolation/history test. Native browser
-callback enrollment and subsequent saved-login checks also passed for one real
-account. The two-account paid conversation test requires both accounts to be enrolled.
+passed 27 tests including the installed-CLI isolation/history test. On September 11,
+2026, a live conversation was started under account A, resumed under account B,
+and resumed again under A. Both resumed requests correctly recalled the phrase
+from the first message without repeating it in the follow-up prompts. No new
+browser login was needed. This verifies a small conversation across the two enrolled
+accounts, not recovery of interrupted tool calls or automatic quota detection.

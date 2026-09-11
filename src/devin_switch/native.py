@@ -1,0 +1,105 @@
+"""Invoke the installed CLI using an account-specific environment."""
+
+import json
+import os
+import re
+import shutil
+import subprocess
+from dataclasses import dataclass
+from pathlib import Path
+
+from devin_switch.store import Account, Store, SwitchError
+
+BUNDLED_CLI = Path(
+    "/Applications/Devin.app/Contents/Resources/app/extensions/windsurf/devin/bin/devin"
+)
+AUTH_ENVIRONMENT = frozenset(
+    {
+        "WINDSURF_API_KEY",
+        "CODEIUM_API_KEY",
+        "DEVIN_API_KEY",
+        "DEVIN_AUTH_TOKEN",
+        "DEVIN_API_URL",
+        "DEVIN_REMOTE_AUTH_TOKEN",
+        "DEVIN_REMOTE_SESSION_TOKEN",
+        "DEVIN_OUTPOSTS_TOKEN",
+        "DEVIN_OUTPOST_CONNECT_TOKEN",
+    }
+)
+ANSI_ESCAPE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
+
+
+def find_binary() -> Path:
+    candidate = os.environ.get("DS_BINARY") or shutil.which("devin")
+    binary = Path(candidate) if candidate else BUNDLED_CLI
+    if not binary.is_file() or not os.access(binary, os.X_OK):
+        raise SwitchError("Devin CLI was not found. Install it or set DS_BINARY to its executable.")
+    return binary.resolve()
+
+
+@dataclass(frozen=True)
+class Native:
+    store: Store
+    binary: Path
+
+    def environment(self, account: Account) -> dict[str, str]:
+        self.store.prepare(account)
+        base = self.store.directory(account.name)
+        return {
+            **{key: value for key, value in os.environ.items() if key not in AUTH_ENVIRONMENT},
+            "XDG_DATA_HOME": str(base / "data"),
+            "XDG_CONFIG_HOME": str(base / "config"),
+            "XDG_CACHE_HOME": str(base / "cache"),
+            "XDG_STATE_HOME": str(base / "state"),
+        }
+
+    def capture(self, account: Account, arguments: tuple[str, ...]) -> str:
+        result = subprocess.run(
+            (str(self.binary), *arguments),
+            env=self.environment(account),
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+        )
+        if result.returncode:
+            # Native authentication errors can include credential material.
+            raise SwitchError(
+                f"Devin {' '.join(arguments)} failed for {account.name!r} "
+                f"(exit {result.returncode}); retry with ds login {account.name}."
+            )
+        return result.stdout
+
+    def authenticated(self, account: Account) -> bool:
+        credentials = self.store.credentials(account)
+        if credentials.is_symlink():
+            raise SwitchError(f"Credentials must be a separate regular file for {account.name!r}.")
+        if not credentials.is_file() or credentials.stat().st_size == 0:
+            return False
+        credentials.chmod(0o600)
+        output = ANSI_ESCAPE.sub("", self.capture(account, ("auth", "status")))
+        return bool(re.search(r"^Logged in(?:[ .]|$)", output, re.MULTILINE))
+
+    def require_login(self, account: Account) -> None:
+        if not self.authenticated(account):
+            raise SwitchError(f"No saved login for {account.name!r}. Run: ds login {account.name}")
+
+    def interactive(self, account: Account, arguments: tuple[str, ...]) -> int:
+        previous_umask = os.umask(0o077)
+        try:
+            result = subprocess.run(
+                (str(self.binary), *arguments), env=self.environment(account), check=False
+            )
+            return result.returncode if result.returncode >= 0 else 128 - result.returncode
+        finally:
+            os.umask(previous_umask)
+
+    def sessions(self, account: Account) -> list[object]:
+        output = self.capture(account, ("list", "--format", "json"))
+        try:
+            sessions = json.loads(output)
+        except json.JSONDecodeError as exc:
+            raise SwitchError("Devin returned an unreadable session list.") from exc
+        if not isinstance(sessions, list):
+            raise SwitchError("Devin returned an unexpected session list format.")
+        return sessions

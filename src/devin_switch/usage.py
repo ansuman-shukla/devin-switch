@@ -196,6 +196,29 @@ def read_cached(store: Store, account: Account, *, now: float | None = None) -> 
         return Usage()
 
 
+def remaining_allowance(reading: Usage, *, now: float | None = None) -> float | None:
+    now = time.time() if now is None else now
+    if reading.status != "ok" or reading.fetched_at is None:
+        return None
+    try:
+        age = now - finite_number(reading.fetched_at)
+        if not 0 <= age <= STALE_SECONDS:
+            return None
+        remaining = []
+        for window in (reading.daily, reading.weekly):
+            if window.state == "not_applicable":
+                continue
+            if window.state != "available" or finite_number(window.resets_at) <= now:
+                return None
+            used = finite_number(window.used_percent)
+            if not 0 <= used <= 100:
+                return None
+            remaining.append(100 - used)
+        return min(remaining) if remaining else None
+    except ValueError:
+        return None
+
+
 def refresh_account(store: Store, account: Account, *, force: bool = False) -> Usage:
     now = time.time()
     previous = read_cached(store, account, now=now)

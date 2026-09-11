@@ -114,6 +114,10 @@ class Native:
     def interactive(self, account: Account, arguments: tuple[str, ...]) -> int:
         previous_umask = os.umask(0o077)
         try:
+            if self.run_id and sys.stdin.isatty() and sys.stdout.isatty():
+                from devin_switch import terminal
+
+                return terminal.run(self, account, arguments)
             result = subprocess.run(
                 (str(self.binary), *arguments),
                 env=self.environment(account),

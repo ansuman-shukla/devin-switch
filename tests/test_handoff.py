@@ -1,7 +1,6 @@
 import io
 import json
 import os
-import shlex
 import sqlite3
 import subprocess
 import sys
@@ -9,7 +8,7 @@ from pathlib import Path
 
 import pytest
 
-from devin_switch import cli, sessions
+from devin_switch import cli, handoff, sessions, usage
 from devin_switch.native import Native
 from devin_switch.store import Store, SwitchError
 
@@ -26,10 +25,27 @@ def seed_history(store: Store, project: Path) -> None:
         )
 
 
-def setup_project(store: Store, project: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+@pytest.fixture(autouse=True)
+def reported_usage(monkeypatch):
+    import time
+
+    def refresh(store, account, *, force):
+        assert force
+        now = time.time()
+        return usage.Usage(
+            status="ok",
+            daily=usage.Window(20, now + 3600, "available"),
+            weekly=usage.Window(40, now + 86400, "available"),
+            fetched_at=now,
+            checked_at=now,
+        )
+
+    monkeypatch.setattr(usage, "refresh_account", refresh)
+
+
+def setup_project(store: Store, project: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.chdir(project)
-    assert cli.execute(cli.parser().parse_args(["switch", "--setup"]), store) == 0
-    return project / ".devin/hooks.v1.json"
+    monkeypatch.setattr(handoff, "controller_available", lambda *_: True)
 
 
 def record_exit(store: Store, session_id="exact-chat", reason="prompt_input_exit") -> None:
@@ -41,54 +57,71 @@ def record_exit(store: Store, session_id="exact-chat", reason="prompt_input_exit
     )
 
 
-def test_setup_merges_hooks_idempotently(store: Store, tmp_path: Path, monkeypatch):
-    from devin_switch.handoff import HOOK_COMMAND
-
-    directory = tmp_path / ".devin"
-    directory.mkdir()
-    path = directory / "hooks.v1.json"
-    existing = {"Stop": [{"hooks": [{"type": "command", "command": "check-tests"}]}]}
-    existing["SessionEnd"] = [{"hooks": [{"type": "command", "command": "existing-cleanup"}]}]
-    path.write_text(json.dumps(existing))
-    setup_project(store, tmp_path, monkeypatch)
-    first = path.read_bytes()
-    setup_project(store, tmp_path, monkeypatch)
-    assert path.read_bytes() == first
-    installed = json.loads(first)
-    assert installed["Stop"] == existing["Stop"]
-    assert installed["SessionEnd"][0] == existing["SessionEnd"][0]
-    assert installed["SessionEnd"][1]["hooks"][0]["command"] == HOOK_COMMAND
-    assert str(tmp_path) not in HOOK_COMMAND
-    assert not (tmp_path / ".claude").exists()
-
-
-@pytest.mark.parametrize("content", ["not json", "[]", '{"SessionEnd": {}}'])
-def test_setup_preserves_invalid_configuration(store: Store, tmp_path, monkeypatch, content):
-    monkeypatch.chdir(tmp_path)
-    directory = tmp_path / ".devin"
-    directory.mkdir()
-    path = directory / "hooks.v1.json"
+@pytest.mark.parametrize(
+    "content",
+    [
+        "{}",
+        '{"theme_mode":"dark"}',
+        '{"hooks":null,"theme_mode":"dark"}',
+        '{"hooks":{"Stop":[]}}',
+        '{"hooks":{"SessionEnd":[{"hooks":[{"type":"command","command":"old"}]}]}}',
+        '{\n// keep this\n"permissions":{"deny":["Exec(secret)"],}, /* keep too */\n}',
+        '{"hooks":{"SessionEnd":[/* keep array comment */],},"label":"http://x/*a*/,}",}',
+    ],
+)
+def test_automatic_hook_preserves_profile_configuration(store, tmp_path, content):
+    account = store.accounts()[0]
+    path = store.directory(account.name) / "config/devin/config.json"
+    path.parent.mkdir()
     path.write_text(content)
-    with pytest.raises(SwitchError, match="hooks"):
-        cli.execute(cli.parser().parse_args(["switch", "--setup"]), store)
+    handoff.enable(store, account)
+    first = path.read_text()
+    before = json.loads(handoff.json_source(content))
+    installed = json.loads(handoff.json_source(first))
+    assert handoff.HOOK in installed["hooks"]["SessionEnd"]
+    installed["hooks"]["SessionEnd"].remove(handoff.HOOK)
+    for key, value in before.items():
+        if key != "hooks":
+            assert installed[key] == value
+    for event, hooks in (before.get("hooks") or {}).items():
+        assert installed["hooks"][event] == hooks
+    if "// keep this" in content:
+        assert "// keep this" in first and "/* keep too */" in first
+    if "/* keep array comment */" in content:
+        assert "/* keep array comment */" in first
+    handoff.enable(store, account)
+    assert path.read_text() == first
+    assert not (tmp_path / ".devin").exists()
+
+
+@pytest.mark.parametrize(
+    "content", ["not json", "[]", '{"hooks":[]}', '{"hooks":{"SessionEnd":{}}}']
+)
+def test_automatic_hook_preserves_invalid_configuration(store, content):
+    account = store.accounts()[0]
+    path = store.directory(account.name) / "config/devin/config.json"
+    path.parent.mkdir()
+    path.write_text(content)
+    with pytest.raises(SwitchError, match="config"):
+        handoff.enable(store, account)
     assert path.read_text() == content
 
 
 @pytest.mark.parametrize("linked_directory", [False, True])
-def test_setup_refuses_symlinks(store: Store, tmp_path, monkeypatch, linked_directory):
-    monkeypatch.chdir(tmp_path)
+def test_automatic_hook_refuses_symlinks(store, tmp_path, linked_directory):
+    account = store.accounts()[0]
     external = tmp_path / "external"
     external.mkdir()
-    target = external / "hooks.v1.json"
+    target = external / "config.json"
     target.write_text("{}")
-    directory = tmp_path / ".devin"
+    directory = store.directory(account.name) / "config/devin"
     if linked_directory:
         directory.symlink_to(external, target_is_directory=True)
     else:
         directory.mkdir()
-        (directory / "hooks.v1.json").symlink_to(target)
+        (directory / "config.json").symlink_to(target)
     with pytest.raises(SwitchError, match="linked"):
-        cli.execute(cli.parser().parse_args(["switch", "--setup"]), store)
+        handoff.enable(store, account)
     assert target.read_text() == "{}"
 
 
@@ -132,8 +165,10 @@ def test_switch_resumes_exact_exit_chat_and_cycles_from_bound_account(
     assert store.selected().name == "ansuman-2"
     assert not any(run["active"] for run in sessions.runs(store))
     output = capsys.readouterr()
-    assert "Ctrl+D" in output.out
+    assert "Ctrl+D" not in output.out
+    assert "automatically" in output.out
     assert "default" in output.err
+    assert not (tmp_path / ".devin").exists()
 
 
 @pytest.mark.parametrize(
@@ -177,11 +212,11 @@ def test_handoff_never_guesses_or_restarts_on_failure(
     assert not any(run["active"] for run in sessions.runs(store))
 
 
-@pytest.mark.parametrize("case", ["same-account", "signed-out", "no-setup", "print"])
+@pytest.mark.parametrize("case", ["same-account", "signed-out", "no-controller", "print"])
 def test_invalid_switch_does_not_queue(signed_in: Native, tmp_path, monkeypatch, case):
     store = signed_in.store
     monkeypatch.chdir(tmp_path)
-    if case != "no-setup":
+    if case != "no-controller":
         setup_project(store, tmp_path, monkeypatch)
     store.select(store.account("ansuman-1"))
     monkeypatch.setattr(cli, "find_binary", lambda: signed_in.binary)
@@ -211,7 +246,7 @@ def test_invalid_switch_does_not_queue(signed_in: Native, tmp_path, monkeypatch,
         (("--", "initial private prompt", "--sandbox"), ()),
         (("--resume=old", "--model", "opus", "--", "do not replay"), ()),
         (("-rold", "--prompt-file=private.txt", "--sandbox"), ("--sandbox",)),
-        (("--continue", "--config", "a path/config.json"), ("--config", "a path/config.json")),
+        (("--continue", "--config", "a path/config.json"), None),
         (("--permission-mode=accept-edits",), ("--permission-mode=accept-edits",)),
         (
             ("--export", "a file.json", "--respect-workspace-trust", "true"),
@@ -286,71 +321,40 @@ def test_hook_command_quotes_runtime_and_noops_outside_switch(tmp_path, frozen):
     assert result.stdout.splitlines() == expected
 
 
-def test_real_process_handoff_keeps_terminal_directory_and_no_prompt_replay(
-    signed_in: Native, tmp_path: Path, monkeypatch
-):
+def test_best_account_uses_limiting_quota_not_alphabetical_order(signed_in, monkeypatch):
+    import time
+
     store = signed_in.store
-    setup_project(store, tmp_path, monkeypatch)
-    seed_history(store, tmp_path)
-    store.select(store.account("ansuman-1"))
-    binary = tmp_path / "fake native"
-    binary.write_text(
-        "#!/usr/bin/env python3\n"
-        "import json, os, pathlib, subprocess, sys\n"
-        "args = sys.argv[1:]\n"
-        "if args == ['auth', 'status']:\n"
-        "    print('Logged in as offline@example.invalid')\n"
-        "    sys.exit(0)\n"
-        "account = pathlib.Path(os.environ['XDG_DATA_HOME']).parent.name\n"
-        "print(json.dumps({'account': account, 'args': args, 'cwd': os.getcwd()}), flush=True)\n"
-        "if account == 'ansuman-1':\n"
-        f"    command = {shlex.join((sys.executable, '-m', 'devin_switch.cli', 'switch'))!r}\n"
-        "    result = subprocess.run(command, shell=True, capture_output=True, text=True)\n"
-        "    assert result.returncode == 0, result.stderr\n"
-        "    hooks = json.loads(pathlib.Path('.devin/hooks.v1.json').read_text())\n"
-        "    command = hooks['SessionEnd'][-1]['hooks'][0]['command']\n"
-        "    event = {'hook_event_name': 'SessionEnd', 'session_id': 'exact-chat', "
-        "'reason': 'prompt_input_exit'}\n"
-        "    result = subprocess.run(command, shell=True, input=json.dumps(event), "
-        "capture_output=True, text=True)\n"
-        "    assert result.returncode == 0, result.stderr\n"
-    )
-    binary.chmod(0o700)
-    environment = {**os.environ, "DS_BINARY": str(binary)}
-    result = subprocess.run(
-        (
-            sys.executable,
-            "-m",
-            "devin_switch.cli",
-            "run",
-            "--",
-            "--sandbox",
-            "--",
-            "private-prompt-marker",
-        ),
-        env=environment,
-        cwd=tmp_path,
-        capture_output=True,
-        text=True,
-        timeout=20,
-    )
-    assert result.returncode == 0, result.stderr
-    launches = [json.loads(line) for line in result.stdout.splitlines()]
-    assert launches == [
-        {
-            "account": "ansuman-1",
-            "args": ["--sandbox", "--", "private-prompt-marker"],
-            "cwd": str(tmp_path),
-        },
-        {
-            "account": "ansuman-2",
-            "args": ["--sandbox", "--resume", "exact-chat"],
-            "cwd": str(tmp_path),
-        },
-    ]
-    assert store.selected().name == "ansuman-1"
-    assert not any(run["active"] for run in sessions.runs(store))
-    assert "private-prompt-marker" not in json.dumps(sessions.overview(store))
+    with store.lock():
+        third = store.add("ansuman-3", None)
+    store.credentials(third).write_text("valid-third")
+    checked = []
+
+    def refresh(store, account, *, force):
+        assert force
+        if account.name == "ansuman-2":
+            with store.lock():
+                pass
+        checked.append(account.name)
+        now = time.time()
+        used = (0, 95) if account.name == "ansuman-2" else (35, 40)
+        return usage.Usage(
+            status="ok",
+            daily=usage.Window(used[0], now + 1000, "available"),
+            weekly=usage.Window(used[1], now + 1000, "available"),
+            fetched_at=now,
+        )
+
+    monkeypatch.setattr(usage, "refresh_account", refresh)
+    assert handoff.choose_best(signed_in, "ansuman-1") == (third, 60)
+    assert set(checked) == {"ansuman-2", "ansuman-3"}
+
+
+@pytest.mark.parametrize("status", ["stale", "unavailable", "sign_in"])
+def test_no_known_quota_never_selects_unknown_as_unlimited(signed_in, monkeypatch, status):
+    monkeypatch.setattr(usage, "refresh_account", lambda *_a, **_k: usage.Usage(status=status))
+    with pytest.raises(SwitchError, match="confirmed remaining usage"):
+        handoff.choose_best(signed_in, "ansuman-1")
 
 
 def test_repeated_handoffs_follow_exit_id_not_original_resume(
@@ -492,7 +496,7 @@ def test_handoff_keeps_launch_metadata_readable_by_older_managers(signed_in: Nat
         }
 
 
-@pytest.mark.parametrize("flag", ["--setup", "--cancel"])
+@pytest.mark.parametrize("flag", ["--cancel"])
 def test_setup_and_cancel_reject_account_argument(store, flag):
     with pytest.raises(SwitchError, match="not both"):
         cli.execute(cli.parser().parse_args(["switch", "ansuman-2", flag]), store)

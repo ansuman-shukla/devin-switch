@@ -180,3 +180,19 @@ def test_installed_cli_isolation_and_existing_session_visibility(
     assert history(store)[0]["project"] == str(tmp_path)
     assert not store.credentials(first).exists()
     assert not store.credentials(second).exists()
+
+
+@pytest.mark.skipif(
+    not os.environ.get("DS_TEST_NATIVE"), reason="Set DS_TEST_NATIVE for installed CLI"
+)
+def test_installed_cli_accepts_automatic_hook(store: Store, tmp_path: Path, monkeypatch) -> None:
+    from devin_switch.handoff import enable
+
+    monkeypatch.chdir(tmp_path)
+    native = Native(store, Path(os.environ["DS_TEST_NATIVE"]))
+    account = store.accounts()[0]
+    enable(store, account)
+    assert "Not logged in" in native.capture(account, ("auth", "status"))
+    assert native.sessions(account) == []
+    assert not store.credentials(account).exists()
+    assert not (tmp_path / ".devin").exists()

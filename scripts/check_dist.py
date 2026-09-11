@@ -95,7 +95,7 @@ def verify(directory: Path) -> None:
             cwd=root,
         )
         python = root / "tools/devin-switch/bin/python"
-        for module in ("cli", "desktop", "sessions", "usage", "handoff"):
+        for module in ("cli", "desktop", "sessions", "usage", "handoff", "terminal"):
             subprocess.run(
                 (str(python), "-c", f"import devin_switch.{module}"),
                 check=True,
@@ -105,14 +105,20 @@ def verify(directory: Path) -> None:
         subprocess.run((str(root / "bin/ds"), "--help"), check=True, env=environment, cwd=root)
         subprocess.run((str(root / "bin/ds"), "list"), check=True, env=environment, cwd=root)
         subprocess.run(
-            (str(root / "bin/ds"), "switch", "--setup"), check=True, env=environment, cwd=root
+            (str(root / "bin/ds"), "switch", "--help"), check=True, env=environment, cwd=root
         )
         subprocess.run(
             (
                 str(python),
                 "-c",
-                "from pathlib import Path; from devin_switch.handoff import "
-                "enabled; assert enabled(Path.cwd())",
+                "import json, os; from pathlib import Path; "
+                "from devin_switch.handoff import enable, json_source, HOOK; "
+                "from devin_switch.store import Store; store = Store(Path(os.environ['DS_HOME'])); "
+                "account = store.add('package-test', None); enable(store, account); "
+                "config = store.directory(account.name) / 'config/devin/config.json'; "
+                "loaded = json.loads(json_source(config.read_text())); "
+                "assert HOOK in loaded['hooks']['SessionEnd']; "
+                "assert not (Path.cwd() / '.devin').exists()",
             ),
             check=True,
             env=environment,

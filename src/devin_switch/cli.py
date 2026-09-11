@@ -37,24 +37,16 @@ def parser() -> argparse.ArgumentParser:
     commands.add_parser("next", help="Cycle to another saved login; does not measure quota")
     switch = commands.add_parser(
         "switch",
-        help="Queue an in-chat account handoff; exit with Ctrl+D to resume here",
+        help="Resume this chat with the account reporting the most remaining usage",
         description=(
-            "Inside a ds run chat, type !ds switch [ALIAS], then Ctrl+D on an empty input. "
-            "The exact saved conversation reopens here; the default account is unchanged. "
-            "Without ALIAS, cycle from this chat's account (not a quota check). "
-            "First enable the project hook with ds switch --setup, then start ds run."
+            "Inside a ds run chat, type !ds switch. Switch refreshes usage, selects the "
+            "other saved login with the most remaining daily/weekly allowance, and reopens "
+            "the exact conversation here. No project setup or manual exit is needed. "
+            "An optional ALIAS overrides automatic selection. The saved default is unchanged."
         ),
     )
     switch.add_argument("account", nargs="?")
-    switch_mode = switch.add_mutually_exclusive_group()
-    switch_mode.add_argument(
-        "--setup",
-        action="store_true",
-        help="Add the exit hook to this project's .devin/hooks.v1.json",
-    )
-    switch_mode.add_argument(
-        "--cancel", action="store_true", help="Cancel this chat's queued switch"
-    )
+    switch.add_argument("--cancel", action="store_true", help="Cancel a pending switch")
     commands.add_parser("list", help="List registered accounts and the current selection")
     commands.add_parser("profiles", help="List existing Chrome profile identifiers")
     status = commands.add_parser("status", help="Check the selected or specified saved login")
@@ -158,9 +150,10 @@ def execute(args: argparse.Namespace, store: Store) -> int:
                 else:
                     print(f"Using {account.name}", file=sys.stderr, flush=True)
                     if options is not None:
+                        with store.lock():
+                            handoff.enable(store, account)
                         print(
-                            "Switch accounts here: !ds switch [alias], then Ctrl+D. "
-                            "One-time project setup: ds switch --setup",
+                            "Low on usage? !ds switch resumes here with the best available login.",
                             file=sys.stderr,
                             flush=True,
                         )
@@ -179,35 +172,34 @@ def execute(args: argparse.Namespace, store: Store) -> int:
                 file=sys.stderr,
                 flush=True,
             )
-    with store.lock():
-        if args.command == "switch":
-            if args.account and (args.setup or args.cancel):
-                raise SwitchError("Use an account alias, --setup, or --cancel, not both.")
-            if args.setup:
-                handoff.install(Path.cwd().resolve())
-                print("Exit hook enabled in .devin/hooks.v1.json. Start a fresh ds run to use it.")
-                return 0
+    if args.command == "switch":
+        if args.account and args.cancel:
+            raise SwitchError("Use an account alias or --cancel, not both.")
+        with store.lock():
             run = handoff.current(store)
             if args.cancel:
                 handoff.cancel(store, run)
-                print("Queued switch canceled. This chat's account and the default are unchanged.")
+                print("Switch canceled. This chat's account and the default are unchanged.")
                 return 0
-            native = Native(store, find_binary())
-            account = (
-                store.account(args.account)
-                if args.account
-                else choose_next(store, native, current=run["account"])
-            )
+        native = Native(store, find_binary())
+        if args.account:
+            account, detail = store.account(args.account), "chosen explicitly"
+        else:
+            print("Checking saved accounts for remaining usage…", flush=True)
+            account, remaining = handoff.choose_best(native, run["account"])
+            detail = f"{remaining:g}% remaining in its limiting quota window"
+        with store.lock():
+            run = handoff.current(store)
             with store.account_lock(account, shared=True):
                 native.require_login(account)
                 handoff.queue(store, run, account)
-            print(
-                f"Switch queued: {run['account']} → {account.name} (quota not checked).\n"
-                "Press Ctrl+D on an empty input to exit and reopen this conversation here.\n"
-                "If bash mode remains open, press Esc first. Cancel with !ds switch --cancel.\n"
-                "The saved default is unchanged; your last prompt will not be replayed."
-            )
-            return 0
+        print(
+            f"Switching {run['account']} → {account.name} ({detail}).\n"
+            "Reopening this conversation here automatically; default account unchanged.",
+            flush=True,
+        )
+        return 0
+    with store.lock():
         if args.command == "remove":
             if not args.yes:
                 raise SwitchError("Confirm profile removal with ds remove <alias> --yes.")

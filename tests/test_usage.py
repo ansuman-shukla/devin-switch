@@ -236,3 +236,52 @@ def test_reset_boundary_marks_even_recent_cache_stale(
     account = store.account("ansuman-1")
     usage.refresh_account(store, account)
     assert usage.read_cached(store, account, now=NOW + 6).status == "stale"
+
+
+@pytest.mark.parametrize(
+    ("daily", "weekly", "expected"),
+    [(10, 90, 10), (90, 10, 10), (35, 40, 35), (0, 100, 0), (75, 75, 75)],
+)
+def test_remaining_allowance_uses_limiting_window(daily, weekly, expected):
+    reading = usage.parse_status(
+        response(dailyQuotaRemainingPercent=daily, weeklyQuotaRemainingPercent=weekly), NOW
+    )
+    assert usage.remaining_allowance(reading, now=NOW) == expected
+
+
+def test_remaining_allowance_excludes_hidden_windows_without_assuming_unlimited():
+    reading = usage.parse_status(
+        response(planInfo={"billingStrategy": 2, "hideDailyQuota": True}), NOW
+    )
+    assert usage.remaining_allowance(reading, now=NOW) == 22
+    hidden = usage.parse_status(
+        response(
+            planInfo={
+                "billingStrategy": 2,
+                "hideDailyQuota": True,
+                "hideWeeklyQuota": True,
+            }
+        ),
+        NOW,
+    )
+    assert usage.remaining_allowance(hidden, now=NOW) is None
+
+
+@pytest.mark.parametrize("problem", ["stale", "old", "future", "reset", "missing", "nan"])
+def test_remaining_allowance_requires_fresh_complete_finite_usage(problem):
+    from dataclasses import replace
+
+    reading = usage.parse_status(response(), NOW)
+    if problem == "stale":
+        reading = replace(reading, status="stale")
+    elif problem == "old":
+        reading = replace(reading, fetched_at=NOW - usage.STALE_SECONDS - 1)
+    elif problem == "future":
+        reading = replace(reading, fetched_at=NOW + 1)
+    elif problem == "reset":
+        reading = replace(reading, daily=replace(reading.daily, resets_at=NOW))
+    elif problem == "missing":
+        reading = replace(reading, weekly=usage.Window())
+    else:
+        reading = replace(reading, daily=replace(reading.daily, used_percent=float("nan")))
+    assert usage.remaining_allowance(reading, now=NOW) is None

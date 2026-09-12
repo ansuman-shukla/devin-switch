@@ -6,6 +6,7 @@ import json
 import os
 import subprocess
 import sys
+from dataclasses import replace
 from pathlib import Path
 
 from devin_switch import browser, handoff, sessions
@@ -42,7 +43,8 @@ def parser() -> argparse.ArgumentParser:
             "Inside a ds run chat, type !ds switch. Switch refreshes usage, selects the "
             "other saved login with the most remaining daily/weekly allowance, and reopens "
             "the exact conversation here. No project setup or manual exit is needed. "
-            "An optional ALIAS overrides automatic selection. The saved default is unchanged."
+            "An optional ALIAS overrides automatic selection. The resumed account also becomes "
+            "the app's default for new chats when its CLI process starts."
         ),
     )
     switch.add_argument("account", nargs="?")
@@ -165,8 +167,9 @@ def execute(args: argparse.Namespace, store: Store) -> int:
             if next_launch is None:
                 return code
             name, arguments = next_launch
+            native = replace(native, select_on_start=True)
             print(
-                f"Reopening the saved conversation with {name}; default account unchanged.\n"
+                f"Reopening with {name}; this becomes the default for new chats on launch.\n"
                 "No prompt is replayed. Send your next message when ready.\n"
                 f"If reopening fails: {handoff.recovery_command(name, arguments)}",
                 file=sys.stderr,
@@ -195,7 +198,7 @@ def execute(args: argparse.Namespace, store: Store) -> int:
                 handoff.queue(store, run, account)
         print(
             f"Switching {run['account']} → {account.name} ({detail}).\n"
-            "Reopening this conversation here automatically; default account unchanged.",
+            "Reopening here automatically and setting this account as the app's default.",
             flush=True,
         )
         return 0
@@ -271,7 +274,7 @@ def main() -> int:
         )
         return 1
     except KeyboardInterrupt:
-        print("\nds: Interrupted. Saved account selection is unchanged.", file=sys.stderr)
+        print("\nds: Interrupted.", file=sys.stderr)
         return 130
 
 

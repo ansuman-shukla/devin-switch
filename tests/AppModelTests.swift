@@ -88,6 +88,17 @@ func sampleSnapshot(used: Double = 25, selected: String = "work") -> Snapshot {
             try await Task.sleep(for: .milliseconds(40))
             try expect(updates == 0, "An unchanged snapshot must not redraw the UI")
             withExtendedLifetime(observation) {}
+        case "external-default":
+            model.snapshot = sampleSnapshot()
+            model.focus = "work"
+            model.autoRefreshUsage = false
+            model.refresh()
+            try await waitUntil { bridge.requests.count == 1 }
+            bridge.complete(0, state: sampleSnapshot(selected: "personal"))
+            try await waitUntil { model.snapshot.selected == "personal" }
+            try expect(model.snapshot.selected == "personal", "A CLI switch must update the app's default on state refresh")
+            try expect(model.focus == "work", "Updating the default must not interrupt account browsing")
+            try expect(!model.working && !model.blocked, "An external switch must not leave account controls busy")
         case "usage-race":
             model.snapshot = sampleSnapshot()
             model.focus = "work"

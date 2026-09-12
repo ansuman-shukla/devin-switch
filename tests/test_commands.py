@@ -196,3 +196,30 @@ def test_installed_cli_accepts_automatic_hook(store: Store, tmp_path: Path, monk
     assert native.sessions(account) == []
     assert not store.credentials(account).exists()
     assert not (tmp_path / ".devin").exists()
+
+
+def test_failed_process_creation_does_not_change_handoff_default(signed_in: Native, tmp_path):
+    from dataclasses import replace
+
+    store = signed_in.store
+    first, second = store.accounts()
+    store.select(first)
+    runner = replace(signed_in, binary=tmp_path / "missing-cli", select_on_start=True)
+    with pytest.raises(OSError):
+        runner.interactive(second, ("--resume", "exact-chat"))
+    assert store.selected() == first
+    with store.lock():
+        pass
+
+
+@pytest.mark.parametrize("code", [0, 7])
+def test_launched_handoff_stays_default_after_chat_exit(signed_in, monkeypatch, code):
+    from dataclasses import replace
+
+    store = signed_in.store
+    first, second = store.accounts()
+    store.select(first)
+    monkeypatch.setenv("FAKE_EXIT", str(code))
+    runner = replace(signed_in, select_on_start=True)
+    assert runner.interactive(second, ("--resume", "exact-chat")) == code
+    assert store.selected() == second

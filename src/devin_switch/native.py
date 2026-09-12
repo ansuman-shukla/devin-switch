@@ -6,6 +6,8 @@ import re
 import shutil
 import subprocess
 import sys
+from collections.abc import Iterator
+from contextlib import ExitStack, contextmanager, nullcontext
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -54,6 +56,14 @@ class Native:
     binary: Path
     lock_fds: tuple[int, ...] = ()
     run_id: str | None = None
+    select_on_start: bool = False
+
+    @contextmanager
+    def launch_selection(self, account: Account) -> Iterator[None]:
+        with self.store.lock() if self.select_on_start else nullcontext():
+            yield
+            if self.select_on_start:
+                self.store.select(account)
 
     def environment(self, account: Account) -> dict[str, str]:
         self.store.prepare(account)
@@ -118,13 +128,17 @@ class Native:
                 from devin_switch import terminal
 
                 return terminal.run(self, account, arguments)
-            result = subprocess.run(
-                (str(self.binary), *arguments),
-                env=self.environment(account),
-                check=False,
-                pass_fds=self.lock_fds,
-            )
-            return result.returncode if result.returncode >= 0 else 128 - result.returncode
+            with ExitStack() as stack:
+                with self.launch_selection(account):
+                    process = stack.enter_context(
+                        subprocess.Popen(
+                            (str(self.binary), *arguments),
+                            env=self.environment(account),
+                            pass_fds=self.lock_fds,
+                        )
+                    )
+                code = process.wait()
+            return code if code >= 0 else 128 - code
         finally:
             os.umask(previous_umask)
 

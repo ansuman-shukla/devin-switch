@@ -137,7 +137,11 @@ Start your chat with `ds run` as usual. When you hit a limit, enter this at the 
 **That's it—no project setup and no manual exit.** The local command refreshes reported usage,
 chooses the other signed-in account with the most remaining allowance, closes the CLI normally,
 and reopens the **exact saved conversation in the same terminal and project**. No model response
-is needed to perform the switch. Your saved default and other repositories' chats stay unchanged.
+is needed to perform the switch. When the resumed CLI process starts, its account also becomes
+**the app's default for new chats**. The app picks this up on its next automatic state refresh
+(or when brought to the foreground). Other already-open chats keep their own accounts.
+Canceled requests, failed checks, and process-creation failures leave the default unchanged.
+Once the new CLI has launched, closing that chat does not revert the default.
 
 Accounts are ranked by the smaller of their remaining daily and weekly percentages: either quota
 can prevent another request. Explicitly non-applicable windows are excluded. Exhausted accounts,

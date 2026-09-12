@@ -100,16 +100,17 @@ def run(native, account, arguments: tuple[str, ...]) -> int:
     try:
         resize()
         with native.store.lock(f"controller-{native.run_id}.lock"):
-            process = subprocess.Popen(
-                (str(native.binary), *arguments),
-                stdin=slave,
-                stdout=slave,
-                stderr=slave,
-                env=native.environment(account),
-                pass_fds=native.lock_fds,
-                start_new_session=True,
-                preexec_fn=claim_terminal,
-            )
+            with native.launch_selection(account):
+                process = subprocess.Popen(
+                    (str(native.binary), *arguments),
+                    stdin=slave,
+                    stdout=slave,
+                    stderr=slave,
+                    env=native.environment(account),
+                    pass_fds=native.lock_fds,
+                    start_new_session=True,
+                    preexec_fn=claim_terminal,
+                )
             os.close(slave)
             slave = -1
             signal.signal(signal.SIGWINCH, resize)

@@ -171,6 +171,41 @@ def test_switch_resumes_exact_exit_chat_and_cycles_from_bound_account(
     assert not (tmp_path / ".devin").exists()
 
 
+@pytest.mark.parametrize("initial_default", [None, "ansuman-1"])
+def test_explicit_switch_sets_default_only_when_resumed_launch_starts(
+    signed_in, tmp_path, monkeypatch, initial_default
+):
+    store = signed_in.store
+    setup_project(store, tmp_path, monkeypatch)
+    seed_history(store, tmp_path)
+    if initial_default:
+        store.select(store.account(initial_default))
+    monkeypatch.setattr(cli, "find_binary", lambda: signed_in.binary)
+    launches = []
+
+    def interactive(self, account, arguments):
+        assert cli.selected_name(store) == initial_default
+        with self.launch_selection(account):
+            assert cli.selected_name(store) == initial_default
+        launches.append(account.name)
+        if len(launches) == 1:
+            assert not self.select_on_start
+            monkeypatch.setenv("DS_RUN_ID", self.run_id)
+            cli.execute(cli.parser().parse_args(["switch", "ansuman-2"]), store)
+            assert cli.selected_name(store) == initial_default
+            record_exit(store)
+            assert cli.selected_name(store) == initial_default
+        else:
+            assert self.select_on_start
+            assert store.selected().name == "ansuman-2"
+        return 0
+
+    monkeypatch.setattr(Native, "interactive", interactive)
+    assert cli.execute(cli.parser().parse_args(["run", "--account", "ansuman-1"]), store) == 0
+    assert launches == ["ansuman-1", "ansuman-2"]
+    assert store.selected().name == "ansuman-2"
+
+
 @pytest.mark.parametrize(
     "action", ["cancel", "missing-hook", "crash", "clear-only", "missing-chat"]
 )
@@ -368,7 +403,10 @@ def test_repeated_handoffs_follow_exit_id_not_original_resume(
     launches = []
 
     def interactive(self, account, arguments):
+        with self.launch_selection(account):
+            pass
         launches.append((account.name, arguments))
+        assert store.selected().name == ("ansuman-2" if len(launches) == 1 else account.name)
         monkeypatch.setenv("DS_RUN_ID", self.run_id)
         if len(launches) < 3:
             assert cli.execute(cli.parser().parse_args(["switch"]), store) == 0
@@ -398,7 +436,7 @@ def test_repeated_handoffs_follow_exit_id_not_original_resume(
         ("ansuman-2", ("--permission-mode", "normal", "--sandbox", "--resume", "exact-chat")),
         ("ansuman-1", ("--permission-mode", "normal", "--sandbox", "--resume", "newer-chat")),
     ]
-    assert store.selected().name == "ansuman-2"
+    assert store.selected().name == "ansuman-1"
 
 
 @pytest.mark.parametrize("same_project", [False, True])
@@ -413,6 +451,8 @@ def test_handoff_respects_other_live_chats(signed_in: Native, tmp_path, monkeypa
     launches = []
 
     def interactive(self, account, arguments):
+        with self.launch_selection(account):
+            pass
         launches.append(account.name)
         if len(launches) == 1:
             monkeypatch.setenv("DS_RUN_ID", self.run_id)
@@ -422,7 +462,7 @@ def test_handoff_respects_other_live_chats(signed_in: Native, tmp_path, monkeypa
 
     monkeypatch.setattr(Native, "interactive", interactive)
     monkeypatch.chdir(other)
-    with sessions.managed(signed_in, "ansuman-2", ()):
+    with sessions.managed(signed_in, "ansuman-1", ()):
         monkeypatch.chdir(tmp_path)
         if same_project:
             with pytest.raises(SwitchError, match="open"):
@@ -431,6 +471,9 @@ def test_handoff_respects_other_live_chats(signed_in: Native, tmp_path, monkeypa
         else:
             assert cli.execute(cli.parser().parse_args(["run"]), store) == 0
             assert launches == ["ansuman-1", "ansuman-2"]
+        assert store.selected().name == ("ansuman-1" if same_project else "ansuman-2")
+        active = [run for run in sessions.runs(store) if run["active"]]
+        assert len(active) == 1 and active[0]["account"] == "ansuman-1"
     assert not any(run["active"] for run in sessions.runs(store))
 
 

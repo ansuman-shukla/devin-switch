@@ -49,6 +49,7 @@ def model_tests(tmp_path_factory: pytest.TempPathFactory) -> Path:
     [
         "quiet-polling",
         "unchanged-state",
+        "external-default",
         "usage-race",
         "action-race",
         "errors",

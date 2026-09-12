@@ -11,7 +11,7 @@ from pathlib import Path
 
 import pytest
 
-from devin_switch import handoff, sessions, terminal
+from devin_switch import desktop, handoff, sessions, terminal
 from devin_switch.native import Native
 from devin_switch.store import Store, private_directory, write_json
 
@@ -78,8 +78,9 @@ def read_until(master: int, marker: bytes, timeout: float = 10) -> bytes:
 
 @pytest.mark.parametrize("usable", [True, False])
 def test_one_command_automatically_resumes_with_best_account_on_real_pty(
-    signed_in: Native, tmp_path: Path, usable: bool
+    signed_in: Native, tmp_path: Path, usable: bool, monkeypatch
 ):
+    monkeypatch.setattr(desktop.browser, "profiles", lambda: ())
     store = signed_in.store
     project = tmp_path / "project with spaces"
     project.mkdir()
@@ -193,6 +194,7 @@ def test_one_command_automatically_resumes_with_best_account_on_real_pty(
     try:
         output = read_until(master, b"READY-ansuman-1")
         assert not (project / ".devin").exists()
+        assert store.selected().name == "ansuman-2"
         os.write(master, b"!ds switch\r")
         output += read_until(master, b"READY-ansuman-3" if usable else b"COMMAND-DONE")
         if usable:
@@ -209,10 +211,13 @@ def test_one_command_automatically_resumes_with_best_account_on_real_pty(
         assert running[0]["account"] == ("ansuman-3" if usable else "ansuman-1")
         assert running[0]["project"] == str(project)
         assert running[0]["session_id"] == ("exact-chat" if usable else "newer-chat")
+        expected_default = "ansuman-3" if usable else "ansuman-2"
+        assert store.selected().name == expected_default
+        assert desktop.snapshot(store)["selected"] == expected_default
         os.write(master, b"\x04")
         read_until(master, b"TERMINAL-RESTORED")
         assert process.wait(timeout=5) == 0
-        assert store.selected().name == "ansuman-2"
+        assert store.selected().name == expected_default
         assert not any(run["active"] for run in sessions.runs(store))
         assert "private-initial-prompt" not in json.dumps(sessions.overview(store))
     finally:

@@ -32,6 +32,7 @@ struct Account: Decodable, Equatable, Identifiable {
     let chrome_profile: String?
     let saved_login: Bool
     var usage: AccountUsage
+    var display_name: String? = nil
     var id: String { name }
 }
 

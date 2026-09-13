@@ -24,6 +24,12 @@ def validate_name(name: str) -> str:
     return name
 
 
+def validate_display_name(value: str) -> str:
+    if not isinstance(value, str) or len(value.strip()) > 80 or (value and not value.isprintable()):
+        raise SwitchError("Use a display name of up to 80 printable characters.")
+    return value.strip()
+
+
 def private_directory(path: Path) -> None:
     path.mkdir(parents=True, exist_ok=True, mode=0o700)
     path.chmod(0o700)
@@ -46,6 +52,7 @@ def write_json(path: Path, value: object) -> None:
 class Account:
     name: str
     chrome_profile: str | None
+    display_name: str | None = None
 
 
 @dataclass(frozen=True)
@@ -106,7 +113,21 @@ class Store:
         profile = data["chrome_profile"]
         if profile is not None and (not isinstance(profile, str) or not profile):
             raise SwitchError(f"Chrome profile is invalid for {name!r}.")
-        return Account(name, profile)
+        try:
+            display_name = json.loads((self.directory(name) / "display-name.json").read_text())
+        except FileNotFoundError:
+            display_name = None
+        except json.JSONDecodeError as exc:
+            raise SwitchError(f"Display name is invalid for {name!r}.") from exc
+        if display_name is not None:
+            display_name = validate_display_name(display_name) or None
+        return Account(name, profile, display_name)
+
+    def set_display_name(self, account: Account, display_name: str) -> Account:
+        label = validate_display_name(display_name)
+        current = self.account(account.name)
+        write_json(self.directory(current.name) / "display-name.json", label or None)
+        return self.account(current.name)
 
     def add(self, name: str, chrome_profile: str | None) -> Account:
         folder = self.directory(name)

@@ -41,6 +41,7 @@ def snapshot(store: Store) -> dict[str, object]:
         "accounts": tuple(
             {
                 "name": account.name,
+                "display_name": account.display_name,
                 "chrome_profile": account.chrome_profile,
                 "usage": asdict(usage.read_cached(store, account)),
                 "saved_login": (
@@ -101,6 +102,17 @@ def action(store: Store, request: dict[str, object]) -> dict[str, object]:
     if operation == "usage":
         usage.refresh_all(store, force=request.get("force") == "true")
         return {"state": snapshot(store)}
+    if operation == "rename_display":
+        display_name = request.get("display_name")
+        if not isinstance(display_name, str):
+            raise SwitchError("Display name must be text. Leave it blank to use the CLI alias.")
+        with store.lock():
+            account = store.account(string_field(request, "account"))
+            account = store.set_display_name(account, display_name)
+        return {
+            "state": snapshot(store),
+            "message": f"Display name saved: {account.display_name or account.name}.",
+        }
     with store.lock():
         if operation == "import":
             added, renamed = enrollment.import_profiles(store, browser.profiles())

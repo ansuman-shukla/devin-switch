@@ -57,6 +57,15 @@ def model_tests(tmp_path_factory: pytest.TempPathFactory) -> Path:
         "timers",
         "wake",
         "row-labels",
+        "combined-quota",
+        "combined-quota-exhaustion",
+        "combined-quota-render",
+        "adaptive-layout",
+        "workspace-controls",
+        "navigation",
+        "rename-display",
+        "rename-errors",
+        "display-name-decoding",
     ],
 )
 def test_app_model(model_tests: Path, scenario: str, tmp_path: Path) -> None:

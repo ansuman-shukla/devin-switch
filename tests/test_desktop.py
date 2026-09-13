@@ -23,8 +23,18 @@ def test_snapshot_shows_accounts_while_cli_is_busy_without_exposing_tokens(
         assert state["busy"] is True
         assert state["selected"] == "ansuman-2"
         assert tuple({k: v for k, v in a.items() if k != "usage"} for a in state["accounts"]) == (
-            {"name": "ansuman-1", "chrome_profile": None, "saved_login": True},
-            {"name": "ansuman-2", "chrome_profile": None, "saved_login": True},
+            {
+                "name": "ansuman-1",
+                "display_name": None,
+                "chrome_profile": None,
+                "saved_login": True,
+            },
+            {
+                "name": "ansuman-2",
+                "display_name": None,
+                "chrome_profile": None,
+                "saved_login": True,
+            },
         )
     assert desktop.is_busy(store) is False
     assert "valid-" not in json.dumps(state)
@@ -46,6 +56,47 @@ def test_add_validates_chrome_profile_and_keeps_existing_account(
             store, {"action": "add", "account": "ansuman-4", "chrome_profile": "Missing"}
         )
     assert len(store.accounts()) == 3
+
+
+def test_display_rename_needs_no_cli_and_returns_fresh_state(
+    store: Store, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(browser, "profiles", lambda: ())
+    monkeypatch.setattr(desktop, "find_binary", lambda: pytest.fail("Rename must work offline"))
+    account = store.account("ansuman-1")
+    store.select(account)
+    with store.account_lock(account, shared=True):
+        result = desktop.action(
+            store, {"action": "rename_display", "account": account.name, "display_name": "Personal"}
+        )
+    assert result["state"]["selected"] == account.name
+    assert result["state"]["busy"] is False
+    assert result["state"]["accounts"][0]["display_name"] == "Personal"
+    assert "Personal" in result["message"]
+    reset = desktop.action(
+        store, {"action": "rename_display", "account": account.name, "display_name": ""}
+    )
+    assert reset["state"]["accounts"][0]["display_name"] is None
+
+
+@pytest.mark.parametrize("value", [None, 42, [], {}, "line\nbreak", "x" * 81])
+def test_display_rename_rejects_invalid_input(
+    store: Store, value: object, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(browser, "profiles", lambda: ())
+    with pytest.raises(SwitchError, match="[Dd]isplay name"):
+        desktop.action(
+            store, {"action": "rename_display", "account": "ansuman-1", "display_name": value}
+        )
+    assert store.account("ansuman-1").display_name is None
+
+
+def test_display_rename_respects_store_lock(store: Store) -> None:
+    with store.lock(), pytest.raises(SwitchError, match="Another ds command"):
+        desktop.action(
+            store, {"action": "rename_display", "account": "ansuman-1", "display_name": "Personal"}
+        )
+    assert store.account("ansuman-1").display_name is None
 
 
 def test_select_next_and_failed_select_share_cli_rules(

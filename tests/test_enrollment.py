@@ -29,10 +29,13 @@ def test_renaming_nayanshi_preserves_login_history_and_selection(store: Store) -
     account = store.account("ansuman-2")
     write_json(store.directory(account.name) / "account.json", {"chrome_profile": "Profile 15"})
     store.credentials(account).write_text("preserve-me")
+    with store.lock():
+        store.set_display_name(account, "School account")
     store.select(account)
     profiles = (browser.ChromeProfile("Profile 15", "Nayanshi", "n@test"),)
     assert enrollment.import_profiles(store, profiles) == (0, 1)
     renamed = store.account("nayanshi-1")
+    assert renamed.display_name == "School account"
     assert store.credentials(renamed).read_text() == "preserve-me"
     assert store.selected() == renamed
     assert (store.directory(renamed.name) / "data/devin/cli").resolve() == store.root / "shared/cli"

@@ -40,6 +40,52 @@ def test_accounts_and_selection_are_private_and_duplicate_add_preserves_login(st
     assert stat.S_IMODE((store.root / "selected").stat().st_mode) == 0o600
 
 
+def test_display_name_preserves_account_identity_and_active_sessions(store: Store) -> None:
+    account = store.account("ansuman-1")
+    store.select(account)
+    store.credentials(account).write_text("test-login")
+    history = store.directory(account.name) / "data/devin/cli"
+    metadata = store.directory(account.name) / "account.json"
+    original_metadata = metadata.read_bytes()
+    with store.account_lock(account, shared=True), store.lock():
+        renamed = store.set_display_name(account, "  Work Account  ")
+    assert renamed.name == account.name
+    assert renamed.display_name == "Work Account"
+    assert store.selected() == renamed
+    assert store.credentials(renamed).read_text() == "test-login"
+    assert history.is_symlink()
+    assert Store(store.root).account(account.name).display_name == "Work Account"
+    assert metadata.read_bytes() == original_metadata
+    assert set(json.loads(metadata.read_text())) == {"chrome_profile"}
+    label_file = store.directory(account.name) / "display-name.json"
+    assert stat.S_IMODE(label_file.stat().st_mode) == 0o600
+    with store.lock():
+        reset = store.set_display_name(renamed, "  ")
+    assert reset.display_name is None
+    assert json.loads((store.directory(account.name) / "account.json").read_text()) == {
+        "chrome_profile": account.chrome_profile
+    }
+
+
+@pytest.mark.parametrize("label", ["a" * 81, "first\nsecond", "bad\x00label", "bad\x1blabel"])
+def test_invalid_display_names_preserve_metadata(store: Store, label: str) -> None:
+    account = store.account("ansuman-1")
+    before = (store.directory(account.name) / "account.json").read_bytes()
+    with store.lock(), pytest.raises(SwitchError, match="display name"):
+        store.set_display_name(account, label)
+    assert (store.directory(account.name) / "account.json").read_bytes() == before
+    assert not (store.directory(account.name) / "display-name.json").exists()
+
+
+def test_display_name_supports_unicode_and_survives_alias_rename(store: Store) -> None:
+    account = store.add("custom", "Profile 5")
+    with store.lock():
+        renamed = store.set_display_name(account, "Équipe personnelle")
+        moved = store.rename(renamed, "new-alias")
+    assert moved.display_name == "Équipe personnelle"
+    assert moved.chrome_profile == "Profile 5"
+
+
 def test_other_commands_cannot_switch_during_running_session(store: Store) -> None:
     with store.lock(), pytest.raises(SwitchError, match="Another ds command"):
         with store.lock():

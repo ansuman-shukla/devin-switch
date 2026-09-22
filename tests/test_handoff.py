@@ -171,6 +171,63 @@ def test_switch_resumes_exact_exit_chat_and_cycles_from_bound_account(
     assert not (tmp_path / ".devin").exists()
 
 
+def test_handoff_with_inherited_background_lease(signed_in, tmp_path, monkeypatch):
+    store = signed_in.store
+    setup_project(store, tmp_path, monkeypatch)
+    seed_history(store, tmp_path)
+    monkeypatch.setattr(cli, "find_binary", lambda: signed_in.binary)
+    launches, children = [], []
+
+    def interactive(self, account, arguments):
+        launches.append((account.name, arguments))
+        if len(launches) == 1:
+            children.append(
+                subprocess.Popen(
+                    (sys.executable, "-c", "import sys; sys.stdin.read()"),
+                    stdin=subprocess.PIPE,
+                    pass_fds=self.lock_fds,
+                )
+            )
+            monkeypatch.setenv("DS_RUN_ID", self.run_id)
+            cli.execute(cli.parser().parse_args(["switch", "ansuman-2"]), store)
+            record_exit(store)
+        else:
+            assert children[0].poll() is None
+            assert len([run for run in sessions.runs(store) if run["active"]]) == 1
+        return 0
+
+    monkeypatch.setattr(Native, "interactive", interactive)
+    try:
+        assert cli.execute(cli.parser().parse_args(["run", "--account", "ansuman-1"]), store) == 0
+        assert launches == [("ansuman-1", ()), ("ansuman-2", ("--resume", "exact-chat"))]
+    finally:
+        for child in children:
+            child.communicate(timeout=5)
+
+
+def test_handoff_waits_for_brief_store_contention(signed_in, tmp_path, monkeypatch):
+    store = signed_in.store
+    setup_project(store, tmp_path, monkeypatch)
+    seed_history(store, tmp_path)
+    with sessions.managed(signed_in, "ansuman-1", (), can_handoff=True) as (runner, _, _):
+        monkeypatch.setenv("DS_RUN_ID", runner.run_id)
+        handoff.queue(store, handoff.current(store), store.account("ansuman-2"))
+        record_exit(store)
+    with subprocess.Popen(
+        (
+            sys.executable,
+            "-c",
+            "import os, time; from pathlib import Path; from devin_switch.store import Store; "
+            "store = Store(Path(os.environ['DS_HOME'])); "
+            "lease = store.lock(); lease.__enter__(); print('locked', flush=True); time.sleep(0.3)",
+        ),
+        stdout=subprocess.PIPE,
+    ) as holder:
+        assert holder.stdout.readline() == b"locked\n"
+        assert handoff.finish(runner, 0, ()) == ("ansuman-2", ("--resume", "exact-chat"))
+        assert holder.wait(timeout=5) == 0
+
+
 @pytest.mark.parametrize("initial_default", [None, "ansuman-1"])
 def test_explicit_switch_sets_default_only_when_resumed_launch_starts(
     signed_in, tmp_path, monkeypatch, initial_default
@@ -464,14 +521,9 @@ def test_handoff_respects_other_live_chats(signed_in: Native, tmp_path, monkeypa
     monkeypatch.chdir(other)
     with sessions.managed(signed_in, "ansuman-1", ()):
         monkeypatch.chdir(tmp_path)
-        if same_project:
-            with pytest.raises(SwitchError, match="open"):
-                cli.execute(cli.parser().parse_args(["run"]), store)
-            assert launches == ["ansuman-1"]
-        else:
-            assert cli.execute(cli.parser().parse_args(["run"]), store) == 0
-            assert launches == ["ansuman-1", "ansuman-2"]
-        assert store.selected().name == ("ansuman-1" if same_project else "ansuman-2")
+        assert cli.execute(cli.parser().parse_args(["run"]), store) == 0
+        assert launches == ["ansuman-1", "ansuman-2"]
+        assert store.selected().name == "ansuman-2"
         active = [run for run in sessions.runs(store) if run["active"]]
         assert len(active) == 1 and active[0]["account"] == "ansuman-1"
     assert not any(run["active"] for run in sessions.runs(store))

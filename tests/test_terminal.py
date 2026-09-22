@@ -50,6 +50,18 @@ def test_exit_timeout_cancels_instead_of_killing_or_leaving_delayed_switch(store
     assert request.advance(4) == (b"", "")
 
 
+def test_confirmed_exit_stops_keys_and_survives_slow_native_shutdown(store, monkeypatch):
+    run_id = "d" * 32
+    save_request(store, run_id)
+    request = terminal.ExitRequest(store, run_id, timeout=2)
+    monkeypatch.setattr(terminal, "process_exists", lambda _: False)
+    assert request.advance(0) == (b"\x1b", "")
+    write_json(handoff.state_path(store, run_id, "exit"), {"session_id": "exact-chat"})
+    assert request.advance(1) == (b"", "")
+    assert request.advance(3) == (b"", "")
+    assert handoff.state_path(store, run_id, "request").exists()
+
+
 @pytest.mark.parametrize("pid", [-1, 0, 1, None, "123", True])
 def test_invalid_request_cannot_signal_a_process(store, monkeypatch, pid):
     run_id = "c" * 32
@@ -76,9 +88,9 @@ def read_until(master: int, marker: bytes, timeout: float = 10) -> bytes:
     return output
 
 
-@pytest.mark.parametrize("usable", [True, False])
+@pytest.mark.parametrize("usable,background", [(True, False), (False, False), (True, True)])
 def test_one_command_automatically_resumes_with_best_account_on_real_pty(
-    signed_in: Native, tmp_path: Path, usable: bool, monkeypatch
+    signed_in: Native, tmp_path: Path, usable: bool, background: bool, monkeypatch
 ):
     monkeypatch.setattr(desktop.browser, "profiles", lambda: ())
     store = signed_in.store
@@ -114,11 +126,16 @@ def test_one_command_automatically_resumes_with_best_account_on_real_pty(
     binary = tmp_path / "fake native"
     binary.write_text(
         "#!/usr/bin/env python3\n"
-        "import json, os, pathlib, subprocess, sys, termios, tty\n"
+        "import json, os, pathlib, subprocess, sys, termios, time, tty\n"
         "if sys.argv[1:] == ['auth', 'status']:\n"
         "    print('Logged in as offline@example.invalid')\n"
         "    sys.exit(0)\n"
         "account = pathlib.Path(os.environ['XDG_DATA_HOME']).parent.name\n"
+        f"if {background!r} and account == 'ansuman-1':\n"
+        "    child = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)'], "
+        "close_fds=False, start_new_session=True, stdin=subprocess.DEVNULL, "
+        "stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)\n"
+        "    pathlib.Path('background.pid').write_text(str(child.pid))\n"
         "assert all(os.isatty(fd) for fd in (0, 1, 2))\n"
         "assert os.tcgetpgrp(0) == os.getpgrp()\n"
         "settings = termios.tcgetattr(0)\n"
@@ -151,13 +168,17 @@ def test_one_command_automatically_resumes_with_best_account_on_real_pty(
         "        result = subprocess.run(hook['command'], shell=True, input=json.dumps(event), "
         "text=True, capture_output=True)\n"
         "        assert result.returncode == 0, result.stderr\n"
+        f"if {background!r} and account == 'ansuman-1':\n"
+        "    time.sleep(1.5)\n"
         "termios.tcsetattr(0, termios.TCSADRAIN, settings)\n"
     )
     binary.chmod(0o700)
     driver = tmp_path / "tty driver.py"
     driver.write_text(
-        "import termios\n"
-        "from devin_switch import cli\n"
+        "import functools, termios\n"
+        "from devin_switch import cli, terminal\n"
+        f"if {background!r}:\n"
+        "    terminal.ExitRequest = functools.partial(terminal.ExitRequest, timeout=1)\n"
         "original = termios.tcgetattr(0)\n"
         "code = cli.main()\n"
         "actual = termios.tcgetattr(0)\n"
@@ -220,7 +241,19 @@ def test_one_command_automatically_resumes_with_best_account_on_real_pty(
         assert store.selected().name == expected_default
         assert not any(run["active"] for run in sessions.runs(store))
         assert "private-initial-prompt" not in json.dumps(sessions.overview(store))
+        if background:
+            os.kill(int((project / "background.pid").read_text()), 0)
+            first_run = sessions.runs(store)[0]
+            assert store.locked(f"run-{first_run['id']}.lock")
     finally:
+        pid_file = project / "background.pid"
+        if pid_file.exists():
+            import signal
+
+            try:
+                os.kill(int(pid_file.read_text()), signal.SIGTERM)
+            except ProcessLookupError:
+                pass
         os.close(master)
         os.close(slave)
         if process.poll() is None:

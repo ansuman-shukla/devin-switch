@@ -165,7 +165,7 @@ def test_exact_resume_uses_history_directory_and_rejects_duplicate(
     assert not any(run["active"] for run in desktop.snapshot(store)["runs"])
 
 
-def test_new_chat_blocks_ambiguous_resume_but_not_new_launch(
+def test_new_chat_allows_distinct_resume_and_new_launch(
     signed_in: Native, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     seed_history(signed_in.store, tmp_path)
@@ -174,11 +174,10 @@ def test_new_chat_blocks_ambiguous_resume_but_not_new_launch(
     monkeypatch.setattr(desktop, "find_binary", lambda: signed_in.binary)
 
     def interactive(self, account, arguments):
-        with pytest.raises(SwitchError, match="open"):
-            desktop.action(
-                self.store,
-                {"action": "resume_session", "account": account.name, "session": "first-chat"},
-            )
+        assert desktop.action(
+            self.store,
+            {"action": "resume_session", "account": account.name, "session": "first-chat"},
+        )["launcher"]
         assert desktop.action(
             self.store, {"action": "start", "account": account.name, "project": str(tmp_path)}
         )["launcher"]
@@ -333,7 +332,7 @@ def test_print_mode_does_not_bypass_resume_guard(
         ("--print=hello", "-rfirst-chat"),
     ):
         assert resume_arguments(signed_in.store, arguments, tmp_path)[1] == "first-chat"
-        with managed(signed_in, "ansuman-1", (), kind="chat"):
+        with managed(signed_in, "ansuman-1", ("--resume", "first-chat"), kind="chat"):
             with (
                 pytest.raises(SwitchError, match="open"),
                 managed(signed_in, "ansuman-2", arguments),
@@ -353,3 +352,132 @@ def test_profile_removal_never_follows_shared_or_external_links(store: Store, tm
     with store.lock():
         store.remove(account)
     assert marker.read_text() == shared_marker.read_text() == "keep"
+
+
+def test_ended_legacy_launch_is_not_active_with_inherited_lock(store, tmp_path):
+    from dataclasses import asdict
+
+    from devin_switch import sessions
+    from devin_switch.store import private_directory, write_json
+
+    run = sessions.Run("a" * 32, "ansuman-1", str(tmp_path), "chat", 1, "first-chat", 2)
+    private_directory(store.root / "runs")
+    write_json(store.root / "runs" / f"{run.id}.json", asdict(run))
+    with store.lock(f"run-{run.id}.lock"):
+        assert not sessions.runs(store)[0]["active"]
+
+
+@pytest.mark.parametrize("crash_wrapper", [False, True])
+def test_cli_liveness_ignores_inherited_background_leases(signed_in, tmp_path, crash_wrapper):
+    import signal
+    import time
+
+    from devin_switch import sessions
+
+    binary = tmp_path / "background-cli"
+    binary.write_text(
+        "#!/usr/bin/env python3\n"
+        "import json, os, subprocess, sys\n"
+        "if sys.argv[1:] == ['auth', 'status']:\n"
+        "    print('Logged in as offline@example.invalid')\n"
+        "    sys.exit(0)\n"
+        "child = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)'], "
+        "close_fds=False, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, "
+        "stderr=subprocess.DEVNULL, start_new_session=True)\n"
+        "print(json.dumps({'native': os.getpid(), 'background': child.pid}), flush=True)\n"
+        "sys.stdin.read()\n"
+    )
+    binary.chmod(0o700)
+    process = subprocess.Popen(
+        (sys.executable, "-m", "devin_switch.cli", "run", "--account", "ansuman-1"),
+        env={**os.environ, "DS_BINARY": str(binary)},
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    pids = {}
+    try:
+        assert select.select([process.stdout], [], [], 5)[0]
+        pids = json.loads(process.stdout.readline())
+        run = sessions.runs(signed_in.store)[0]
+        assert run["active"]
+        if crash_wrapper:
+            process.kill()
+            process.wait(timeout=5)
+            assert sessions.runs(signed_in.store)[0]["active"]
+        process.stdin.close()
+        deadline = time.monotonic() + 5
+        while sessions.runs(signed_in.store)[0]["active"] and time.monotonic() < deadline:
+            time.sleep(0.05)
+        assert not sessions.runs(signed_in.store)[0]["active"]
+        assert signed_in.store.locked(f"run-{run['id']}.lock")
+        os.kill(pids["background"], 0)
+        if not crash_wrapper:
+            assert process.wait(timeout=5) == 0
+    finally:
+        for pid in pids.values():
+            try:
+                os.kill(pid, signal.SIGTERM)
+            except ProcessLookupError:
+                pass
+        if process.poll() is None:
+            process.kill()
+        process.wait(timeout=5)
+        for stream in (process.stdin, process.stdout, process.stderr):
+            stream.close()
+
+
+def test_distinct_saved_chats_can_resume_in_same_repository(signed_in, tmp_path, monkeypatch):
+    from devin_switch import sessions
+
+    seed_history(signed_in.store, tmp_path)
+    monkeypatch.chdir(tmp_path)
+    with sessions.managed(signed_in, "ansuman-1", ("--resume", "first-chat")):
+        with sessions.managed(signed_in, "ansuman-2", ("--resume", "second-chat")):
+            assert len([run for run in sessions.runs(signed_in.store) if run["active"]]) == 2
+        with pytest.raises(SwitchError, match="open"):
+            with sessions.managed(signed_in, "ansuman-2", ("--resume", "first-chat")):
+                pytest.fail("Duplicate launch must be rejected")
+
+
+@pytest.mark.parametrize(
+    "stamp,expected", [("original-start", True), ("reused-pid", False), (None, False)]
+)
+def test_native_identity_not_inherited_lock_determines_liveness(
+    store, tmp_path, monkeypatch, stamp, expected
+):
+    from devin_switch import sessions
+    from devin_switch.store import write_json
+
+    run = sessions.Run("b" * 32, "ansuman-1", str(tmp_path), "chat", 1, ended_at=2)
+    monkeypatch.setattr(sessions, "process_started", lambda _: "original-start")
+    sessions.record_process(store, run.id, os.getpid(), role="native")
+    monkeypatch.setattr(sessions, "process_started", lambda _: stamp)
+    with store.lock(f"run-{run.id}.lock"):
+        assert sessions.active(store, run) is expected
+        write_json(
+            store.root / "runtime" / f"{run.id}.json", {"pid": os.getpid(), "role": "wrapper"}
+        )
+        assert not sessions.active(store, run)
+
+
+def test_process_identity_is_independent_of_timezone(monkeypatch):
+    from devin_switch.sessions import process_started
+
+    original = process_started(os.getpid())
+    assert original
+    monkeypatch.setenv("TZ", "Pacific/Honolulu")
+    assert process_started(os.getpid()) == original
+
+
+def test_process_probe_does_not_count_zombies(monkeypatch):
+    from devin_switch import sessions
+
+    monkeypatch.setattr(
+        sessions.subprocess,
+        "run",
+        lambda *args, **kwargs: subprocess.CompletedProcess(
+            args, 0, "Thu Sep 17 00:00:00 2026 Z+\n"
+        ),
+    )
+    assert sessions.process_started(12345) is None

@@ -6,6 +6,7 @@ import os
 import re
 import shutil
 import tempfile
+import time
 from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -60,21 +61,32 @@ class Store:
     root: Path
 
     @contextmanager
-    def lock(self, filename: str = "lock", *, shared: bool = False) -> Iterator[int]:
+    def lock(
+        self, filename: str = "lock", *, shared: bool = False, timeout: float = 0
+    ) -> Iterator[int]:
         private_directory(self.root)
+        deadline = time.monotonic() + timeout
         with open(self.root / filename, "a", opener=private_opener) as handle:
-            try:
-                fcntl.flock(handle, (fcntl.LOCK_SH if shared else fcntl.LOCK_EX) | fcntl.LOCK_NB)
-            except BlockingIOError as exc:
-                if filename.startswith("account-"):
-                    message = (
-                        "This profile is in use. Close its sessions or wait for usage refresh."
+            while True:
+                try:
+                    fcntl.flock(
+                        handle, (fcntl.LOCK_SH if shared else fcntl.LOCK_EX) | fcntl.LOCK_NB
                     )
-                elif filename == "usage.lock":
-                    message = "Another usage refresh is active. Try again shortly."
-                else:
-                    message = "Another ds command is active. Finish it before switching."
-                raise SwitchError(message) from exc
+                    break
+                except BlockingIOError as exc:
+                    remaining = deadline - time.monotonic()
+                    if remaining > 0:
+                        time.sleep(min(0.05, remaining))
+                        continue
+                    if filename.startswith("account-"):
+                        message = (
+                            "This profile is in use. Close its sessions or wait for usage refresh."
+                        )
+                    elif filename == "usage.lock":
+                        message = "Another usage refresh is active. Try again shortly."
+                    else:
+                        message = "Another ds command is active. Finish it before switching."
+                    raise SwitchError(message) from exc
             yield handle.fileno()
 
     def account_lock(self, account: Account, *, shared: bool = False):

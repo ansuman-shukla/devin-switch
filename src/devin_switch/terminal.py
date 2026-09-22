@@ -55,11 +55,13 @@ class ExitRequest:
         if request != self.request:
             self.request, self.started = request, now if request else None
             self.next_key, self.escaped = now, False
-        if request is None:
+        if request is None or handoff.state_path(self.store, self.run_id, "exit").is_file():
             return b"", ""
         if now - self.started >= self.timeout:
             try:
                 with self.store.lock():
+                    if handoff.state_path(self.store, self.run_id, "exit").is_file():
+                        return b"", ""
                     if self.read() == request:
                         handoff.cancel(self.store, {"id": self.run_id})
             except SwitchError:
@@ -111,6 +113,7 @@ def run(native, account, arguments: tuple[str, ...]) -> int:
                     start_new_session=True,
                     preexec_fn=claim_terminal,
                 )
+                native.track_process(process.pid)
             os.close(slave)
             slave = -1
             signal.signal(signal.SIGWINCH, resize)

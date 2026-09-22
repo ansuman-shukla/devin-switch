@@ -203,14 +203,6 @@ def state_path(store: Store, run_id: str, kind: str) -> Path:
 def queue(store: Store, run: dict, account: Account) -> None:
     if account.name == run["account"]:
         raise SwitchError(f"This chat already uses {account.name}. Choose a different account.")
-    for other in sessions.runs(store):
-        if (
-            other["id"] != run["id"]
-            and other["active"]
-            and other["kind"] == "chat"
-            and other["project"] == run["project"]
-        ):
-            raise SwitchError("Close the other open CLI chats in this repo before switching.")
     path = state_path(store, run["id"], "request")
     private_directory(path.parent)
     state_path(store, run["id"], "exit").unlink(missing_ok=True)
@@ -248,7 +240,7 @@ def finish(
     if native.run_id is None or options is None:
         return None
     store = native.store
-    with store.lock():
+    with store.lock(timeout=5):
         path = state_path(store, native.run_id, "request")
         if not path.exists():
             return None

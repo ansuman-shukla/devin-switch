@@ -1,5 +1,7 @@
 import json
+import os
 import sqlite3
+import subprocess
 import time
 import uuid
 from collections.abc import Iterator
@@ -42,6 +44,50 @@ def history(store: Store) -> list[dict]:
         ) from exc
 
 
+def process_started(pid: int) -> str | None:
+    result = subprocess.run(
+        ("/bin/ps", "-p", str(pid), "-o", "lstart=,stat="),
+        capture_output=True,
+        text=True,
+        timeout=2,
+        env={**os.environ, "LC_ALL": "C", "TZ": "UTC"},
+    )
+    fields = result.stdout.split()
+    if len(fields) != 6 or fields[-1].startswith("Z"):
+        return None
+    return " ".join(fields[:5])
+
+
+def record_process(store: Store, run_id: str, pid: int, *, role: str) -> None:
+    directory = store.root / "runtime"
+    private_directory(directory)
+    write_json(
+        directory / f"{run_id}.json",
+        {"pid": pid, "started": process_started(pid), "role": role},
+    )
+
+
+def active(store: Store, run: Run) -> bool:
+    if not store.locked(f"run-{run.id}.lock"):
+        return False
+    try:
+        process = json.loads((store.root / "runtime" / f"{run.id}.json").read_text())
+        if (
+            type(process["pid"]) is int
+            and process["pid"] > 1
+            and process["role"] in ("wrapper", "native")
+        ):
+            if process["role"] == "wrapper":
+                return run.ended_at is None
+            return (
+                isinstance(process["started"], str)
+                and process_started(process["pid"]) == process["started"]
+            )
+    except (OSError, ValueError, KeyError, TypeError, subprocess.SubprocessError):
+        pass
+    return run.ended_at is None
+
+
 def runs(store: Store) -> list[dict]:
     directory = store.root / "runs"
     if not directory.exists():
@@ -56,7 +102,7 @@ def runs(store: Store) -> list[dict]:
                 or not all(c in "0123456789abcdef" for c in run.id)
             ):
                 continue
-            result.append({**asdict(run), "active": store.locked(f"run-{run.id}.lock")})
+            result.append({**asdict(run), "active": active(store, run)})
         except (OSError, ValueError, TypeError):
             continue
     return sorted(result, key=lambda run: run["started_at"])
@@ -64,12 +110,8 @@ def runs(store: Store) -> list[dict]:
 
 def resume_blocker(chat: dict, running: list[dict]) -> str | None:
     for run in running:
-        if (
-            run["active"]
-            and run["kind"] == "chat"
-            and (run["project"] == chat["project"] or run["session_id"] == chat["id"])
-        ):
-            return "Close the open CLI sessions in this repo before resuming a saved chat."
+        if run["active"] and run["kind"] == "chat" and run["session_id"] == chat["id"]:
+            return "This chat already has an open CLI launch. Close it before resuming again."
     return None
 
 
@@ -163,7 +205,7 @@ def managed(
 ) -> Iterator[tuple[Native, Account, tuple[str, ...]]]:
     store = native.store
     with ExitStack() as stack:
-        with store.lock():
+        with store.lock(timeout=5):
             account = store.account(name) if name else store.selected()
             exclusive = kind == "login" or arguments[:1] == ("auth",)
             account_fd = stack.enter_context(store.account_lock(account, shared=not exclusive))
@@ -177,10 +219,14 @@ def managed(
             run_fd = stack.enter_context(store.lock(f"run-{run.id}.lock"))
             directory = store.root / "runs"
             private_directory(directory)
+            record_process(store, run.id, os.getpid(), role="wrapper")
             write_json(directory / f"{run.id}.json", asdict(run))
         try:
             runner = replace(
-                native, lock_fds=(account_fd, run_fd), run_id=run.id if can_handoff else None
+                native,
+                lock_fds=(account_fd, run_fd),
+                run_id=run.id if can_handoff else None,
+                launch_id=run.id,
             )
             yield runner, account, arguments
         finally:

@@ -57,10 +57,17 @@ class Native:
     lock_fds: tuple[int, ...] = ()
     run_id: str | None = None
     select_on_start: bool = False
+    launch_id: str | None = None
+
+    def track_process(self, pid: int) -> None:
+        if self.launch_id:
+            from devin_switch.sessions import record_process
+
+            record_process(self.store, self.launch_id, pid, role="native")
 
     @contextmanager
     def launch_selection(self, account: Account) -> Iterator[None]:
-        with self.store.lock() if self.select_on_start else nullcontext():
+        with self.store.lock(timeout=5) if self.select_on_start else nullcontext():
             yield
             if self.select_on_start:
                 self.store.select(account)
@@ -68,7 +75,7 @@ class Native:
     def environment(self, account: Account) -> dict[str, str]:
         self.store.prepare(account)
         base = self.store.directory(account.name)
-        excluded = AUTH_ENVIRONMENT | {"DS_RUN_ID", "DS_EXECUTABLE", "DS_FROZEN"}
+        excluded = AUTH_ENVIRONMENT | {"DS_RUN_ID", "DS_ACP_RUN_ID", "DS_EXECUTABLE", "DS_FROZEN"}
         environment = {
             **{key: value for key, value in os.environ.items() if key not in excluded},
             "XDG_DATA_HOME": str(base / "data"),
@@ -137,6 +144,7 @@ class Native:
                             pass_fds=self.lock_fds,
                         )
                     )
+                    self.track_process(process.pid)
                 code = process.wait()
             return code if code >= 0 else 128 - code
         finally:

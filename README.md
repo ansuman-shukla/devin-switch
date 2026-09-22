@@ -155,10 +155,11 @@ configuration. Native CLI **3000.5.20 or newer** is needed for exit hooks. An al
 wrapper needs one normal restart after updating the installed `ds` command.
 
 The exit hook provides the final conversation ID, including after in-chat `/new` or `/resume`.
-Missing exit receipts, failed exits, or another open Switch chat in this repo stop the handoff
-rather than guessing “latest.” If automatic exit is unavailable (for example, a rebound exit
-shortcut), the request times out without force-killing the CLI. `!ds switch --cancel` cancels a
-pending request.
+Missing exit receipts, failed exits, or a duplicate known launch of the destination conversation
+stop the handoff rather than guessing “latest.” Other chats in the same repo can keep running.
+If automatic exit is unavailable (for example, a rebound exit shortcut), the request times out
+without force-killing the CLI. Once the exit receipt arrives, Switch waits for native shutdown
+without discarding the handoff. `!ds switch --cancel` cancels a pending request.
 
 The saved transcript survives, but unsent input and in-memory tool shells are not transferred.
 Switch does not replay initial prompts or prompt files; send your next message when the chat
@@ -169,7 +170,7 @@ automatic handoff support.
 
 ### Switch accounts and resume from the shell
 
-First exit CLI chats running in the target project. Then, from the same project directory:
+First exit any CLI already running the conversation you want to resume. From its project directory:
 
 ```sh
 ds use work
@@ -188,11 +189,13 @@ Arguments after `--` are forwarded to Devin CLI without shell interpretation. `-
 is resolved to an exact conversation ID, and `--resume` requires an explicit ID.
 
 In the app, **Resume chat with…** opens the shared-history picker. **Resume latest** selects
-the latest conversation in the chosen folder. Resume is conservatively blocked while
-Switch-managed CLI chats remain open in that repository. Other repositories can keep running.
+the latest conversation in the chosen folder. Different saved chats can run in the same repository;
+a duplicate known launch of the same conversation is blocked.
 
-The session overview tracks **wrapper launches and open processes**, not whether an agent
-is actively working. In-terminal `/new` and `/resume` changes are not tracked or guessed.
+The session overview tracks **wrapper launches and live CLI processes**, not whether an agent
+is actively working. Background servers that inherited a lease do not keep a finished chat open
+in this overview, and Switch does not automatically stop those servers. In-terminal `/new` and
+`/resume` changes are not tracked or guessed, so duplicate checks cover known launch IDs only.
 Use separate Git worktrees if concurrent sessions would otherwise edit the same files.
 
 ### Manage saved profiles
@@ -207,11 +210,121 @@ Use separate Git worktrees if concurrent sessions would otherwise edit the same 
 
 CLI removal requires explicit confirmation: `ds remove work --yes`.
 
+### Switch accounts inside Devin Desktop (experimental)
+
+The **Devin Switch ACP agent** runs the installed Devin CLI inside Desktop's chat UI,
+using the same saved accounts and shared local history as `ds run`. It does **not**
+change Desktop's own login, avatar, cloud account, or built-in agents. No credentials
+are copied into the editor configuration, and no additional sign-in is required for
+profiles that already have a valid saved CLI login.
+
+From a source checkout, install the updated command with `make install`. Then print
+an agent registry entry using the installed command:
+
+```sh
+ds acp --print-registry
+```
+
+For explicit native sandboxing, use `ds acp --sandbox --print-registry` instead.
+The output contains absolute launcher paths and the Switch state-directory path,
+not tokens. It does not modify any configuration files.
+
+In Devin Desktop:
+
+1. Run **Open Local ACP Registry Config** from the Command Palette.
+2. Add the generated `agents` entry to the existing registry, preserving other agents
+   and settings. If the registry is empty, use the complete generated object.
+3. Enable **Devin Switch** in **Devin User Settings → Agents**. When other agent
+   chats are idle, run **Reload ACP Connections** from the Command Palette (or restart
+   Desktop when convenient).
+4. Select **Devin Switch** for a new conversation. Existing built-in Devin Local,
+   Cascade, and Cloud conversations are not automatically migrated to this agent.
+
+After updating the installed `ds` command with `make install`, run **Reload ACP
+Connections** again. An already-running GUI connection keeps its old bridge code
+until reloaded; wait until other chats are idle before restarting connections.
+The registry entry does not need to change when only the Python code is updated.
+
+ACP availability depends on your Desktop plan and organization settings. See the
+[Desktop ACP documentation](https://docs.devin.ai/desktop/acp).
+
+Inside a Switch-managed GUI chat:
+
+```text
+/switch-status
+/switch
+/switch work
+```
+
+`/switch-status` reports the bound account, exact conversation ID, and whether the
+conversation is saved in shared history. `/switch` refreshes usage and chooses another
+eligible account; an alias chooses explicitly. These are local control commands, so
+they work without a model response or remaining credits. `!ds switch [ALIAS]` is also
+recognized locally in this agent. Send a control command by itself, without attachments.
+
+A newly opened GUI chat can have a native session ID **without a saved conversation**.
+The local `/switch-status` and `/switch` commands do not create saved history. Switch
+checks history before closing the current agent; an unsaved chat stays open with its
+account unchanged. Send a normal message and check `/switch-status` for `Shared history:
+saved` before testing a handoff. To choose a different account before the first message,
+run `ds use ALIAS` in Terminal and open a new GUI chat instead. You do not need to exhaust
+the current account's credits to switch a saved conversation.
+
+If an older bridge already closed an unsaved chat, its native ID cannot be reopened
+from shared history. Preserve any visible text you need and start a new chat. Recovery
+errors report the failing startup, load, or configuration stage without exposing raw
+native diagnostics or claiming an unverified conversation is saved.
+
+From a separate terminal, explicitly target a GUI conversation:
+
+```sh
+ds sessions --gui
+ds switch --session SESSION_ID
+ds switch work --session SESSION_ID
+ds switch --session SESSION_ID --cancel
+```
+
+The terminal command queues a handoff for that exact live chat. It waits for the
+current turn to finish; use Desktop's Stop control if you want to cancel a turn.
+Automatic usage selection happens when the queued handoff can run, not while a long
+turn is still using the old account. A queued request can be canceled before the
+handoff begins. Status and failure messages appear in the GUI conversation.
+
+Each loaded GUI conversation owns a separate native process. Handoff closes that
+process normally, loads the **same saved conversation ID**, and restores its reported
+session configuration before accepting another prompt. The project, supplied MCP
+configuration, additional workspace roots, and `--sandbox` option are retained.
+If configuration cannot be preserved or loading fails, Switch attempts to restore
+the previous account; it does not replay prompts or silently fall back to a new chat.
+Slow shutdown is bounded and never force-kills the native agent or background servers.
+In-memory tool shells and unsent input are not transferred.
+
+A successful handoff updates the shared default only after the destination is ready.
+Other loaded chats keep their own accounts. Reopening a managed chat uses its last
+saved account; `ds acp --account ALIAS` explicitly overrides the account when opening
+chats through that connection, without changing the shared default.
+
+The agent lists Switch's **shared local history**, not a different sidebar history
+for each credential. Known conversations already open in a CLI or another GUI
+connection cannot be loaded twice. Account-specific cloud history and ordinary
+Desktop history are not imported. Forking through the standard ACP session-fork
+method is not supported in this initial integration.
+
+The automated checks cover protocol handoffs with a fake CLI and isolated native
+capability/history compatibility without real credentials or inference requests.
+Actual Desktop rendering and paid cross-account continuation still require a live
+validation. This integration does not claim full parity with every built-in agent UI
+extension.
+
 ## CLI reference
 
 | Command | Purpose |
 | --- | --- |
 | `ds gui` | Open the app from `~/Applications` or `/Applications` |
+| `ds acp [--account ALIAS] [--sandbox]` | Serve Switch-managed GUI chats over ACP stdio |
+| `ds acp --print-registry` | Print a secret-free Desktop agent configuration without modifying settings |
+| `ds switch [ALIAS] --session ID` | Queue a handoff for one exact live GUI chat |
+| `ds sessions --gui` | List live managed GUI conversations and their bound accounts |
 | `ds add ALIAS` | Register a local profile |
 | `ds profiles` | List available Chrome profile identifiers |
 | `ds login ALIAS` | Enroll or check a saved login |
@@ -242,6 +355,8 @@ shared/cli/sessions.db
 shared/summaries/
 runs/
 handoffs/
+acp/sessions/
+acp/requests/
 launchers/
 selected
 ```

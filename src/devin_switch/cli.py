@@ -20,6 +20,18 @@ def parser() -> argparse.ArgumentParser:
     )
     commands = root.add_subparsers(dest="command", required=True)
     commands.add_parser("gui", help="Open the native Mac account manager")
+    acp = commands.add_parser("acp", help="Run the Switch-managed GUI agent over ACP stdio")
+    acp.add_argument(
+        "--account", help="Override the account for newly opened chats, not the default"
+    )
+    acp.add_argument(
+        "--sandbox", action="store_true", help="Retain native sandboxing across switches"
+    )
+    acp.add_argument(
+        "--print-registry",
+        action="store_true",
+        help="Print a Desktop ACP registry entry; change no settings",
+    )
     add = commands.add_parser("add", help="Register an account; does not sign in")
     add.add_argument("account")
     add.add_argument("--chrome-profile", help='Chrome directory identifier, e.g. "Profile 1"')
@@ -48,6 +60,7 @@ def parser() -> argparse.ArgumentParser:
         ),
     )
     switch.add_argument("account", nargs="?")
+    switch.add_argument("--session", help="Target an exact live Switch-managed GUI conversation")
     switch.add_argument("--cancel", action="store_true", help="Cancel a pending switch")
     commands.add_parser("list", help="List registered accounts and the current selection")
     commands.add_parser("profiles", help="List existing Chrome profile identifiers")
@@ -58,6 +71,9 @@ def parser() -> argparse.ArgumentParser:
     run.add_argument("arguments", nargs=argparse.REMAINDER)
     sessions = commands.add_parser("sessions", help="List shared sessions in the current directory")
     sessions.add_argument("--account")
+    sessions.add_argument(
+        "--gui", action="store_true", help="List live GUI chats with exact switch IDs"
+    )
     verify = commands.add_parser(
         "verify", help="Check A → B → A saved logins and session visibility"
     )
@@ -106,6 +122,22 @@ def verify(native: Native, first: Account, second: Account) -> None:
 
 
 def execute(args: argparse.Namespace, store: Store) -> int:
+    if args.command == "acp":
+        import asyncio
+
+        from devin_switch import acp
+
+        native = Native(store, find_binary())
+        if args.print_registry:
+            print(json.dumps(acp.registry(native, args.account, args.sandbox), indent=2))
+        else:
+            asyncio.run(acp.serve(native, account=args.account, sandbox=args.sandbox))
+        return 0
+    if args.command == "sessions" and args.gui:
+        from devin_switch import acp_state
+
+        print(json.dumps(acp_state.live(store), indent=2))
+        return 0
     if args.command == "gui":
         app = next(
             (
@@ -152,7 +184,7 @@ def execute(args: argparse.Namespace, store: Store) -> int:
                 else:
                     print(f"Using {account.name}", file=sys.stderr, flush=True)
                     if options is not None:
-                        with store.lock():
+                        with store.lock(timeout=5):
                             handoff.enable(store, account)
                         print(
                             "Low on usage? !ds switch resumes here with the best available login.",
@@ -178,6 +210,15 @@ def execute(args: argparse.Namespace, store: Store) -> int:
     if args.command == "switch":
         if args.account and args.cancel:
             raise SwitchError("Use an account alias or --cancel, not both.")
+        if args.session is not None or os.environ.get("DS_ACP_RUN_ID"):
+            from devin_switch import acp_state
+
+            print(
+                acp_state.queue(
+                    Native(store, find_binary()), args.session, args.account, cancel=args.cancel
+                )
+            )
+            return 0
         with store.lock():
             run = handoff.current(store)
             if args.cancel:

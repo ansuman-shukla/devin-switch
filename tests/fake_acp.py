@@ -146,24 +146,37 @@ async def handle(message):
                 stdin=subprocess.DEVNULL,
                 close_fds=False,
             )
-        if text == "permission":
+        decision = {}
+        if text in {"permission", "question"}:
             future = asyncio.get_running_loop().create_future()
             replies[100] = future
-            emit(
-                {
-                    "id": 100,
-                    "method": "session/request_permission",
-                    "params": {
-                        "sessionId": loaded,
-                        "toolCall": {"toolCallId": "tool", "title": "Test"},
-                        "options": [
-                            {"optionId": "reject", "name": "Reject", "kind": "reject_once"}
-                        ],
+            request = {
+                "id": 100,
+                "method": "session/request_permission",
+                "params": {
+                    "sessionId": loaded,
+                    "toolCall": {"toolCallId": "tool", "title": "Test", "kind": "execute"},
+                    "options": [
+                        {"optionId": "allow", "name": "Yes", "kind": "allow_once"},
+                        {"optionId": "reject", "name": "No", "kind": "reject_once"},
+                    ],
+                },
+            }
+            if text == "question":
+                request["method"] = "elicitation/create"
+                request["params"] = {
+                    "sessionId": loaded,
+                    "mode": "form",
+                    "message": "Choose an approach",
+                    "requestedSchema": {
+                        "type": "object",
+                        "properties": {"approach": {"type": "string", "enum": ["one", "two"]}},
                     },
                 }
-            )
+            emit(request)
             response = await future
-            assert response["result"]["outcome"]["optionId"] == "reject"
+            assert response["id"] == 100
+            decision = {"decision": response}
         update(
             loaded,
             {
@@ -171,7 +184,7 @@ async def handle(message):
                 "content": {
                     "type": "text",
                     "text": json.dumps(
-                        {"account": account, "session": loaded, "settings": settings}
+                        {"account": account, "session": loaded, "settings": settings, **decision}
                     ),
                 },
             },
@@ -183,6 +196,12 @@ async def handle(message):
         if os.environ.get("FAKE_IGNORE_CONFIG_ACCOUNT") != account:
             settings[params["configId"]] = params["value"]
         result = {"configOptions": configs()}
+    elif method == "session/set_mode":
+        settings["mode"] = params["modeId"]
+    elif method == "session/set_model":
+        settings["model"] = params["modelId"]
+    elif method == "_cognition.ai/command/revise":
+        result = {"command": params["command"] + " --revised"}
     elif method == "session/list":
         result = {
             "sessions": [

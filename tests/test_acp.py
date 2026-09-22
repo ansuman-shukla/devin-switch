@@ -28,12 +28,14 @@ def acp_native(signed_in: Native, tmp_path: Path, monkeypatch):
 
 
 class Client:
-    def __init__(self, process):
+    def __init__(self, process, *, auto_respond=True):
         self.process = process
         self.sequence = 0
         self.pending = {}
         self.messages = []
         self.permissions = []
+        self.requests = asyncio.Queue()
+        self.auto_respond = auto_respond
         self.pump = asyncio.create_task(self.read())
 
     async def read(self):
@@ -43,12 +45,16 @@ class Client:
             if "method" in message:
                 if "id" in message:
                     self.permissions.append(message)
-                    await self.send(
-                        {
-                            "id": message["id"],
-                            "result": {"outcome": {"outcome": "selected", "optionId": "reject"}},
-                        }
-                    )
+                    self.requests.put_nowait(message)
+                    if self.auto_respond:
+                        await self.send(
+                            {
+                                "id": message["id"],
+                                "result": {
+                                    "outcome": {"outcome": "selected", "optionId": "reject"}
+                                },
+                            }
+                        )
             elif future := self.pending.pop(message.get("id"), None):
                 future.set_result(message)
         for future in self.pending.values():
@@ -88,7 +94,7 @@ class Client:
 
 
 @asynccontextmanager
-async def connect(native, *arguments):
+async def connect(native, *arguments, auto_respond=True):
     environment = {
         **os.environ,
         "DS_HOME": str(native.store.root),
@@ -106,7 +112,7 @@ async def connect(native, *arguments):
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
     )
-    client = Client(process)
+    client = Client(process, auto_respond=auto_respond)
     try:
         result = await client.request(
             "initialize",
@@ -261,6 +267,125 @@ def test_gui_permission_requests_keep_separate_ids_and_user_decisions(acp_native
     asyncio.run(scenario())
 
 
+@pytest.mark.parametrize(
+    ("text", "response"),
+    [
+        ("permission", {"result": {"outcome": {"outcome": "selected", "optionId": "allow"}}}),
+        ("permission", {"result": {"outcome": {"outcome": "selected", "optionId": "reject"}}}),
+        ("permission", {"result": {"outcome": {"outcome": "cancelled"}}}),
+        (
+            "permission",
+            {
+                "result": {
+                    "outcome": {"outcome": "selected", "optionId": "allow"},
+                    "_meta": {"cognition.ai/updatedInput": {"command": "printf safe"}},
+                }
+            },
+        ),
+        ("question", {"result": {"action": "accept", "content": {"approach": "two"}}}),
+        (
+            "question",
+            {
+                "result": {
+                    "action": "decline",
+                    "_meta": {"cognition.ai/partialContent": {"approach": "one"}},
+                }
+            },
+        ),
+        ("question", {"error": {"code": -32601, "message": "Unsupported by test client"}}),
+    ],
+)
+def test_gui_delayed_decisions_reach_only_the_requesting_chat(acp_native, tmp_path, text, response):
+    async def scenario():
+        async with connect(acp_native, auto_respond=False) as client:
+            first, second = await client.new(tmp_path), await client.new(tmp_path)
+            pending = asyncio.create_task(client.prompt(first, text))
+            request = await asyncio.wait_for(client.requests.get(), 5)
+            assert request["params"]["sessionId"] == first
+            assert not pending.done()
+            await client.prompt(second, "continue")
+            assert client.agent_replies()[-1]["session"] == second
+            await client.send({"id": request["id"], **response})
+            assert "result" in await pending
+            assert client.agent_replies()[-1]["decision"] == {
+                "jsonrpc": "2.0",
+                "id": 100,
+                **response,
+            }
+            assert client.agent_replies()[-1]["session"] == first
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize(
+    ("method", "params"),
+    [
+        ("session/set_config_option", {"configId": "mode", "value": "code"}),
+        ("session/set_mode", {"modeId": "code"}),
+        ("session/set_model", {"modelId": "other-model"}),
+        ("_cognition.ai/command/revise", {"command": "printf test", "note": "Use safe flags"}),
+    ],
+)
+def test_gui_controls_respond_while_tool_approval_is_pending(acp_native, tmp_path, method, params):
+    async def scenario():
+        async with connect(acp_native, auto_respond=False) as client:
+            session_id = await client.new(tmp_path)
+            pending = asyncio.create_task(client.prompt(session_id, "permission"))
+            request = await asyncio.wait_for(client.requests.get(), 5)
+            control = asyncio.create_task(
+                client.request(method, {"sessionId": session_id, **params})
+            )
+            try:
+                response = await asyncio.wait_for(asyncio.shield(control), 1)
+                assert "result" in response
+                assert not pending.done()
+                if method == "_cognition.ai/command/revise":
+                    assert response["result"] == {"command": "printf test --revised"}
+            finally:
+                await client.send(
+                    {
+                        "id": request["id"],
+                        "result": {"outcome": {"outcome": "selected", "optionId": "reject"}},
+                    }
+                )
+                await pending
+                await control
+
+    asyncio.run(scenario())
+
+
+def test_gui_concurrent_approvals_keep_opposite_decisions_separate(acp_native, tmp_path):
+    async def scenario():
+        async with connect(acp_native, auto_respond=False) as client:
+            first, second = await client.new(tmp_path), await client.new(tmp_path)
+            pending = [
+                asyncio.create_task(client.prompt(session_id, "permission"))
+                for session_id in (first, second)
+            ]
+            requests = [await asyncio.wait_for(client.requests.get(), 5) for _ in pending]
+            assert len({request["id"] for request in requests}) == 2
+            decisions = {first: "allow", second: "reject"}
+            for request in reversed(requests):
+                await client.send(
+                    {
+                        "id": request["id"],
+                        "result": {
+                            "outcome": {
+                                "outcome": "selected",
+                                "optionId": decisions[request["params"]["sessionId"]],
+                            }
+                        },
+                    }
+                )
+            assert all("result" in response for response in await asyncio.gather(*pending))
+            assert {
+                reply["session"]: reply["decision"]["result"]["outcome"]["optionId"]
+                for reply in client.agent_replies()
+            } == decisions
+
+    asyncio.run(scenario())
+
+
 def test_terminal_gui_switch_is_queued_until_turn_finishes(acp_native, tmp_path):
     async def scenario():
         async with connect(acp_native) as client:
@@ -327,6 +452,77 @@ async def in_process(native):
         yield bridge, messages
     finally:
         await bridge.close()
+
+
+def test_gui_handoff_waits_for_inflight_controls_and_restores_their_settings(
+    acp_native, tmp_path, monkeypatch
+):
+    async def scenario():
+        async with in_process(acp_native) as (bridge, messages):
+            created = await bridge.dispatch("session/new", {"cwd": str(tmp_path), "mcpServers": []})
+            session_id = created["sessionId"]
+            chat = bridge.chats[session_id]
+            original = chat.backend
+            request = original.request
+            started, finish = asyncio.Event(), asyncio.Event()
+
+            async def delayed_control(method, params, timeout=None):
+                if method == "session/set_config_option":
+                    started.set()
+                    await finish.wait()
+                return await request(method, params, timeout)
+
+            monkeypatch.setattr(original, "request", delayed_control)
+            prompt = bridge.spawn(
+                bridge.dispatch(
+                    "session/prompt",
+                    {"sessionId": session_id, "prompt": [{"type": "text", "text": "permission"}]},
+                )
+            )
+            async with asyncio.timeout(5):
+                while not any(
+                    message.get("method") == "session/request_permission" for message in messages
+                ):
+                    await asyncio.sleep(0.01)
+            permission = next(
+                message
+                for message in messages
+                if message.get("method") == "session/request_permission"
+            )
+            control = bridge.spawn(
+                bridge.dispatch(
+                    "session/set_config_option",
+                    {"sessionId": session_id, "configId": "mode", "value": "code"},
+                )
+            )
+            await asyncio.wait_for(started.wait(), 5)
+            acp_state.queue(acp_native, session_id, "ansuman-2")
+            path = acp_state.request_path(acp_native.store, original.lease.run.id)
+            switching = bridge.spawn(bridge.queued_switch(chat, path))
+            await bridge.handle(
+                {
+                    "jsonrpc": "2.0",
+                    "id": permission["id"],
+                    "result": {"outcome": {"outcome": "selected", "optionId": "reject"}},
+                }
+            )
+            async with asyncio.timeout(5):
+                while chat.controls is not None:
+                    await asyncio.sleep(0.01)
+            assert not prompt.done() and not control.done() and not switching.done()
+            assert chat.backend is original and original.process.poll() is None
+            assert acp_native.store.selected().name == "ansuman-1"
+            finish.set()
+            await asyncio.wait_for(asyncio.gather(prompt, control, switching), 5)
+            assert chat.backend.account.name == "ansuman-2"
+            assert chat.backend.configs["mode"]["currentValue"] == "code"
+            assert not bridge.client_requests
+            assert (
+                len([call for call in logged(acp_native) if call["method"] == "session/prompt"])
+                == 1
+            )
+
+    asyncio.run(scenario())
 
 
 @pytest.mark.parametrize("available", [True, False])

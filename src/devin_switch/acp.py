@@ -25,6 +25,12 @@ LOCAL_COMMANDS = [
     {"name": "switch-status", "description": "Show this chat's saved account and exact session ID"},
 ]
 BLOCKED_COMMANDS = {"login", "logout", "org", "new", "resume"}
+LIVE_CONTROLS = {
+    "session/set_config_option",
+    "session/set_mode",
+    "session/set_model",
+    "_cognition.ai/command/revise",
+}
 
 
 class RpcError(SwitchError):
@@ -280,6 +286,7 @@ class Chat:
     setup: dict
     backend: Backend
     gate: asyncio.Lock = field(default_factory=asyncio.Lock)
+    controls: set[asyncio.Task] | None = None
 
 
 class Bridge:
@@ -442,6 +449,11 @@ class Bridge:
         if notification:
             await chat.backend.send({"method": method, "params": params})
             return {}
+        if method in LIVE_CONTROLS and chat.controls is not None:
+            task = self.spawn(self.forward_request(chat.backend, method, params))
+            chat.controls.add(task)
+            task.add_done_callback(chat.controls.discard)
+            return await task
         if method == "session/fork":
             raise RpcError("Forking is not supported by this bridge.", -32601)
         if method == "session/close":
@@ -464,12 +476,21 @@ class Bridge:
             if method == "session/prompt":
                 if await self.local_prompt(chat, params):
                     return {"stopReason": "end_turn"}
-            result = await chat.backend.request(method, params)
-            if method == "session/set_mode":
-                chat.backend.mode = params["modeId"]
-            if method == "session/set_model":
-                chat.backend.model = params["modelId"]
-            return result
+                controls = chat.controls = set()
+                try:
+                    return await self.forward_request(chat.backend, method, params)
+                finally:
+                    chat.controls = None
+                    await asyncio.gather(*controls, return_exceptions=True)
+            return await self.forward_request(chat.backend, method, params)
+
+    async def forward_request(self, backend, method, params):
+        result = await backend.request(method, params)
+        if method == "session/set_mode":
+            backend.mode = params["modeId"]
+        if method == "session/set_model":
+            backend.model = params["modelId"]
+        return result
 
     async def list_sessions(self, params):
         history = await asyncio.to_thread(sessions.history, self.native.store)

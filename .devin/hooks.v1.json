@@ -1,0 +1,14 @@
+{
+  "SessionEnd": [
+    {
+      "matcher": "",
+      "hooks": [
+        {
+          "type": "command",
+          "command": "if [ -n \"${DS_RUN_ID:-}\" ] && [ -n \"${DS_EXECUTABLE:-}\" ]; then if [ \"${DS_FROZEN:-0}\" = 1 ]; then \"$DS_EXECUTABLE\" _session-end; else \"$DS_EXECUTABLE\" -m devin_switch.cli _session-end; fi; fi",
+          "timeout": 5
+        }
+      ]
+    }
+  ]
+}

@@ -75,3 +75,73 @@ def test_module_entrypoint_supports_cli_and_private_bridge(tmp_path: Path) -> No
     )
     assert bridge.returncode == 1
     assert json.loads(bridge.stdout) == {"ok": False, "message": "Account is required."}
+
+
+def test_installed_gui_bridge_modules_and_registry_are_isolated(native, tmp_path):
+    import os
+
+    root = Path(__file__).resolve().parents[1]
+    excluded = {"PYTHONPATH", "DS_RUN_ID", "DS_ACP_RUN_ID", "DS_EXECUTABLE", "DS_FROZEN"}
+    environment = {
+        **{
+            key: value
+            for key, value in os.environ.items()
+            if key not in excluded and not key.startswith("XDG_")
+        },
+        "UV_TOOL_DIR": str(tmp_path / "tools"),
+        "UV_TOOL_BIN_DIR": str(tmp_path / "bin"),
+        "DS_HOME": str(native.store.root),
+        "DS_BINARY": str(native.binary),
+    }
+    installed = subprocess.run(
+        (
+            "uv",
+            "tool",
+            "install",
+            "--offline",
+            "--force",
+            "--reinstall-package",
+            "devin-switch",
+            "--python",
+            sys.executable,
+            str(root),
+        ),
+        env=environment,
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+    assert installed.returncode == 0, installed.stderr
+    python = tmp_path / "tools/devin-switch/bin/python"
+    imported = subprocess.run(
+        (
+            str(python),
+            "-c",
+            "import devin_switch.acp, devin_switch.acp_state; "
+            "assert callable(devin_switch.acp_state.check_handoff); "
+            "print(devin_switch.acp.__file__)",
+        ),
+        env=environment,
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        timeout=15,
+    )
+    assert imported.returncode == 0, imported.stderr
+    assert str(tmp_path / "tools") in imported.stdout
+    registry = subprocess.run(
+        (str(tmp_path / "bin/ds"), "acp", "--sandbox", "--print-registry"),
+        env=environment,
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        timeout=15,
+    )
+    assert registry.returncode == 0, registry.stderr
+    agent = json.loads(registry.stdout)["agents"][0]
+    binary = next(iter(agent["distribution"]["binary"].values()))
+    assert binary["cmd"] == str(python)
+    assert binary["args"] == ["-m", "devin_switch.cli", "acp", "--sandbox"]
+    assert set(binary["env"]) == {"DS_HOME", "DS_BINARY"}
+    assert not (native.store.root / "acp").exists()

@@ -95,7 +95,16 @@ def verify(directory: Path) -> None:
             cwd=root,
         )
         python = root / "tools/devin-switch/bin/python"
-        for module in ("cli", "desktop", "sessions", "usage", "handoff", "terminal"):
+        for module in (
+            "cli",
+            "desktop",
+            "sessions",
+            "usage",
+            "handoff",
+            "terminal",
+            "acp",
+            "acp_state",
+        ):
             subprocess.run(
                 (str(python), "-c", f"import devin_switch.{module}"),
                 check=True,

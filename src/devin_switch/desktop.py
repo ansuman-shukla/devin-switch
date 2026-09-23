@@ -10,7 +10,7 @@ import uuid
 from dataclasses import asdict
 from pathlib import Path
 
-from devin_switch import browser, enrollment, sessions, usage
+from devin_switch import acp_state, browser, enrollment, sessions, usage
 from devin_switch.cli import choose_next, selected_name
 from devin_switch.native import Native, find_binary
 from devin_switch.store import Store, SwitchError, private_directory
@@ -37,6 +37,18 @@ def snapshot(store: Store) -> dict[str, object]:
     except SwitchError as exc:
         chrome_profiles = ()
         chrome_error = str(exc)
+    overview = sessions.overview(store)
+    for run in overview["runs"]:
+        run["gui_lifecycle"] = None
+        if (
+            run["active"]
+            and run["kind"] == "chat"
+            and store.locked(f"acp-controller-{run['id']}.lock")
+        ):
+            try:
+                run["gui_lifecycle"] = acp_state.lifecycle(store, run["id"])
+            except (SwitchError, OSError):
+                pass
     return {
         "accounts": tuple(
             {
@@ -56,7 +68,7 @@ def snapshot(store: Store) -> dict[str, object]:
         "profiles": chrome_profiles,
         "chrome_error": chrome_error,
         "busy": is_busy(store),
-        **sessions.overview(store),
+        **overview,
     }
 
 
@@ -99,6 +111,9 @@ def action(store: Store, request: dict[str, object]) -> dict[str, object]:
     operation = string_field(request, "action")
     if operation == "state":
         return {"state": snapshot(store)}
+    if operation == "close_session":
+        message = acp_state.queue_close(store, string_field(request, "run"))
+        return {"state": snapshot(store), "message": message}
     if operation == "usage":
         usage.refresh_all(store, force=request.get("force") == "true")
         return {"state": snapshot(store)}

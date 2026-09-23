@@ -4,7 +4,8 @@ import json
 import platform
 import subprocess
 import sys
-from contextlib import suppress
+import time
+from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
@@ -16,6 +17,8 @@ from devin_switch.store import Account, SwitchError, write_json
 MAX_MESSAGE = 8 * 1024 * 1024
 LIFECYCLE_TIMEOUT = 30
 SHUTDOWN_TIMEOUT = 10
+IDLE_TIMEOUT = 15 * 60
+IDLE_RECHECK = 30
 LOCAL_COMMANDS = [
     {
         "name": "switch",
@@ -106,6 +109,7 @@ class Backend:
         self.model = None
         self.suppress_replay = False
         self.stopping = False
+        self.last_activity = time.monotonic()
         bridge.backends.add(self)
 
     async def start(self):
@@ -175,6 +179,7 @@ class Backend:
             raise SwitchError(
                 "The GUI agent has stopped. Reopen this saved conversation to reconnect."
             )
+        self.last_activity = time.monotonic()
         self.writer.write((json.dumps({"jsonrpc": "2.0", **message}) + "\n").encode())
         await self.writer.drain()
 
@@ -206,6 +211,12 @@ class Backend:
         finally:
             self.pending.pop(identifier, None)
 
+    def remember_selection(self, category, value):
+        setattr(self, category, value)
+        for option in self.configs.values():
+            if option.get("category") == category:
+                option["currentValue"] = value
+
     def remember(self, result):
         if isinstance(result.get("configOptions"), list):
             self.configs = {
@@ -213,14 +224,18 @@ class Backend:
                 for option in result["configOptions"]
                 if isinstance(option, dict) and "id" in option and "currentValue" in option
             }
+            for option in self.configs.values():
+                if option.get("category") in ("mode", "model"):
+                    setattr(self, option["category"], option["currentValue"])
         if isinstance(result.get("modes"), dict):
-            self.mode = result["modes"].get("currentModeId")
+            self.remember_selection("mode", result["modes"].get("currentModeId"))
         if isinstance(result.get("models"), dict):
-            self.model = result["models"].get("currentModelId")
+            self.remember_selection("model", result["models"].get("currentModelId"))
 
     async def read(self):
         try:
             while line := await self.reader.readline():
+                self.last_activity = time.monotonic()
                 message = json.loads(line)
                 if not isinstance(message, dict) or message.get("jsonrpc") != "2.0":
                     raise ValueError
@@ -287,6 +302,17 @@ class Chat:
     backend: Backend
     gate: asyncio.Lock = field(default_factory=asyncio.Lock)
     controls: set[asyncio.Task] | None = None
+    suspended: bool = False
+    next_idle_check: float = 0
+
+    @asynccontextmanager
+    async def access(self):
+        async with self.gate:
+            self.backend.last_activity = time.monotonic()
+            try:
+                yield
+            finally:
+                self.backend.last_activity = time.monotonic()
 
 
 class Bridge:
@@ -303,6 +329,7 @@ class Bridge:
         self.sequence = 0
         self.tasks = set()
         self.queued = set()
+        self.releasing = set()
 
     def spawn(self, coroutine):
         task = asyncio.create_task(coroutine)
@@ -347,7 +374,7 @@ class Bridge:
             if kind == "config_option_update":
                 backend.remember(update)
             if kind == "current_mode_update":
-                backend.mode = update.get("currentModeId")
+                backend.remember_selection("mode", update.get("currentModeId"))
             if kind == "available_commands_update":
                 update["availableCommands"] = [
                     item
@@ -447,7 +474,16 @@ class Bridge:
             raise RpcError("Load the exact saved conversation before using it.", -32602)
         chat = self.chats[session_id]
         if notification:
-            await chat.backend.send({"method": method, "params": params})
+            if chat.suspended:
+                if method == "session/cancel":
+                    return {}
+                async with chat.access():
+                    if self.chats.get(session_id) is not chat:
+                        return {}
+                    await self.reconnect(chat)
+                    await chat.backend.send({"method": method, "params": params})
+            else:
+                await chat.backend.send({"method": method, "params": params})
             return {}
         if method in LIVE_CONTROLS and chat.controls is not None:
             task = self.spawn(self.forward_request(chat.backend, method, params))
@@ -461,11 +497,13 @@ class Bridge:
             with self.native.store.lock(timeout=5):
                 if path.exists() and acp_state.read_request(path)["stage"] == "queued":
                     path.unlink()
-            if chat.gate.locked():
+            if chat.gate.locked() and not chat.suspended and not chat.backend.stopping:
                 await chat.backend.send(
                     {"method": "session/cancel", "params": {"sessionId": session_id}}
                 )
-        async with chat.gate:
+        async with chat.access():
+            if self.chats.get(session_id) is not chat:
+                raise SwitchError("This GUI chat was closed. Reopen the saved conversation.")
             if method == "session/close":
                 if not await chat.backend.close():
                     raise SwitchError(
@@ -476,20 +514,23 @@ class Bridge:
             if method == "session/prompt":
                 if await self.local_prompt(chat, params):
                     return {"stopReason": "end_turn"}
+                await self.reconnect(chat)
                 controls = chat.controls = set()
                 try:
                     return await self.forward_request(chat.backend, method, params)
                 finally:
                     chat.controls = None
                     await asyncio.gather(*controls, return_exceptions=True)
+            if method == "session/cancel" and chat.suspended:
+                return {}
+            await self.reconnect(chat)
             return await self.forward_request(chat.backend, method, params)
 
     async def forward_request(self, backend, method, params):
         result = await backend.request(method, params)
-        if method == "session/set_mode":
-            backend.mode = params["modeId"]
-        if method == "session/set_model":
-            backend.model = params["modelId"]
+        if method in {"session/set_mode", "session/set_model"}:
+            category = "mode" if method == "session/set_mode" else "model"
+            backend.remember_selection(category, params[f"{category}Id"])
         return result
 
     async def list_sessions(self, params):
@@ -525,7 +566,15 @@ class Bridge:
                 chat = self.chats[session_id]
                 if chat.setup["cwd"] != str(project):
                     raise SwitchError("Resume this conversation from its original project.")
-                async with chat.gate:
+                async with chat.access():
+                    if self.chats.get(session_id) is not chat:
+                        raise SwitchError(
+                            "This GUI chat was closed. Reopen the saved conversation."
+                        )
+                    if chat.suspended:
+                        return await self.reconnect(
+                            chat, setup=setup, replay=method == "session/load"
+                        )
                     if chat.backend.process.poll() is not None or chat.backend.writer.is_closing():
                         if not await chat.backend.close():
                             raise SwitchError(
@@ -563,6 +612,7 @@ class Bridge:
             setup["sessionId"] = session_id
             with self.native.store.lock(timeout=5):
                 acp_state.bind(self.native.store, session_id, account)
+                acp_state.set_lifecycle(self.native.store, backend.lease.run.id, "open")
             backend.suppress_replay = False
             self.chats[session_id] = Chat(session_id, setup, backend)
             return result
@@ -604,14 +654,20 @@ class Bridge:
                 history = "saved" if saved else "not saved yet"
             except (SwitchError, OSError):
                 history = "unavailable"
+            connection = (
+                "suspended (reconnects on the next message)"
+                if chat.suspended
+                else ("open" if connected else "closed")
+            )
             await self.note(
                 chat.session_id,
                 f"Account: {chat.backend.account.name}. Session: {chat.session_id}. "
-                f"Connection: {'open' if connected else 'closed'}. "
+                f"Connection: {connection}. "
                 f"Shared history: {history}. Desktop login is unchanged.",
             )
             return True
         try:
+            await self.reconnect(chat)
             await self.switch(chat, words[1] if len(words) == 2 else None)
         except (SwitchError, OSError) as exc:
             await self.note(
@@ -644,14 +700,43 @@ class Bridge:
                 }
             )
 
-    async def restore(self, chat, account, settings, mode, model):
-        candidate = Backend(self, account, Path(chat.setup["cwd"]), chat.session_id)
-        candidate.suppress_replay = True
+    async def reconnect(self, chat, *, setup=None, replay=False):
+        if not chat.suspended:
+            return None
+        old = chat.backend
+        if old.process.poll() is None:
+            raise SwitchError("The previous agent is still shutting down. Retry after it exits.")
+        await old.close()
+        if old.process.returncode != 0:
+            raise SwitchError(
+                "The previous agent exited abnormally. Close this tab and reopen the saved chat. "
+                "No prompt was sent."
+            )
+        candidate, result = await self.restore(
+            chat,
+            old.account,
+            copy.deepcopy(old.configs),
+            old.mode,
+            old.model,
+            setup=setup,
+            replay=replay,
+        )
+        chat.backend = candidate
+        chat.suspended = False
+        if setup is not None:
+            chat.setup = setup
+        await self.publish_settings(chat)
+        return result
+
+    async def restore(self, chat, account, settings, mode, model, *, setup=None, replay=False):
+        setup = chat.setup if setup is None else setup
+        candidate = Backend(self, account, Path(setup["cwd"]), chat.session_id)
+        candidate.suppress_replay = not replay
         stage = "starting the native agent"
         try:
             await candidate.start()
             stage = "loading the saved conversation"
-            result = await candidate.request("session/load", chat.setup, LIFECYCLE_TIMEOUT)
+            result = await candidate.request("session/load", setup, LIFECYCLE_TIMEOUT)
             stage = "restoring session settings"
             for identifier, option in settings.items():
                 current = candidate.configs.get(identifier)
@@ -693,8 +778,19 @@ class Bridge:
                 for identifier, option in settings.items()
             ):
                 raise SwitchError("The destination did not preserve this chat's configuration.")
+            if (mode is not None and candidate.mode != mode) or (
+                model is not None and candidate.model != model
+            ):
+                raise SwitchError("The destination did not preserve this chat's mode or model.")
             if candidate.process.poll() is not None:
                 raise SwitchError("The destination agent exited before the conversation was ready.")
+            with self.native.store.lock(timeout=5):
+                acp_state.set_lifecycle(self.native.store, candidate.lease.run.id, "open")
+            result = {**result, "configOptions": list(candidate.configs.values())}
+            if isinstance(result.get("modes"), dict):
+                result["modes"]["currentModeId"] = candidate.mode
+            if isinstance(result.get("models"), dict):
+                result["models"]["currentModelId"] = candidate.model
             candidate.suppress_replay = False
             return candidate, result
         except BaseException as exc:
@@ -726,6 +822,9 @@ class Bridge:
             acp_state.check_handoff, store, chat.session_id, chat.setup["cwd"], old.lease.run.id
         )
         settings, mode, model = copy.deepcopy(old.configs), old.mode, old.model
+        with store.lock(timeout=5):
+            acp_state.check_switchable(store, old.lease.run.id)
+            acp_state.set_lifecycle(store, old.lease.run.id, "closing")
         if not await old.close():
             raise SwitchError(
                 "The current agent is still shutting down. No replacement was started or "
@@ -774,7 +873,7 @@ class Bridge:
 
     async def queued_switch(self, chat, path):
         try:
-            async with chat.gate:
+            async with chat.access():
                 with self.native.store.lock(timeout=5):
                     if not path.exists():
                         return
@@ -803,13 +902,77 @@ class Bridge:
             path.unlink(missing_ok=True)
             self.queued.discard(chat.session_id)
 
+    async def release_idle(self, chat):
+        manual = False
+        store = self.native.store
+        run_id = chat.backend.lease.run.id
+        try:
+            if chat.gate.locked() or chat.suspended or self.chats.get(chat.session_id) is not chat:
+                return False
+            async with chat.gate:
+                backend = chat.backend
+                if (
+                    backend.stopping
+                    or backend.process.poll() is not None
+                    or backend.writer.is_closing()
+                    or backend.pending
+                    or chat.controls is not None
+                    or any(owner is backend for owner, _ in self.client_requests.values())
+                    or chat.session_id in self.queued
+                ):
+                    return False
+                with store.lock(timeout=5):
+                    state = acp_state.lifecycle(store, run_id)
+                    manual = state == "close_requested"
+                    if state not in ("open", "close_requested"):
+                        return False
+                    if not manual and time.monotonic() - backend.last_activity < IDLE_TIMEOUT:
+                        return False
+                    if acp_state.request_path(store, run_id).exists():
+                        return False
+                    saved = acp_state.check_saved(store, chat.session_id, chat.setup["cwd"])
+                    others = [run for run in sessions.runs(store) if run["id"] != run_id]
+                    if blocker := sessions.resume_blocker(saved, others):
+                        raise SwitchError(blocker)
+                    acp_state.set_lifecycle(store, run_id, "closing")
+                    chat.suspended = True
+                return await backend.close()
+        except (SwitchError, OSError):
+            if manual and not chat.suspended:
+                with store.lock(timeout=5):
+                    acp_state.set_lifecycle(store, run_id, "open")
+                await self.note(
+                    chat.session_id,
+                    "Close canceled: saved history or connection state is unavailable. "
+                    "The current agent was left open. Retry after checking /switch-status.",
+                )
+            return False
+        finally:
+            chat.next_idle_check = time.monotonic() + IDLE_RECHECK
+            self.releasing.discard(chat.session_id)
+
     async def poll(self):
         while True:
             for chat in list(self.chats.values()):
-                path = acp_state.request_path(self.native.store, chat.backend.lease.run.id)
+                if chat.suspended:
+                    continue
+                run_id = chat.backend.lease.run.id
+                path = acp_state.request_path(self.native.store, run_id)
                 if path.exists() and chat.session_id not in self.queued:
                     self.queued.add(chat.session_id)
                     self.spawn(self.queued_switch(chat, path))
+                elif not chat.gate.locked() and chat.session_id not in self.releasing:
+                    try:
+                        manual = acp_state.lifecycle(self.native.store, run_id) == "close_requested"
+                    except (SwitchError, OSError):
+                        continue
+                    now = time.monotonic()
+                    if manual or (
+                        now >= chat.next_idle_check
+                        and now - chat.backend.last_activity >= IDLE_TIMEOUT
+                    ):
+                        self.releasing.add(chat.session_id)
+                        self.spawn(self.release_idle(chat))
             await asyncio.sleep(0.1)
 
     async def close(self):

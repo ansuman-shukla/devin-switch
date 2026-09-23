@@ -62,6 +62,8 @@ def parser() -> argparse.ArgumentParser:
     switch.add_argument("account", nargs="?")
     switch.add_argument("--session", help="Target an exact live Switch-managed GUI conversation")
     switch.add_argument("--cancel", action="store_true", help="Cancel a pending switch")
+    close = commands.add_parser("close", help="Release a saved GUI chat's process when idle")
+    close.add_argument("--run", required=True, help="Exact launch ID from ds sessions --gui")
     commands.add_parser("list", help="List registered accounts and the current selection")
     commands.add_parser("profiles", help="List existing Chrome profile identifiers")
     status = commands.add_parser("status", help="Check the selected or specified saved login")
@@ -132,6 +134,11 @@ def execute(args: argparse.Namespace, store: Store) -> int:
             print(json.dumps(acp.registry(native, args.account, args.sandbox), indent=2))
         else:
             asyncio.run(acp.serve(native, account=args.account, sandbox=args.sandbox))
+        return 0
+    if args.command == "close":
+        from devin_switch import acp_state
+
+        print(acp_state.queue_close(store, args.run))
         return 0
     if args.command == "sessions" and args.gui:
         from devin_switch import acp_state

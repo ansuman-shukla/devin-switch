@@ -70,6 +70,65 @@ def request_path(store: Store, run_id: str) -> Path:
     return store.root / "acp" / "requests" / f"{run_id}.json"
 
 
+def lifecycle_path(store: Store, run_id: str) -> Path:
+    return store.root / "acp" / "lifecycle" / request_path(store, run_id).name
+
+
+def lifecycle(store: Store, run_id: str) -> str | None:
+    try:
+        value = json.loads(lifecycle_path(store, run_id).read_text())
+        if value not in ("open", "close_requested", "closing"):
+            raise ValueError
+        return value
+    except FileNotFoundError:
+        return None
+    except (ValueError, TypeError) as exc:
+        raise SwitchError("Invalid GUI lifecycle state. Reopen the saved chat.") from exc
+
+
+def set_lifecycle(store: Store, run_id: str, state: str) -> None:
+    path = lifecycle_path(store, run_id)
+    private_directory(path.parent)
+    write_json(path, state)
+
+
+def check_saved(store: Store, session_id: str, project: str) -> dict:
+    saved = saved_chat(store, session_id)
+    if saved is None or saved["project"] != project or not Path(project).is_dir():
+        raise SwitchError(
+            "Close canceled: this chat is not available in shared history. "
+            "Its connection is unchanged. Send a normal message first and retry."
+        )
+    return saved
+
+
+def queue_close(store: Store, run_id: str) -> str:
+    lifecycle_path(store, run_id)
+    with store.lock(timeout=5):
+        run = target(store, None, run_id)
+        if lifecycle(store, run_id) is None:
+            raise SwitchError(
+                "This older GUI bridge cannot reconnect automatically. Close its tab instead."
+            )
+        if request_path(store, run_id).exists():
+            raise SwitchError("A GUI switch is pending. Cancel it before closing this connection.")
+        if lifecycle(store, run_id) != "open":
+            raise SwitchError("This GUI connection is already closing.")
+        check_saved(store, run["session_id"], run["project"])
+        set_lifecycle(store, run_id, "close_requested")
+    return (
+        "Close requested for this GUI connection when idle. Saved history is kept; "
+        "the next message reconnects using the same account."
+    )
+
+
+def check_switchable(store: Store, run_id: str) -> None:
+    if lifecycle(store, run_id) not in (None, "open"):
+        raise SwitchError(
+            "This GUI connection is closing. Send a message to reconnect before switching."
+        )
+
+
 def live(store: Store) -> list[dict]:
     return [
         run
@@ -128,6 +187,7 @@ def queue(native: Native, session_id: str | None, account_name: str | None, *, c
         if cancel:
             path.unlink(missing_ok=True)
             return "Queued GUI switch canceled. No account was changed."
+        check_switchable(store, run["id"])
     if account_name:
         account = store.account(account_name)
         if account.name == run["account"]:
@@ -139,6 +199,7 @@ def queue(native: Native, session_id: str | None, account_name: str | None, *, c
             raise SwitchError("This GUI chat changed while checking accounts; try again.")
         if path.exists():
             raise SwitchError("A GUI switch is already queued. Use --cancel first.")
+        check_switchable(store, run["id"])
         private_directory(path.parent)
         write_json(
             path, {"account": account_name, "session_id": run["session_id"], "stage": "queued"}
@@ -202,5 +263,6 @@ class Lease:
             if ended and hasattr(self, "path"):
                 write_json(self.path, asdict(replace(self.run, ended_at=time.time())))
             request_path(self.store, self.run.id).unlink(missing_ok=True)
+            lifecycle_path(self.store, self.run.id).unlink(missing_ok=True)
         finally:
             self.stack.close()

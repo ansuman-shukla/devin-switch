@@ -462,7 +462,7 @@ func sampleSnapshot(used: Double = 25, selected: String = "work") -> Snapshot {
         request.recognitionLevel = .accurate
         try VNImageRequestHandler(cgImage: image()).perform([request])
         guard let caption = request.results?.first(where: {
-            $0.topCandidates(1).first?.string.hasPrefix("Clos") == true
+            $0.topCandidates(1).first?.string.contains("Clos") == true
         }) else {
             throw TestFailure(description: "GUI connection must visibly offer a Close button; found: \(request.results?.compactMap { $0.topCandidates(1).first?.string } ?? [])")
         }

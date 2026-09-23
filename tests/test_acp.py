@@ -7,7 +7,7 @@ from pathlib import Path
 
 import pytest
 
-from devin_switch import acp, acp_state, cli, sessions, usage
+from devin_switch import acp, acp_state, cli, desktop, sessions, usage
 from devin_switch.native import Native
 from devin_switch.store import SwitchError
 
@@ -888,6 +888,369 @@ def test_gui_unsaved_queued_handoff_does_not_close_source(acp_native, tmp_path, 
             assert acp_native.store.selected().name == "ansuman-1"
             assert "not saved" in json.dumps(messages)
             assert not path.exists()
+
+    asyncio.run(scenario())
+
+
+def test_gui_idle_release_reconnects_once_with_same_account_and_settings(acp_native, tmp_path):
+    async def scenario():
+        async with in_process(acp_native) as (bridge, messages):
+            bridge.flags = ("--sandbox",)
+            result = await bridge.dispatch("session/new", {"cwd": str(tmp_path), "mcpServers": []})
+            session_id = result["sessionId"]
+            chat = bridge.chats[session_id]
+            original = chat.backend
+            await bridge.dispatch(
+                "session/set_config_option",
+                {"sessionId": session_id, "configId": "mode", "value": "plan"},
+            )
+            assert not await bridge.release_idle(chat)
+            original.last_activity -= acp.IDLE_TIMEOUT + 1
+            assert await bridge.release_idle(chat)
+            assert chat.suspended and original.process.poll() == 0
+            assert not acp_state.live(acp_native.store)
+            acp_native.store.select(acp_native.store.account("ansuman-2"))
+            await bridge.dispatch(
+                "session/prompt",
+                {"sessionId": session_id, "prompt": [{"type": "text", "text": "/switch-status"}]},
+            )
+            assert "suspended" in json.dumps(messages)
+            assert chat.backend is original
+            await asyncio.gather(
+                *(
+                    bridge.dispatch(
+                        "session/prompt",
+                        {"sessionId": session_id, "prompt": [{"type": "text", "text": "next"}]},
+                    )
+                    for _ in range(2)
+                )
+            )
+            assert not chat.suspended and chat.backend is not original
+            assert chat.backend.account.name == "ansuman-1"
+            assert chat.backend.configs["mode"]["currentValue"] == "plan"
+            assert acp_native.store.selected().name == "ansuman-2"
+            assert "historical replay" not in json.dumps(messages)
+            calls = logged(acp_native)
+            assert len([call for call in calls if call["method"] == "session/load"]) == 1
+            assert len([call for call in calls if call["method"] == "session/prompt"]) == 2
+            assert all("--sandbox" in call["args"] for call in calls[1:])
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize(
+    ("method", "params", "key", "value"),
+    [
+        ("session/set_mode", {"modeId": "plan"}, "mode", "plan"),
+        ("session/set_model", {"modelId": "other-model"}, "model", "other-model"),
+    ],
+)
+def test_gui_idle_preserves_mode_and_model_controls(
+    acp_native, tmp_path, method, params, key, value
+):
+    async def scenario():
+        async with in_process(acp_native) as (bridge, messages):
+            result = await bridge.dispatch("session/new", {"cwd": str(tmp_path), "mcpServers": []})
+            chat = bridge.chats[result["sessionId"]]
+            await bridge.dispatch(method, {"sessionId": chat.session_id, **params})
+            chat.backend.last_activity -= acp.IDLE_TIMEOUT + 1
+            assert await bridge.release_idle(chat)
+            await bridge.dispatch(
+                "session/prompt",
+                {"sessionId": chat.session_id, "prompt": [{"type": "text", "text": "next"}]},
+            )
+            reply = json.loads(messages[-1]["params"]["update"]["content"]["text"])
+            assert reply["settings"][key] == value
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("reason", ["unsaved", "history_error", "permission", "control", "switch"])
+def test_gui_idle_release_leaves_unsafe_chats_open(acp_native, tmp_path, monkeypatch, reason):
+    if reason == "unsaved":
+        monkeypatch.setenv("FAKE_SAVE_ON_PROMPT", "1")
+
+    async def scenario():
+        async with in_process(acp_native) as (bridge, _):
+            result = await bridge.dispatch("session/new", {"cwd": str(tmp_path), "mcpServers": []})
+            chat = bridge.chats[result["sessionId"]]
+            backend = chat.backend
+            backend.last_activity -= acp.IDLE_TIMEOUT + 1
+            if reason == "history_error":
+
+                def unavailable(store):
+                    raise SwitchError("History unavailable")
+
+                monkeypatch.setattr(sessions, "history", unavailable)
+            if reason == "permission":
+                bridge.client_requests["pending"] = (backend, 123)
+            if reason == "control":
+                chat.controls = set()
+            if reason == "switch":
+                acp_state.queue(acp_native, chat.session_id, "ansuman-2")
+            assert not await bridge.release_idle(chat)
+            assert not chat.suspended and backend.process.poll() is None
+            assert chat.backend is backend
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("exit_code", [0, 7])
+def test_gui_idle_slow_shutdown_never_overlaps_replacement(
+    acp_native, tmp_path, monkeypatch, exit_code
+):
+    async def scenario():
+        async with in_process(acp_native) as (bridge, _):
+            monkeypatch.setenv("FAKE_SHUTDOWN_DELAY", "0.5")
+            monkeypatch.setenv("FAKE_EXIT_ON_EOF", str(exit_code))
+            result = await bridge.dispatch("session/new", {"cwd": str(tmp_path), "mcpServers": []})
+            chat = bridge.chats[result["sessionId"]]
+            backend = chat.backend
+            backend.last_activity -= acp.IDLE_TIMEOUT + 1
+            monkeypatch.setattr(acp, "SHUTDOWN_TIMEOUT", 0.01)
+            assert not await bridge.release_idle(chat)
+            assert chat.suspended and backend.process.poll() is None
+            params = {"sessionId": chat.session_id, "prompt": [{"type": "text", "text": "next"}]}
+            with pytest.raises(SwitchError, match="still shutting down"):
+                await bridge.dispatch("session/prompt", params)
+            assert not any(call["method"] == "session/load" for call in logged(acp_native))
+            await asyncio.wait_for(backend.watcher, 3)
+            if exit_code:
+                with pytest.raises(SwitchError, match="abnormally"):
+                    await bridge.dispatch("session/prompt", params)
+            else:
+                await bridge.dispatch("session/prompt", params)
+                assert chat.backend is not backend
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("source", ["desktop", "cli"])
+def test_gui_close_exact_launch_waits_for_decision_and_reconnects(
+    acp_native, tmp_path, source, monkeypatch
+):
+    monkeypatch.setattr(desktop.browser, "profiles", lambda: ())
+
+    async def scenario():
+        async with connect(acp_native, auto_respond=False) as client:
+            first, other = await client.new(tmp_path), await client.new(tmp_path)
+            original = next(
+                run for run in acp_state.live(acp_native.store) if run["session_id"] == first
+            )
+            pending = asyncio.create_task(client.prompt(first, "permission"))
+            request = await asyncio.wait_for(client.requests.get(), 5)
+            if source == "desktop":
+                result = await asyncio.to_thread(
+                    desktop.action,
+                    acp_native.store,
+                    {"action": "close_session", "run": original["id"]},
+                )
+                assert "when idle" in result["message"]
+            else:
+                args = cli.parser().parse_args(["close", "--run", original["id"]])
+                assert await asyncio.to_thread(cli.execute, args, acp_native.store) == 0
+            await asyncio.sleep(0.2)
+            assert not pending.done()
+            assert len(acp_state.live(acp_native.store)) == 2
+            assert acp_state.lifecycle(acp_native.store, original["id"]) == "close_requested"
+            with pytest.raises(SwitchError, match="closing"):
+                acp_state.queue(acp_native, first, "ansuman-2")
+            response = {"outcome": {"outcome": "selected", "optionId": "reject"}}
+            await client.send({"id": request["id"], "result": response})
+            assert "result" in await pending
+            assert client.agent_replies()[-1]["decision"]["result"] == response
+            async with asyncio.timeout(5):
+                while any(run["id"] == original["id"] for run in acp_state.live(acp_native.store)):
+                    await asyncio.sleep(0.05)
+            assert [run["session_id"] for run in acp_state.live(acp_native.store)] == [other]
+            await client.prompt(first, "next")
+            assert client.agent_replies()[-1]["session"] == first
+            assert client.agent_replies()[-1]["account"] == original["account"]
+            with pytest.raises(SwitchError, match="No unique live GUI"):
+                acp_state.queue_close(acp_native.store, original["id"])
+            assert "historical replay" not in client.texts()
+            assert acp_native.store.selected().name == original["account"]
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("reason", ["unsaved", "legacy", "switch", "invalid"])
+def test_gui_close_rejects_unsafe_or_unsupported_launches(
+    acp_native, tmp_path, monkeypatch, reason
+):
+    if reason == "unsaved":
+        monkeypatch.setenv("FAKE_SAVE_ON_PROMPT", "1")
+
+    async def scenario():
+        async with in_process(acp_native) as (bridge, _):
+            result = await bridge.dispatch("session/new", {"cwd": str(tmp_path), "mcpServers": []})
+            chat = bridge.chats[result["sessionId"]]
+            run_id = chat.backend.lease.run.id
+            if reason == "legacy":
+                acp_state.lifecycle_path(acp_native.store, run_id).unlink()
+            if reason == "switch":
+                acp_state.queue(acp_native, chat.session_id, "ansuman-2")
+            with pytest.raises(SwitchError):
+                acp_state.queue_close(
+                    acp_native.store, "../invalid" if reason == "invalid" else run_id
+                )
+            assert chat.backend.process.poll() is None
+            assert acp_state.lifecycle(acp_native.store, run_id) in (None, "open")
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("reason", ["missing", "duplicate", "restore_failure", "ignored_settings"])
+def test_gui_idle_reconnect_failure_never_sends_prompt(acp_native, tmp_path, monkeypatch, reason):
+    async def scenario():
+        async with in_process(acp_native) as (bridge, messages):
+            result = await bridge.dispatch("session/new", {"cwd": str(tmp_path), "mcpServers": []})
+            chat = bridge.chats[result["sessionId"]]
+            await bridge.dispatch(
+                "session/set_config_option",
+                {"sessionId": chat.session_id, "configId": "mode", "value": "plan"},
+            )
+            chat.backend.last_activity -= acp.IDLE_TIMEOUT + 1
+            assert await bridge.release_idle(chat)
+            if reason == "missing":
+                monkeypatch.setattr(sessions, "history", lambda store: [])
+            if reason == "restore_failure":
+                monkeypatch.setenv("FAKE_FAIL_LOAD_ACCOUNT", "ansuman-1")
+            if reason == "ignored_settings":
+                monkeypatch.setenv("FAKE_IGNORE_CONFIG_ACCOUNT", "ansuman-1")
+            async with in_process(acp_native) as (other, _):
+                if reason == "duplicate":
+                    await other.dispatch("session/load", chat.setup)
+                with pytest.raises(SwitchError) as error:
+                    await bridge.dispatch(
+                        "session/prompt",
+                        {
+                            "sessionId": chat.session_id,
+                            "prompt": [{"type": "text", "text": "next"}],
+                        },
+                    )
+                assert "sensitive-native-diagnostic" not in str(error.value)
+                assert chat.suspended
+                assert "historical replay" not in json.dumps(messages)
+                assert not any(call["method"] == "session/prompt" for call in logged(acp_native))
+
+    asyncio.run(scenario())
+
+
+def test_gui_idle_poll_releases_only_old_idle_connections(acp_native, tmp_path):
+    async def scenario():
+        async with in_process(acp_native) as (bridge, _):
+            first = await bridge.dispatch("session/new", {"cwd": str(tmp_path), "mcpServers": []})
+            second = await bridge.dispatch("session/new", {"cwd": str(tmp_path), "mcpServers": []})
+            old, recent = bridge.chats[first["sessionId"]], bridge.chats[second["sessionId"]]
+            old.backend.last_activity -= acp.IDLE_TIMEOUT + 1
+            bridge.spawn(bridge.poll())
+            async with asyncio.timeout(5):
+                while not old.suspended or old.backend.process.poll() is None:
+                    await asyncio.sleep(0.05)
+            assert not recent.suspended and recent.backend.process.poll() is None
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("method", ["session/load", "session/resume"])
+def test_gui_idle_explicit_reopen_restores_settings_and_replay_policy(acp_native, tmp_path, method):
+    async def scenario():
+        async with in_process(acp_native) as (bridge, messages):
+            result = await bridge.dispatch("session/new", {"cwd": str(tmp_path), "mcpServers": []})
+            chat = bridge.chats[result["sessionId"]]
+            await bridge.dispatch(
+                "session/set_config_option",
+                {"sessionId": chat.session_id, "configId": "mode", "value": "plan"},
+            )
+            chat.backend.last_activity -= acp.IDLE_TIMEOUT + 1
+            assert await bridge.release_idle(chat)
+            result = await bridge.dispatch(method, chat.setup)
+            assert (
+                next(option for option in result["configOptions"] if option["id"] == "mode")[
+                    "currentValue"
+                ]
+                == "plan"
+            )
+            assert ("historical replay" in json.dumps(messages)) == (method == "session/load")
+            assert not any(call["method"] == "session/prompt" for call in logged(acp_native))
+
+    asyncio.run(scenario())
+
+
+def test_gui_idle_release_ignores_background_lease_and_keeps_server_alive(acp_native, tmp_path):
+    async def scenario():
+        async with in_process(acp_native) as (bridge, _):
+            result = await bridge.dispatch("session/new", {"cwd": str(tmp_path), "mcpServers": []})
+            chat = bridge.chats[result["sessionId"]]
+            await bridge.dispatch(
+                "session/prompt",
+                {"sessionId": chat.session_id, "prompt": [{"type": "text", "text": "background"}]},
+            )
+            old = chat.backend
+            old.last_activity -= acp.IDLE_TIMEOUT + 1
+            assert await bridge.release_idle(chat)
+            assert old.process.poll() == 0
+            assert acp_native.store.locked(f"run-{old.lease.run.id}.lock")
+            assert not acp_state.live(acp_native.store)
+            await bridge.dispatch(
+                "session/set_mode", {"sessionId": chat.session_id, "modeId": "plan"}
+            )
+            assert chat.backend is not old and not chat.suspended
+            assert acp_native.store.locked(f"run-{old.lease.run.id}.lock")
+            await asyncio.sleep(2)
+
+    asyncio.run(scenario())
+
+
+def test_gui_close_rechecks_history_and_keeps_legacy_run_schema(acp_native, tmp_path, monkeypatch):
+    monkeypatch.setattr(desktop.browser, "profiles", lambda: ())
+
+    async def scenario():
+        async with in_process(acp_native) as (bridge, messages):
+            result = await bridge.dispatch("session/new", {"cwd": str(tmp_path), "mcpServers": []})
+            chat = bridge.chats[result["sessionId"]]
+            backend = chat.backend
+            run_id = backend.lease.run.id
+            record = backend.lease.path.read_text()
+            state = desktop.snapshot(acp_native.store)
+            assert (
+                next(run for run in state["runs"] if run["id"] == run_id)["gui_lifecycle"] == "open"
+            )
+            acp_state.queue_close(acp_native.store, run_id)
+            state = desktop.snapshot(acp_native.store)
+            assert (
+                next(run for run in state["runs"] if run["id"] == run_id)["gui_lifecycle"]
+                == "close_requested"
+            )
+            monkeypatch.setattr(sessions, "history", lambda store: [])
+            assert not await bridge.release_idle(chat)
+            assert not chat.suspended and backend.process.poll() is None
+            assert acp_state.lifecycle(acp_native.store, run_id) == "open"
+            assert "Close canceled" in json.dumps(messages)
+            assert backend.lease.path.read_text() == record
+            acp_state.lifecycle_path(acp_native.store, run_id).unlink()
+            state = desktop.snapshot(acp_native.store)
+            assert (
+                next(run for run in state["runs"] if run["id"] == run_id)["gui_lifecycle"] is None
+            )
+
+    asyncio.run(scenario())
+
+
+def test_gui_idle_close_tab_does_not_restart_a_suspended_chat(acp_native, tmp_path):
+    async def scenario():
+        async with in_process(acp_native) as (bridge, _):
+            result = await bridge.dispatch("session/new", {"cwd": str(tmp_path), "mcpServers": []})
+            chat = bridge.chats[result["sessionId"]]
+            chat.backend.last_activity -= acp.IDLE_TIMEOUT + 1
+            assert await bridge.release_idle(chat)
+            await bridge.dispatch(
+                "session/cancel", {"sessionId": chat.session_id}, notification=True
+            )
+            await bridge.dispatch("session/close", {"sessionId": chat.session_id})
+            assert chat.session_id not in bridge.chats
+            assert not any(call["method"] == "session/load" for call in logged(acp_native))
 
     asyncio.run(scenario())
 

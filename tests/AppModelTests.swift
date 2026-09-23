@@ -198,6 +198,38 @@ func sampleSnapshot(used: Double = 25, selected: String = "work") -> Snapshot {
             try await adaptiveLayout(model: model, defaults: defaults)
         case "workspace-controls":
             try await workspaceControls(model: model, defaults: defaults)
+        case "session-close":
+            model.snapshot = sampleSnapshot()
+            let run = SessionRun(id: "exact-launch", account: "work", project: "/test", kind: "chat", started_at: 1, session_id: "saved-chat", active: true, gui_lifecycle: "open")
+            model.snapshot.runs = [run]
+            model.closeSession(run)
+            try await waitUntil { bridge.requests.count == 1 }
+            try expect(bridge.requests[0].0 == ["action": "close_session", "run": "exact-launch"], "Close must target the exact launch, not an account or latest chat")
+            var closing = model.snapshot
+            closing.runs[0].gui_lifecycle = "close_requested"
+            bridge.complete(0, state: closing)
+            try await waitUntil { !model.working && bridge.requests.count == 2 }
+            try expect(model.snapshot == closing && model.snapshot.selected == "work", "Close must retain history and account selection")
+            try expect(bridge.requests[1].0["action"] == "state", "Close must not trigger network usage requests")
+            model.closeSession(closing.runs[0])
+            var legacy = run
+            legacy.gui_lifecycle = nil
+            model.closeSession(legacy)
+            await Task.yield()
+            try expect(bridge.requests.count == 2, "Closing or legacy connections must not send duplicate requests")
+            bridge.complete(1, state: closing)
+        case "session-close-error":
+            let run = SessionRun(id: "exact-launch", account: "work", project: "/test", kind: "chat", started_at: 1, session_id: "unsaved-chat", active: true, gui_lifecycle: "open")
+            model.snapshot.runs = [run]
+            model.closeSession(run)
+            try await waitUntil { bridge.requests.count == 1 }
+            bridge.requests[0].1.resume(returning: Reply(ok: false, state: nil, message: "Chat is not saved yet", launcher: nil, focus: nil))
+            try await waitUntil { !model.working && bridge.requests.count == 2 }
+            try expect(model.failed && model.message == "Chat is not saved yet", "Close rejection must be visible")
+            try expect(model.snapshot.runs == [run], "A rejected close must leave the row present")
+            bridge.complete(1, state: model.snapshot)
+        case "session-close-control":
+            try await sessionCloseControl(model: model, bridge: bridge)
         case "navigation":
             model.snapshot = sampleSnapshot()
             model.focus = "personal"
@@ -404,6 +436,57 @@ func sampleSnapshot(used: Double = 25, selected: String = "work") -> Snapshot {
             let path = URL(fileURLWithPath: CommandLine.arguments[2]).appendingPathComponent("global-quota-overview.png")
             try NSBitmapImageRep(cgImage: image).representation(using: .png, properties: [:])!.write(to: path)
         }
+    }
+
+    @MainActor static func sessionCloseControl(model: AppModel, bridge: MockBridge) async throws {
+        NSApplication.shared.setActivationPolicy(.prohibited)
+        model.snapshot = sampleSnapshot()
+        let run = SessionRun(id: "exact-launch", account: "work", project: "/test/project", kind: "chat", started_at: 1, session_id: "saved-chat", active: true, gui_lifecycle: "open")
+        model.snapshot.runs = [run]
+        let view = NSHostingView(rootView: OpenSessionsPanel().environmentObject(model).foregroundStyle(Palette.text).preferredColorScheme(.dark))
+        let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 780, height: 360), styleMask: [.titled], backing: .buffered, defer: false)
+        window.contentView = view
+        window.makeKeyAndOrderFront(nil)
+        defer { window.orderOut(nil) }
+        try await Task.sleep(for: .milliseconds(100))
+        view.layoutSubtreeIfNeeded()
+        func image() throws -> CGImage {
+            let renderer = ImageRenderer(content: OpenSessionsPanel().environmentObject(model)
+                .foregroundStyle(Palette.text).preferredColorScheme(.dark)
+                .frame(width: view.bounds.width, height: view.bounds.height))
+            renderer.scale = 3
+            guard let image = renderer.cgImage else { throw TestFailure(description: "Could not render session controls") }
+            return image
+        }
+        let request = VNRecognizeTextRequest()
+        request.recognitionLevel = .accurate
+        try VNImageRequestHandler(cgImage: image()).perform([request])
+        guard let caption = request.results?.first(where: { $0.topCandidates(1).first?.string == "Close" }) else {
+            throw TestFailure(description: "GUI connection must visibly offer a Close button; found: \(request.results?.compactMap { $0.topCandidates(1).first?.string } ?? [])")
+        }
+        let center = caption.boundingBox
+        let point = NSPoint(x: center.midX * view.bounds.width, y: (view.isFlipped ? 1 - center.midY : center.midY) * view.bounds.height)
+        for type in [NSEvent.EventType.leftMouseDown, .leftMouseUp] {
+            let event = NSEvent.mouseEvent(with: type, location: view.convert(point, to: nil), modifierFlags: [], timestamp: ProcessInfo.processInfo.systemUptime, windowNumber: window.windowNumber, context: nil, eventNumber: 0, clickCount: 1, pressure: 1)!
+            window.sendEvent(event)
+        }
+        try await waitUntil { bridge.requests.count == 1 }
+        try expect(bridge.requests[0].0 == ["action": "close_session", "run": "exact-launch"], "The visible Close button must target its row")
+        var closing = model.snapshot
+        closing.runs[0].gui_lifecycle = "close_requested"
+        bridge.complete(0, state: closing)
+        try await waitUntil { !model.working && bridge.requests.count == 2 }
+        bridge.complete(1, state: closing)
+        try await Task.sleep(for: .milliseconds(60))
+        view.layoutSubtreeIfNeeded()
+        let labels = try recognizedText(in: image())
+        try expect(labels.contains("Closing"), "A queued close must visibly disable and relabel the button")
+        let legacy = """
+        {"id":"legacy","account":"work","project":"/test","kind":"chat","started_at":1,"session_id":"saved-chat","active":true}
+        """
+        let decoded = try JSONDecoder().decode(SessionRun.self, from: Data(legacy.utf8))
+        try expect(!decoded.canClose && decoded.gui_lifecycle == nil, "Legacy launches must decode without offering unsafe Close actions")
+        withExtendedLifetime(window) {}
     }
 
     @MainActor static func workspaceControls(model: AppModel, defaults: UserDefaults) async throws {

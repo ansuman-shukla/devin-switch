@@ -107,6 +107,11 @@ func callBridge(_ payload: [String: String]) throws -> Reply {
         perform(["action": "select", "account": account.name])
     }
 
+    func closeSession(_ run: SessionRun) {
+        guard run.canClose, !blocked else { return }
+        perform(["action": "close_session", "run": run.id])
+    }
+
     func chooseChat(_ account: Account) {
         failed = false
         resuming = account
@@ -201,7 +206,7 @@ func callBridge(_ payload: [String: String]) throws -> Reply {
             }
             working = false
             refresh()
-            if operation != "rename_display" { refreshUsage() }
+            if operation != "rename_display" && operation != "close_session" { refreshUsage() }
         }
     }
 

@@ -8,10 +8,10 @@ from pathlib import Path
 
 import pytest
 
-from devin_switch import sessions
+from devin_switch import acp, acp_state, sessions
 from devin_switch.acp import Bridge
 from devin_switch.native import Native
-from devin_switch.store import Store
+from devin_switch.store import Store, SwitchError
 
 pytestmark = pytest.mark.skipif(
     not os.environ.get("DS_TEST_NATIVE"), reason="Set DS_TEST_NATIVE for installed CLI"
@@ -170,7 +170,13 @@ def test_installed_bridge_keeps_unsaved_chat_open_on_switch(store, tmp_path, mon
             )
             created = await bridge.dispatch("session/new", {"cwd": str(tmp_path), "mcpServers": []})
             session_id = created["sessionId"]
-            original = bridge.chats[session_id].backend
+            chat = bridge.chats[session_id]
+            original = chat.backend
+            original.last_activity -= acp.IDLE_TIMEOUT + 1
+            assert not await bridge.release_idle(chat)
+            assert not chat.suspended and original.process.poll() is None
+            with pytest.raises(SwitchError, match="not available in shared history"):
+                acp_state.queue_close(store, original.lease.run.id)
             await bridge.dispatch(
                 "session/prompt",
                 {

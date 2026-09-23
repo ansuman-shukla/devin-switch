@@ -90,6 +90,8 @@ struct SessionRun: Decodable, Equatable, Identifiable {
     let started_at: Double
     let session_id: String?
     let active: Bool
+    var gui_lifecycle: String? = nil
+    var canClose: Bool { active && kind == "chat" && session_id != nil && gui_lifecycle == "open" }
 }
 
 struct SavedSession: Decodable, Equatable, Identifiable {
@@ -383,7 +385,7 @@ struct OpenSessionsPanel: View {
                     }
                 }.padding(14).background(Palette.background, in: RoundedRectangle(cornerRadius: 7))
             }
-            Text("Open means the CLI process is alive, not necessarily that the agent is working. Accounts stay fixed per launch; in-terminal chat changes are not tracked.")
+            Text("Open means a process is alive, not necessarily working. Saved GUI chats release their process after 15 idle minutes and reconnect on the next message. Close waits for the current turn and pending decisions; history is kept. Terminal launches must be closed in Terminal; in-terminal chat changes are not tracked.")
                 .font(.system(size: 10)).foregroundStyle(Palette.secondary).fixedSize(horizontal: false, vertical: true)
         }.padding(18).frame(maxWidth: .infinity, alignment: .leading)
             .background(Palette.panel, in: RoundedRectangle(cornerRadius: 10))
@@ -410,6 +412,13 @@ struct OpenSessionsPanel: View {
             StatusPill(label: model.displayName(for: run.account), active: true)
             Text("Opened \(Date(timeIntervalSince1970: run.started_at).formatted(date: .omitted, time: .shortened))")
                 .font(.system(size: 10)).foregroundStyle(Palette.secondary)
+            if let lifecycle = run.gui_lifecycle {
+                Button { model.closeSession(run) } label: {
+                    Label(lifecycle == "open" ? "Close" : "Closing…", systemImage: "pause.circle")
+                }.buttonStyle(MonoButton()).disabled(model.blocked || !run.canClose)
+                    .help("Release this saved GUI connection when idle. The next message reconnects on the same account; history is kept.")
+                    .accessibilityLabel("Close GUI connection \(run.session_id ?? run.id)")
+            }
         }
     }
 }

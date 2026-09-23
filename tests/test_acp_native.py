@@ -144,7 +144,9 @@ def test_installed_acp_new_chat_is_not_saved_before_a_prompt(store, tmp_path, mo
     asyncio.run(scenario())
 
 
-def test_installed_bridge_keeps_unsaved_chat_open_on_switch(store, tmp_path, monkeypatch):
+def test_installed_bridge_keeps_blank_chat_on_switch_and_releases_it_idle(
+    store, tmp_path, monkeypatch
+):
     monkeypatch.chdir(tmp_path)
     monkeypatch.setenv("HOME", str(tmp_path))
     monkeypatch.setattr(Native, "require_login", lambda self, account: None)
@@ -172,9 +174,6 @@ def test_installed_bridge_keeps_unsaved_chat_open_on_switch(store, tmp_path, mon
             session_id = created["sessionId"]
             chat = bridge.chats[session_id]
             original = chat.backend
-            original.last_activity -= acp.IDLE_TIMEOUT + 1
-            assert not await bridge.release_idle(chat)
-            assert not chat.suspended and original.process.poll() is None
             with pytest.raises(SwitchError, match="not available in shared history"):
                 acp_state.queue_close(store, original.lease.run.id)
             await bridge.dispatch(
@@ -188,6 +187,16 @@ def test_installed_bridge_keeps_unsaved_chat_open_on_switch(store, tmp_path, mon
             assert bridge.chats[session_id].backend is original
             assert store.selected() == first
             assert "not saved" in json.dumps(messages)
+            original.last_activity -= acp.IDLE_TIMEOUT + 1
+            assert await bridge.release_idle(chat)
+            assert chat.suspended and original.process.poll() == 0
+            with pytest.raises(SwitchError, match="start a new chat"):
+                await bridge.dispatch(
+                    "session/prompt",
+                    {"sessionId": session_id, "prompt": [{"type": "text", "text": "hello"}]},
+                )
+            assert bridge.chats[session_id].backend is original
+            assert session_id not in {item["id"] for item in sessions.history(store)}
         finally:
             await bridge.close()
         assert not any(store.credentials(account).exists() for account in store.accounts())

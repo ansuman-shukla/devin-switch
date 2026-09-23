@@ -998,7 +998,12 @@ def test_gui_idle_release_leaves_unsafe_chats_open(acp_native, tmp_path, monkeyp
             result = await bridge.dispatch("session/new", {"cwd": str(tmp_path), "mcpServers": []})
             chat = bridge.chats[result["sessionId"]]
             backend = chat.backend
-            backend.last_activity -= acp.IDLE_TIMEOUT + 1
+            if reason == "unsaved":
+                await bridge.dispatch(
+                    "session/prompt",
+                    {"sessionId": chat.session_id, "prompt": [{"type": "text", "text": "hi"}]},
+                )
+                monkeypatch.setattr(sessions, "history", lambda store: [])
             if reason == "history_error":
 
                 def unavailable(store):
@@ -1011,6 +1016,7 @@ def test_gui_idle_release_leaves_unsafe_chats_open(acp_native, tmp_path, monkeyp
                 chat.controls = set()
             if reason == "switch":
                 acp_state.queue(acp_native, chat.session_id, "ansuman-2")
+            backend.last_activity -= acp.IDLE_TIMEOUT + 1
             assert not await bridge.release_idle(chat)
             assert not chat.suspended and backend.process.poll() is None
             assert chat.backend is backend
@@ -1198,6 +1204,42 @@ def test_gui_idle_poll_ignores_native_telemetry_but_not_chat_output(
             else:
                 await asyncio.sleep(1.5)
                 assert not chat.suspended and backend.process.poll() is None
+
+    asyncio.run(scenario())
+
+
+def test_gui_idle_releases_blank_chat_without_restarting_it(acp_native, tmp_path, monkeypatch):
+    monkeypatch.setenv("FAKE_SAVE_ON_PROMPT", "1")
+
+    async def scenario():
+        async with in_process(acp_native) as (bridge, messages):
+            result = await bridge.dispatch("session/new", {"cwd": str(tmp_path), "mcpServers": []})
+            chat = bridge.chats[result["sessionId"]]
+            backend = chat.backend
+            status = {
+                "sessionId": chat.session_id,
+                "prompt": [{"type": "text", "text": "/switch-status"}],
+            }
+            await bridge.dispatch("session/prompt", status)
+            backend.last_activity -= acp.IDLE_TIMEOUT + 1
+            assert await bridge.release_idle(chat)
+            assert chat.suspended and backend.process.poll() == 0
+            assert not acp_state.live(acp_native.store)
+            for method, params in (
+                ("session/prompt", {"prompt": [{"type": "text", "text": "hello"}]}),
+                ("session/set_mode", {"modeId": "plan"}),
+                ("session/load", chat.setup),
+            ):
+                with pytest.raises(SwitchError, match="start a new chat"):
+                    await bridge.dispatch(method, {"sessionId": chat.session_id, **params})
+            await bridge.dispatch("session/prompt", status)
+            assert "start a new chat" in messages[-1]["params"]["update"]["content"]["text"]
+            assert chat.backend is backend
+            await bridge.dispatch("session/close", {"sessionId": chat.session_id})
+            assert chat.session_id not in bridge.chats
+            calls = logged(acp_native)
+            assert not any(call["method"] in {"session/prompt", "session/load"} for call in calls)
+            assert len({call["pid"] for call in calls}) == 2
 
     asyncio.run(scenario())
 

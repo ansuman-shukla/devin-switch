@@ -301,9 +301,13 @@ The next message reconnects to the exact chat on the same account, restoring rep
 settings without replaying prompts or the transcript. The shared default does not change.
 Running turns, pending user decisions, in-flight controls, and queued switches prevent
 idle release. Background telemetry and settings/command-list updates from the native CLI
-do not count as activity. Unsaved chats or unavailable shared history stay open; close
-their Desktop tab explicitly when you no longer need them. Background servers are not
-force-killed.
+do not count as activity. Background servers are not force-killed.
+
+An **empty** GUI chat (opened but never sent a message) is also released after 15 idle
+minutes. The native CLI cannot reopen a conversation that was never saved, so a later
+message in that old tab returns "start a new chat" without contacting the model.
+Chats that received a message but are missing from shared history, or whose history
+cannot be read, stay open; close their Desktop tab explicitly when you no longer need them.
 
 To release a saved connection sooner, click **Close** on its row in Devin Switch, or run
 `ds close --run RUN_ID` using the launch `id` from `ds sessions --gui`. This waits for idle

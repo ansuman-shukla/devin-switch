@@ -41,6 +41,10 @@ BACKGROUND_UPDATES = {
     "session_info_update",
     "usage_update",
 }
+BLANK_RELEASED = (
+    "This empty chat was closed after 15 idle minutes to free its agent. Nothing was sent "
+    "to the model; start a new chat."
+)
 
 
 class RpcError(SwitchError):
@@ -321,6 +325,7 @@ class Chat:
     gate: asyncio.Lock = field(default_factory=asyncio.Lock)
     controls: set[asyncio.Task] | None = None
     suspended: bool = False
+    blank: bool = False
     next_idle_check: float = 0
 
     @asynccontextmanager
@@ -533,6 +538,7 @@ class Bridge:
                 if await self.local_prompt(chat, params):
                     return {"stopReason": "end_turn"}
                 await self.reconnect(chat)
+                chat.blank = False
                 controls = chat.controls = set()
                 try:
                     return await self.forward_request(chat.backend, method, params)
@@ -632,7 +638,7 @@ class Bridge:
                 acp_state.bind(self.native.store, session_id, account)
                 acp_state.set_lifecycle(self.native.store, backend.lease.run.id, "open")
             backend.suppress_replay = False
-            self.chats[session_id] = Chat(session_id, setup, backend)
+            self.chats[session_id] = Chat(session_id, setup, backend, blank=method == "session/new")
             return result
         except BaseException:
             await backend.close()
@@ -673,7 +679,9 @@ class Bridge:
             except (SwitchError, OSError):
                 history = "unavailable"
             connection = (
-                "suspended (reconnects on the next message)"
+                "closed while empty (start a new chat)"
+                if chat.suspended and chat.blank
+                else "suspended (reconnects on the next message)"
                 if chat.suspended
                 else ("open" if connected else "closed")
             )
@@ -721,6 +729,8 @@ class Bridge:
     async def reconnect(self, chat, *, setup=None, replay=False):
         if not chat.suspended:
             return None
+        if chat.blank:
+            raise SwitchError(BLANK_RELEASED)
         old = chat.backend
         if old.process.poll() is None:
             raise SwitchError("The previous agent is still shutting down. Retry after it exits.")
@@ -948,10 +958,13 @@ class Bridge:
                         return False
                     if acp_state.request_path(store, run_id).exists():
                         return False
-                    saved = acp_state.check_saved(store, chat.session_id, chat.setup["cwd"])
-                    others = [run for run in sessions.runs(store) if run["id"] != run_id]
-                    if blocker := sessions.resume_blocker(saved, others):
-                        raise SwitchError(blocker)
+                    if chat.blank and (manual or acp_state.saved_chat(store, chat.session_id)):
+                        chat.blank = False
+                    if not chat.blank:
+                        saved = acp_state.check_saved(store, chat.session_id, chat.setup["cwd"])
+                        others = [run for run in sessions.runs(store) if run["id"] != run_id]
+                        if blocker := sessions.resume_blocker(saved, others):
+                            raise SwitchError(blocker)
                     acp_state.set_lifecycle(store, run_id, "closing")
                     chat.suspended = True
                 return await backend.close()

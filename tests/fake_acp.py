@@ -63,6 +63,7 @@ async def handle(message):
                         "pid": os.getpid(),
                         "sessionId": params.get("sessionId"),
                         "args": sys.argv[1:],
+                        "gh_config_dir": os.environ.get("GH_CONFIG_DIR"),
                     }
                 )
                 + "\n"

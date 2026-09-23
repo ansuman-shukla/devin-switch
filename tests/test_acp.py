@@ -191,6 +191,29 @@ def test_gui_switch_a_b_a_keeps_exact_chat_settings_and_other_chat(acp_native, t
     asyncio.run(scenario())
 
 
+def test_gui_chats_and_handoffs_share_user_github_config(acp_native, tmp_path, monkeypatch):
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    monkeypatch.delenv("GH_CONFIG_DIR", raising=False)
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(acp_native.store.directory("ansuman-1") / "config"))
+
+    async def scenario():
+        async with connect(acp_native) as client:
+            first = await client.new(tmp_path)
+            await client.new(tmp_path)
+            await client.prompt(first, "/switch ansuman-2")
+            assert acp_native.store.selected().name == "ansuman-2"
+        async with connect(acp_native) as client:
+            await client.new(tmp_path)
+        calls = [
+            call for call in logged(acp_native) if call["method"] in {"session/new", "session/load"}
+        ]
+        assert len(calls) == 4
+        assert {call["account"] for call in calls} == {"ansuman-1", "ansuman-2"}
+        assert {call["gh_config_dir"] for call in calls} == {str(tmp_path / "home/.config/gh")}
+
+    asyncio.run(scenario())
+
+
 def test_gui_reopen_restores_account_and_replays_only_on_explicit_load(acp_native, tmp_path):
     async def scenario():
         async with connect(acp_native) as client:

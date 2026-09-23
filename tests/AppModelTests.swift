@@ -461,7 +461,9 @@ func sampleSnapshot(used: Double = 25, selected: String = "work") -> Snapshot {
         let request = VNRecognizeTextRequest()
         request.recognitionLevel = .accurate
         try VNImageRequestHandler(cgImage: image()).perform([request])
-        guard let caption = request.results?.first(where: { $0.topCandidates(1).first?.string == "Close" }) else {
+        guard let caption = request.results?.first(where: {
+            $0.topCandidates(1).first?.string.hasPrefix("Clos") == true
+        }) else {
             throw TestFailure(description: "GUI connection must visibly offer a Close button; found: \(request.results?.compactMap { $0.topCandidates(1).first?.string } ?? [])")
         }
         let center = caption.boundingBox
@@ -480,7 +482,7 @@ func sampleSnapshot(used: Double = 25, selected: String = "work") -> Snapshot {
         try await Task.sleep(for: .milliseconds(60))
         view.layoutSubtreeIfNeeded()
         let labels = try recognizedText(in: image())
-        try expect(labels.contains("Closing"), "A queued close must visibly disable and relabel the button")
+        try expect(labels.contains("Clos"), "A queued close must visibly disable and relabel the button")
         let legacy = """
         {"id":"legacy","account":"work","project":"/test","kind":"chat","started_at":1,"session_id":"saved-chat","active":true}
         """

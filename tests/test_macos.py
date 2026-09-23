@@ -1,3 +1,4 @@
+import os
 import platform
 import shutil
 import subprocess
@@ -10,6 +11,12 @@ pytestmark = pytest.mark.skipif(
     sys.platform != "darwin" or shutil.which("swiftc") is None,
     reason="Native model tests require macOS and Swift",
 )
+INTEL_CI_RENDER_SCENARIOS = {
+    "row-labels",
+    "combined-quota-render",
+    "adaptive-layout",
+    "session-close-control",
+}
 
 
 @pytest.fixture(scope="module")
@@ -72,7 +79,13 @@ def model_tests(tmp_path_factory: pytest.TempPathFactory) -> Path:
     ],
 )
 def test_app_model(model_tests: Path, scenario: str, tmp_path: Path) -> None:
+    if (
+        os.environ.get("GITHUB_ACTIONS") == "true"
+        and platform.machine() == "x86_64"
+        and scenario in INTEL_CI_RENDER_SCENARIOS
+    ):
+        pytest.skip("GitHub's Intel macOS runner cannot initialize Metal for native rendering")
     result = subprocess.run(
-        (str(model_tests), scenario, str(tmp_path)), capture_output=True, text=True, timeout=30
+        (str(model_tests), scenario, str(tmp_path)), capture_output=True, text=True, timeout=60
     )
     assert result.returncode == 0, result.stdout + result.stderr

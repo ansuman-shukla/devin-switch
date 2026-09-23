@@ -50,6 +50,22 @@ def find_binary() -> Path:
     raise SwitchError("Devin CLI was not found. Install it or set DS_BINARY to its executable.")
 
 
+def github_config_directory(store: Store) -> str:
+    if configured := os.environ.get("GH_CONFIG_DIR"):
+        return configured
+    if configured := os.environ.get("XDG_CONFIG_HOME"):
+        config = Path(configured).resolve()
+        roots = {store.root.resolve()}
+        if inherited := os.environ.get("DS_HOME"):
+            roots.add(Path(inherited).expanduser().resolve())
+        isolated = config.name == "config" and any(
+            config.parent.parent == root / "accounts" for root in roots
+        )
+        if not isolated:
+            return str(config / "gh")
+    return str(Path.home() / ".config/gh")
+
+
 @dataclass(frozen=True)
 class Native:
     store: Store
@@ -82,6 +98,7 @@ class Native:
             "XDG_CONFIG_HOME": str(base / "config"),
             "XDG_CACHE_HOME": str(base / "cache"),
             "XDG_STATE_HOME": str(base / "state"),
+            "GH_CONFIG_DIR": github_config_directory(self.store),
             "CHISEL_SESSION_DB": str(self.store.root / "shared/cli/sessions.db"),
             "DS_HOME": str(self.store.root),
             "DS_BINARY": str(self.binary),

@@ -154,6 +154,12 @@ preserving existing settings, hooks, and JSON comments. It does not create or mo
 configuration. Native CLI **3000.5.20 or newer** is needed for exit hooks. An already-open older
 wrapper needs one normal restart after updating the installed `ds` command.
 
+Each account reads its own private CLI configuration, not `~/.config/devin/config.json`. New
+accounts created by `ds add`, profile enrollment, or the Mac app start with `"attribution": false`,
+so Devin does not add a `Generated with Devin` line or `Co-Authored-By` trailer to commits and pull
+requests. Existing accounts are left unchanged; set the option in
+`$DS_HOME/accounts/ALIAS/config/devin/config.json` and restart open chats.
+
 The exit hook provides the final conversation ID, including after in-chat `/new` or `/resume`.
 Missing exit receipts, failed exits, or a duplicate known launch of the destination conversation
 stop the handoff rather than guessing “latest.” Other chats in the same repo can keep running.
@@ -383,6 +389,12 @@ selected
   Protect this directory and its backups as sensitive data.
 - Each account receives isolated XDG directories. `CHISEL_SESSION_DB` is explicitly pinned
   to shared history, and known authentication environment overrides are removed.
+- GitHub CLI login is shared across terminal and ACP chats, including account handoffs.
+  Switch pins `GH_CONFIG_DIR` before isolating Devin's XDG directories: an explicit
+  `GH_CONFIG_DIR` wins, otherwise it uses the incoming user-level `XDG_CONFIG_HOME/gh`
+  or `~/.config/gh`. An inherited Switch account's isolated config directory is ignored.
+  GitHub credentials are never copied into profiles; `gh auth logout` affects every chat
+  using that shared login. Other external tools' configuration is unchanged.
 - Usage refresh sends the saved credential to the service's status endpoint over HTTPS.
   Custom API servers are not supported for usage reporting; credential-bearing redirects
   are rejected. The usage cache can contain account email and plan information.
@@ -410,6 +422,13 @@ Ignore rules and secret scans provide safeguards, not a guarantee against every 
 `~/.local/bin`, and standard Homebrew locations. For a custom location, set `DS_BINARY` to
 its executable path. Finder-launched apps do not inherit your terminal's shell configuration;
 use a standard installation location for the app.
+
+**GitHub CLI asks for login in each chat:** update Switch and restart the ACP connection
+(or restart Desktop) so new native children receive the shared `GH_CONFIG_DIR`. Existing
+process environments do not update in place. If you have no user-level GitHub login yet,
+run `gh auth login` once in a normal terminal outside Switch. Logins previously saved only
+inside a Switch profile are not migrated. In an older open chat, you can use
+`GH_CONFIG_DIR="$HOME/.config/gh" gh ...` (substitute your custom config path if needed).
 
 **No sessions to continue:** start a conversation using `ds run`, send a message, exit,
 and resume from the same project directory. Ordinary CLI/Desktop history is not imported.

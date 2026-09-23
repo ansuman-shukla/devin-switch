@@ -1,11 +1,13 @@
 import json
 import os
+import shutil
 import stat
+import subprocess
 from pathlib import Path
 
 import pytest
 
-from devin_switch import cli
+from devin_switch import cli, handoff
 from devin_switch.native import AUTH_ENVIRONMENT, Native
 from devin_switch.store import Store, SwitchError, validate_name
 
@@ -38,6 +40,21 @@ def test_accounts_and_selection_are_private_and_duplicate_add_preserves_login(st
     assert stat.S_IMODE(store.root.stat().st_mode) == 0o700
     assert stat.S_IMODE(store.directory(first.name).stat().st_mode) == 0o700
     assert stat.S_IMODE((store.root / "selected").stat().st_mode) == 0o600
+
+
+def test_new_accounts_disable_commit_attribution_privately(store: Store, native: Native) -> None:
+    account = store.add("fresh", None)
+    config = store.directory(account.name) / "config/devin/config.json"
+    assert json.loads(config.read_text()) == {"attribution": False}
+    assert stat.S_IMODE(config.stat().st_mode) == 0o600
+    assert stat.S_IMODE(config.parent.stat().st_mode) == 0o700
+    assert native.environment(account)["XDG_CONFIG_HOME"] == str(config.parent.parent)
+    with store.lock():
+        handoff.enable(store, account)
+    assert json.loads(handoff.json_source(config.read_text()))["attribution"] is False
+    config.write_text('{"attribution": true}')
+    store.prepare(account)
+    assert json.loads(config.read_text()) == {"attribution": True}
 
 
 def test_display_name_preserves_account_identity_and_active_sessions(store: Store) -> None:
@@ -118,6 +135,70 @@ def test_environment_cannot_select_another_accounts_credentials(
     assert first_env["XDG_CONFIG_HOME"] != second_env["XDG_CONFIG_HOME"]
     assert first_env["HOME"] == second_env["HOME"] == before_home
     assert first_env["DEVIN_MODEL"] == "test-model"
+
+
+@pytest.mark.parametrize(
+    ("gh_config", "xdg_config", "expected"),
+    [
+        (None, None, "home/.config/gh"),
+        ("", "", "home/.config/gh"),
+        (None, "custom-config", "custom-config/gh"),
+        ("custom-gh", "custom-config", "custom-gh"),
+        (None, "state/accounts/ansuman-1/config", "home/.config/gh"),
+        (None, "old-state/accounts/ansuman-1/config", "home/.config/gh"),
+        ("custom-gh", "state/accounts/ansuman-1/config", "custom-gh"),
+    ],
+)
+def test_github_config_is_user_level_before_account_isolation(
+    native: Native, tmp_path: Path, monkeypatch, gh_config, xdg_config, expected
+) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    monkeypatch.setenv("DS_HOME", str(tmp_path / "old-state"))
+    for key, value in (("GH_CONFIG_DIR", gh_config), ("XDG_CONFIG_HOME", xdg_config)):
+        if value is None:
+            monkeypatch.delenv(key, raising=False)
+        else:
+            monkeypatch.setenv(key, str(tmp_path / value) if value else "")
+    before = dict(os.environ)
+    first, second = native.store.accounts()
+    first_env, second_env = native.environment(first), native.environment(second)
+    assert first_env["GH_CONFIG_DIR"] == second_env["GH_CONFIG_DIR"] == str(tmp_path / expected)
+    assert first_env["XDG_CONFIG_HOME"] != second_env["XDG_CONFIG_HOME"]
+    assert dict(os.environ) == before
+    assert not (tmp_path / expected).exists()
+    assert not (native.store.directory(first.name) / "config/gh").exists()
+    assert not (native.store.directory(second.name) / "config/gh").exists()
+
+
+def test_nested_launch_keeps_original_github_config(native: Native, tmp_path: Path, monkeypatch):
+    monkeypatch.delenv("GH_CONFIG_DIR", raising=False)
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "user-config"))
+    first, second = native.store.accounts()
+    environment = native.environment(first)
+    for key, value in environment.items():
+        monkeypatch.setenv(key, value)
+    assert native.environment(second)["GH_CONFIG_DIR"] == str(tmp_path / "user-config/gh")
+
+
+@pytest.mark.skipif(not shutil.which("gh"), reason="GitHub CLI is not installed")
+def test_real_github_cli_reuses_config_across_accounts(native: Native, tmp_path: Path, monkeypatch):
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.delenv("GH_CONFIG_DIR", raising=False)
+    monkeypatch.delenv("XDG_CONFIG_HOME", raising=False)
+    subprocess.run(("gh", "config", "set", "editor", "switch-test-editor"), check=True)
+    first, second = native.store.accounts()
+    for account in (first, second, first):
+        result = subprocess.run(
+            ("gh", "config", "get", "editor"),
+            env=native.environment(account),
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        assert result.stdout.strip() == "switch-test-editor"
+        assert not (native.store.directory(account.name) / "config/gh").exists()
 
 
 def test_zero_exit_status_is_not_proof_of_authentication(native: Native) -> None:

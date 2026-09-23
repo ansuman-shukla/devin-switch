@@ -72,7 +72,6 @@ def record_exit(store: Store, session_id="exact-chat", reason="prompt_input_exit
 def test_automatic_hook_preserves_profile_configuration(store, tmp_path, content):
     account = store.accounts()[0]
     path = store.directory(account.name) / "config/devin/config.json"
-    path.parent.mkdir()
     path.write_text(content)
     handoff.enable(store, account)
     first = path.read_text()
@@ -100,7 +99,6 @@ def test_automatic_hook_preserves_profile_configuration(store, tmp_path, content
 def test_automatic_hook_preserves_invalid_configuration(store, content):
     account = store.accounts()[0]
     path = store.directory(account.name) / "config/devin/config.json"
-    path.parent.mkdir()
     path.write_text(content)
     with pytest.raises(SwitchError, match="config"):
         handoff.enable(store, account)
@@ -115,10 +113,11 @@ def test_automatic_hook_refuses_symlinks(store, tmp_path, linked_directory):
     target = external / "config.json"
     target.write_text("{}")
     directory = store.directory(account.name) / "config/devin"
+    (directory / "config.json").unlink()
     if linked_directory:
+        directory.rmdir()
         directory.symlink_to(external, target_is_directory=True)
     else:
-        directory.mkdir()
         (directory / "config.json").symlink_to(target)
     with pytest.raises(SwitchError, match="linked"):
         handoff.enable(store, account)

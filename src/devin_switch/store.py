@@ -12,6 +12,8 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 
+NEW_ACCOUNT_CONFIG = {"attribution": False}
+
 
 class SwitchError(Exception):
     """An actionable failure that can be displayed without a traceback."""
@@ -150,6 +152,8 @@ class Store:
         write_json(folder / "account.json", {"chrome_profile": chrome_profile})
         account = self.account(name)
         self.prepare(account)
+        private_directory(folder / "config/devin")
+        write_json(folder / "config/devin/config.json", NEW_ACCOUNT_CONFIG)
         return account
 
     def rename(self, account: Account, name: str) -> Account:

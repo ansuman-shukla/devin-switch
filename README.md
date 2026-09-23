@@ -154,6 +154,12 @@ preserving existing settings, hooks, and JSON comments. It does not create or mo
 configuration. Native CLI **3000.5.20 or newer** is needed for exit hooks. An already-open older
 wrapper needs one normal restart after updating the installed `ds` command.
 
+Each account reads its own private CLI configuration, not `~/.config/devin/config.json`. New
+accounts created by `ds add`, profile enrollment, or the Mac app start with `"attribution": false`,
+so Devin does not add a `Generated with Devin` line or `Co-Authored-By` trailer to commits and pull
+requests. Existing accounts are left unchanged; set the option in
+`$DS_HOME/accounts/ALIAS/config/devin/config.json` and restart open chats.
+
 The exit hook provides the final conversation ID, including after in-chat `/new` or `/resume`.
 Missing exit receipts, failed exits, or a duplicate known launch of the destination conversation
 stop the handoff rather than guessing “latest.” Other chats in the same repo can keep running.

@@ -7,7 +7,7 @@ from pathlib import Path
 
 import pytest
 
-from devin_switch import cli
+from devin_switch import cli, handoff
 from devin_switch.native import AUTH_ENVIRONMENT, Native
 from devin_switch.store import Store, SwitchError, validate_name
 
@@ -40,6 +40,21 @@ def test_accounts_and_selection_are_private_and_duplicate_add_preserves_login(st
     assert stat.S_IMODE(store.root.stat().st_mode) == 0o700
     assert stat.S_IMODE(store.directory(first.name).stat().st_mode) == 0o700
     assert stat.S_IMODE((store.root / "selected").stat().st_mode) == 0o600
+
+
+def test_new_accounts_disable_commit_attribution_privately(store: Store, native: Native) -> None:
+    account = store.add("fresh", None)
+    config = store.directory(account.name) / "config/devin/config.json"
+    assert json.loads(config.read_text()) == {"attribution": False}
+    assert stat.S_IMODE(config.stat().st_mode) == 0o600
+    assert stat.S_IMODE(config.parent.stat().st_mode) == 0o700
+    assert native.environment(account)["XDG_CONFIG_HOME"] == str(config.parent.parent)
+    with store.lock():
+        handoff.enable(store, account)
+    assert json.loads(handoff.json_source(config.read_text()))["attribution"] is False
+    config.write_text('{"attribution": true}')
+    store.prepare(account)
+    assert json.loads(config.read_text()) == {"attribution": True}
 
 
 def test_display_name_preserves_account_identity_and_active_sessions(store: Store) -> None:

@@ -214,12 +214,34 @@ async def handle(message):
         emit({"id": message["id"], "result": result})
 
 
+async def periodic(kind):
+    while True:
+        await asyncio.sleep(0.05)
+        if loaded is None:
+            continue
+        if kind == "work":
+            update(
+                loaded,
+                {"sessionUpdate": "agent_message_chunk", "content": {"type": "text", "text": "."}},
+            )
+            continue
+        emit(
+            {
+                "method": "_cognition.ai/processMemory",
+                "params": {"phase": "periodic", "rssBytes": 1, "loadedSessionCount": 1},
+            }
+        )
+        update(loaded, {"sessionUpdate": "available_commands_update", "availableCommands": []})
+
+
 async def main():
     reader = asyncio.StreamReader()
     await asyncio.get_running_loop().connect_read_pipe(
         lambda: asyncio.StreamReaderProtocol(reader), sys.stdin
     )
     tasks = set()
+    kind = os.environ.get("FAKE_PERIODIC")
+    emitter = asyncio.create_task(periodic(kind)) if kind else None
     while line := await reader.readline():
         message = json.loads(line)
         if "method" not in message:
@@ -228,6 +250,8 @@ async def main():
         task = asyncio.create_task(handle(message))
         tasks.add(task)
         task.add_done_callback(tasks.discard)
+    if emitter:
+        emitter.cancel()
     if tasks:
         await asyncio.gather(*tasks)
     await asyncio.sleep(float(os.environ.get("FAKE_SHUTDOWN_DELAY", "0")))

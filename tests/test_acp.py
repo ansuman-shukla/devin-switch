@@ -1176,6 +1176,32 @@ def test_gui_idle_poll_releases_only_old_idle_connections(acp_native, tmp_path):
     asyncio.run(scenario())
 
 
+@pytest.mark.parametrize(("periodic", "released"), [("telemetry", True), ("work", False)])
+def test_gui_idle_poll_ignores_native_telemetry_but_not_chat_output(
+    acp_native, tmp_path, monkeypatch, periodic, released
+):
+    monkeypatch.setenv("FAKE_PERIODIC", periodic)
+    monkeypatch.setattr(acp, "IDLE_TIMEOUT", 0.5)
+    monkeypatch.setattr(acp, "IDLE_RECHECK", 0.05)
+
+    async def scenario():
+        async with in_process(acp_native) as (bridge, messages):
+            result = await bridge.dispatch("session/new", {"cwd": str(tmp_path), "mcpServers": []})
+            chat = bridge.chats[result["sessionId"]]
+            backend = chat.backend
+            bridge.spawn(bridge.poll())
+            if released:
+                async with asyncio.timeout(5):
+                    while not chat.suspended or backend.process.poll() is None:
+                        await asyncio.sleep(0.05)
+                assert any(m.get("method") == "_cognition.ai/processMemory" for m in messages)
+            else:
+                await asyncio.sleep(1.5)
+                assert not chat.suspended and backend.process.poll() is None
+
+    asyncio.run(scenario())
+
+
 @pytest.mark.parametrize("method", ["session/load", "session/resume"])
 def test_gui_idle_explicit_reopen_restores_settings_and_replay_policy(acp_native, tmp_path, method):
     async def scenario():

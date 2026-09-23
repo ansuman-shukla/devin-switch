@@ -34,6 +34,13 @@ LIVE_CONTROLS = {
     "session/set_model",
     "_cognition.ai/command/revise",
 }
+BACKGROUND_UPDATES = {
+    "available_commands_update",
+    "config_option_update",
+    "current_mode_update",
+    "session_info_update",
+    "usage_update",
+}
 
 
 class RpcError(SwitchError):
@@ -47,6 +54,16 @@ def failure_detail(error: Exception) -> str:
         str(error)
         if isinstance(error, SwitchError)
         else f"Operation failed ({type(error).__name__})."
+    )
+
+
+def is_activity(message: dict) -> bool:
+    if "method" not in message or "id" in message:
+        return True
+    update = message.get("params", {}).get("update", {})
+    return (
+        message["method"] == "session/update"
+        and update.get("sessionUpdate") not in BACKGROUND_UPDATES
     )
 
 
@@ -235,10 +252,11 @@ class Backend:
     async def read(self):
         try:
             while line := await self.reader.readline():
-                self.last_activity = time.monotonic()
                 message = json.loads(line)
                 if not isinstance(message, dict) or message.get("jsonrpc") != "2.0":
                     raise ValueError
+                if is_activity(message):
+                    self.last_activity = time.monotonic()
                 if "method" in message:
                     await self.bridge.from_backend(self, message)
                 elif future := self.pending.get(message.get("id")):

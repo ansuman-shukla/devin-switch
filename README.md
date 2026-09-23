@@ -290,7 +290,23 @@ Automatic usage selection happens when the queued handoff can run, not while a l
 turn is still using the old account. A queued request can be canceled before the
 handoff begins. Status and failure messages appear in the GUI conversation.
 
-Each loaded GUI conversation owns a separate native process. Handoff closes that
+Saved GUI chats automatically release their native process after **15 minutes idle**.
+The next message reconnects to the exact chat on the same account, restoring reported
+settings without replaying prompts or the transcript. The shared default does not change.
+Running turns, pending user decisions, in-flight controls, and queued switches prevent
+idle release. Unsaved chats or unavailable shared history stay open; close their Desktop
+tab explicitly when you no longer need them. Background servers are not force-killed.
+
+To release a saved connection sooner, click **Close** on its row in Devin Switch, or run
+`ds close --run RUN_ID` using the launch `id` from `ds sessions --gui`. This waits for idle
+rather than cancelling work or approving a decision. It keeps history and reconnects on
+the next message. A slow or abnormal shutdown never starts an overlapping replacement.
+If reconnection fails, no prompt is sent; fix the reported issue and retry. In-memory tool
+shells do not survive release. Older running bridges need a normal Desktop restart after
+updating before idle release and the Close button are available. Terminal launches are
+unchanged and must be closed in Terminal.
+
+Each connected GUI conversation owns a separate native process. Handoff closes that
 process normally, loads the **same saved conversation ID**, and restores its reported
 session configuration before accepting another prompt. The project, supplied MCP
 configuration, additional workspace roots, and `--sandbox` option are retained.
@@ -325,6 +341,7 @@ extension.
 | `ds acp --print-registry` | Print a secret-free Desktop agent configuration without modifying settings |
 | `ds switch [ALIAS] --session ID` | Queue a handoff for one exact live GUI chat |
 | `ds sessions --gui` | List live managed GUI conversations and their bound accounts |
+| `ds close --run RUN_ID` | Release an exact saved GUI connection when idle; reconnect on the next message |
 | `ds add ALIAS` | Register a local profile |
 | `ds profiles` | List available Chrome profile identifiers |
 | `ds login ALIAS` | Enroll or check a saved login |
@@ -357,6 +374,7 @@ runs/
 handoffs/
 acp/sessions/
 acp/requests/
+acp/lifecycle/
 launchers/
 selected
 ```

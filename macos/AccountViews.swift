@@ -43,7 +43,9 @@ struct CombinedQuota: Equatable {
     private(set) var notApplicableCount = 0
     private var remainingSum = 0.0
     var totalCount: Int { includedCount + unavailableCount + notApplicableCount }
-    var remainingPercent: Double? { includedCount == 0 ? nil : remainingSum / Double(includedCount) }
+    var remainingTotal: Double? { includedCount == 0 ? nil : remainingSum }
+    var capacity: Double { Double(includedCount) * 100 }
+    var fillFraction: Double { includedCount == 0 ? 0 : remainingSum / capacity }
 
     init(accounts: [Account], window: KeyPath<AccountUsage, QuotaWindow>, now: Double = Date().timeIntervalSince1970) {
         for account in accounts {
@@ -306,7 +308,7 @@ struct GlobalQuotaPanel: View {
                 CombinedQuotaMeter(title: "Daily left", quota: daily)
                 CombinedQuotaMeter(title: "Weekly left", quota: weekly)
             }
-            Text("All accounts combined · Equal-weight averages, not a shared balance. Accounts at either limit count as 0% in both windows. Plan limits and reset times can differ.")
+            Text("All accounts combined · Each account's remaining percentage is added up; 100% equals one full account. Accounts at either limit count as 0% in both windows. Plan limits and reset times can differ.")
                 .font(.system(size: 10)).foregroundStyle(Palette.secondary).fixedSize(horizontal: false, vertical: true)
         }.padding(18).frame(maxWidth: .infinity, alignment: .leading)
             .background(Palette.panel, in: RoundedRectangle(cornerRadius: 10))
@@ -319,6 +321,8 @@ struct CombinedQuotaMeter: View {
     let quota: CombinedQuota
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
+    static func percent(_ value: Double) -> String { "\(value.formatted(.number.precision(.fractionLength(0...1))))%" }
+
     var coverage: String {
         if quota.totalCount == 0 { return "Add accounts to see quota" }
         if quota.notApplicableCount == quota.totalCount { return "No quota window for these plans" }
@@ -329,18 +333,18 @@ struct CombinedQuotaMeter: View {
         VStack(alignment: .leading, spacing: 10) {
             Text(title).font(.system(size: 11, weight: .medium)).foregroundStyle(Palette.secondary)
             HStack(alignment: .firstTextBaseline, spacing: 6) {
-                Text(quota.remainingPercent.map { "\($0.formatted(.number.precision(.fractionLength(0...1))))%" } ?? "—")
+                Text(quota.remainingTotal.map(Self.percent) ?? "—")
                     .font(.system(size: 28, weight: .medium, design: .rounded)).monospacedDigit()
-                if quota.remainingPercent != nil {
-                    Text("remaining").font(.system(size: 11)).foregroundStyle(Palette.secondary)
+                if quota.remainingTotal != nil {
+                    Text("left of \(Self.percent(quota.capacity))").font(.system(size: 11)).foregroundStyle(Palette.secondary)
                 }
             }
             GeometryReader { geometry in
                 ZStack(alignment: .leading) {
                     Capsule().fill(Color.white.opacity(0.09))
                     Capsule().fill(Palette.green)
-                        .frame(width: geometry.size.width * (quota.remainingPercent ?? 0) / 100)
-                        .animation(reduceMotion ? nil : .easeInOut(duration: 0.25), value: quota.remainingPercent)
+                        .frame(width: geometry.size.width * quota.fillFraction)
+                        .animation(reduceMotion ? nil : .easeInOut(duration: 0.25), value: quota.fillFraction)
                 }
             }.frame(height: 4)
             VStack(alignment: .leading, spacing: 4) {

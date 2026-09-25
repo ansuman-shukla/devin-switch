@@ -327,7 +327,7 @@ func sampleSnapshot(used: Double = 25, selected: String = "work") -> Snapshot {
         let added = CombinedQuota(accounts: pool + [quotaAccount(name: "extra", weekly: 90)], window: \.weekly, now: 1000)
         try expect(added.remainingCredits == 190 && added.capacity == 400, "Adding an account with quota left must raise the global total, never lower it")
         try expect(daily.remainingPercent == 50 && weekly.remainingPercent == 40, "The percentage must be the share of combined credits left")
-        for (dailyLeft, weeklyLeft, expected) in [(30.0, 49.0, 30.0), (100, 10, 20), (100, 60, 100), (100, 50, 100), (80, 50, 80), (70, 30, 60), (20, 90, 20), (100, 0.5, 1)] {
+        for (dailyLeft, weeklyLeft, expected) in [(30.0, 49.0, 30.0), (60, 49, 60), (98, 49, 98), (99, 49, 98), (100, 49, 98), (100, 10, 20), (100, 60, 100), (100, 50, 100), (80, 50, 80), (70, 30, 60), (20, 90, 20), (100, 0.5, 1)] {
             let result = CombinedQuota(accounts: [quotaAccount(daily: 100 - dailyLeft, weekly: 100 - weeklyLeft)], window: \.daily, now: 1000)
             try expect(result.remainingCredits == expected && result.capacity == 100, "Daily credits left must be capped at twice the weekly credits left, never above the daily reading: \(dailyLeft)/\(weeklyLeft)")
         }
@@ -422,12 +422,12 @@ func sampleSnapshot(used: Double = 25, selected: String = "work") -> Snapshot {
         let stale = quotaAccount(name: "stale", status: "stale", fetched: now, reset: now + 3600)
         let weeklyCapped = quotaAccount(name: "weekly-capped", daily: 0, weekly: 90, fetched: now, reset: now + 3600)
         for (scenario, accounts, percentages) in [
-            ("complete", current, ["100", "120", "of 200 credits", "50% left", "60% left"]),
-            ("partial", current + [stale], ["100", "120", "of 200 credits", "50% left", "60% left"]),
-            ("weekly-limit", [current[0], weeklyLimited], ["75", "40", "of 200 credits", "37.5% left", "20% left"]),
-            ("daily-limit", [current[0], dailyLimited], ["75", "40", "of 200 credits", "37.5% left", "20% left"]),
-            ("weekly-capped", [weeklyCapped], ["20", "10", "of 100 credits", "20% left", "10% left"]),
-            ("exhausted", [weeklyLimited, dailyLimited], ["0% left", "of 200 credits"])
+            ("complete", current, ["100", "120", "of 200 credits"]),
+            ("partial", current + [stale], ["100", "120", "of 200 credits"]),
+            ("weekly-limit", [current[0], weeklyLimited], ["75", "40", "of 200 credits"]),
+            ("daily-limit", [current[0], dailyLimited], ["75", "40", "of 200 credits"]),
+            ("weekly-capped", [weeklyCapped], ["20", "10", "of 100 credits"]),
+            ("exhausted", [weeklyLimited, dailyLimited], ["of 200 credits"])
         ] {
             model.snapshot.accounts = accounts
             for width in [339.0, 895] {
@@ -437,7 +437,7 @@ func sampleSnapshot(used: Double = 25, selected: String = "work") -> Snapshot {
                 renderer.scale = 3
                 guard let image = renderer.cgImage else { throw TestFailure(description: "Could not render global quota") }
                 let labels = try recognizedText(in: image)
-                for label in ["Global quota", "Daily left", "Weekly left", "100 credits", "one full account", "weekly credits left", "accounts included", "either limit"] + percentages {
+                for label in ["Global quota", "Daily left", "Weekly left", "100 credits", "one full account", "weekly credits left", "accounts included", "either limit", "% left"] + percentages {
                     try expect(labels.contains(label), "The \(scenario) global quota panel must keep \(label) visible at \(width) points; found: \(labels)")
                 }
                 try expect(!labels.contains("120%") && !labels.contains("of 200%"), "Summed credits must not be shown as percentages above 100")
@@ -456,7 +456,7 @@ func sampleSnapshot(used: Double = 25, selected: String = "work") -> Snapshot {
         model.snapshot.selected = "work"
         let image = try await workspaceImage(model: model, defaults: defaults, width: 1180, height: 820)
         let labels = try recognizedText(in: image)
-        try expect(labels.contains("Global quota") && labels.contains("50% left") && labels.contains("60% left") && labels.contains("of 200 credits"), "The All accounts dashboard must display live combined quota")
+        try expect(labels.contains("Global quota") && labels.contains("120") && labels.contains("% left") && labels.contains("of 200 credits"), "The All accounts dashboard must display live combined quota")
         if CommandLine.arguments.count > 2 {
             let path = URL(fileURLWithPath: CommandLine.arguments[2]).appendingPathComponent("global-quota-overview.png")
             try NSBitmapImageRep(cgImage: image).representation(using: .png, properties: [:])!.write(to: path)

@@ -308,7 +308,7 @@ struct GlobalQuotaPanel: View {
                 CombinedQuotaMeter(title: "Daily left", quota: daily)
                 CombinedQuotaMeter(title: "Weekly left", quota: weekly)
             }
-            Text("All accounts combined · Each account's remaining percentage is added up; 100% equals one full account. Accounts at either limit count as 0% in both windows. Plan limits and reset times can differ.")
+            Text("All accounts combined · Sum of accounts; 100% = one full account. Accounts at either limit count as 0% in both windows. Plan limits and reset times can differ.")
                 .font(.system(size: 10)).foregroundStyle(Palette.secondary).fixedSize(horizontal: false, vertical: true)
         }.padding(18).frame(maxWidth: .infinity, alignment: .leading)
             .background(Palette.panel, in: RoundedRectangle(cornerRadius: 10))

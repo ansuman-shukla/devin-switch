@@ -421,7 +421,7 @@ func sampleSnapshot(used: Double = 25, selected: String = "work") -> Snapshot {
                 renderer.scale = 3
                 guard let image = renderer.cgImage else { throw TestFailure(description: "Could not render global quota") }
                 let labels = try recognizedText(in: image)
-                for label in ["Global quota", "Daily left", "Weekly left", "added up", "one full account", "accounts included", "either limit", "both windows"] + percentages {
+                for label in ["Global quota", "Daily left", "Weekly left", "Sum of accounts", "one full account", "accounts included", "either limit", "both windows"] + percentages {
                     try expect(labels.contains(label), "The \(scenario) global quota panel must keep \(label) visible at \(width) points; found: \(labels)")
                 }
                 if scenario == "partial" {

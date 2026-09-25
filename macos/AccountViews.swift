@@ -38,14 +38,16 @@ struct Account: Decodable, Equatable, Identifiable {
 }
 
 struct CombinedQuota: Equatable {
+    static let dailyCreditsPerWeeklyCredit = 2.0
     private(set) var includedCount = 0
     private(set) var unavailableCount = 0
     private(set) var notApplicableCount = 0
     private var remainingSum = 0.0
     var totalCount: Int { includedCount + unavailableCount + notApplicableCount }
-    var remainingTotal: Double? { includedCount == 0 ? nil : remainingSum }
+    var remainingCredits: Double? { includedCount == 0 ? nil : remainingSum }
     var capacity: Double { Double(includedCount) * 100 }
     var fillFraction: Double { includedCount == 0 ? 0 : remainingSum / capacity }
+    var remainingPercent: Double? { includedCount == 0 ? nil : fillFraction * 100 }
 
     init(accounts: [Account], window: KeyPath<AccountUsage, QuotaWindow>, now: Double = Date().timeIntervalSince1970) {
         for account in accounts {
@@ -70,7 +72,12 @@ struct CombinedQuota: Equatable {
                 continue
             }
             includedCount += 1
-            remainingSum += applicable.contains { $0.used_percent == 100 } ? 0 : 100 - used
+            if applicable.contains(where: { $0.used_percent == 100 }) { continue }
+            var credits = 100 - used
+            if window == \AccountUsage.daily, usage.weekly.state != "not_applicable", let weeklyUsed = usage.weekly.used_percent {
+                credits = min(credits, (100 - weeklyUsed) * Self.dailyCreditsPerWeeklyCredit)
+            }
+            remainingSum += credits
         }
     }
 }
@@ -308,7 +315,7 @@ struct GlobalQuotaPanel: View {
                 CombinedQuotaMeter(title: "Daily left", quota: daily)
                 CombinedQuotaMeter(title: "Weekly left", quota: weekly)
             }
-            Text("All accounts combined · Sum of accounts; 100% = one full account. Accounts at either limit count as 0% in both windows. Plan limits and reset times can differ.")
+            Text("All accounts combined · 100 credits = one full account. Daily is capped at 2× the weekly credits left. Accounts at either limit count as 0. Reset times can differ.")
                 .font(.system(size: 10)).foregroundStyle(Palette.secondary).fixedSize(horizontal: false, vertical: true)
         }.padding(18).frame(maxWidth: .infinity, alignment: .leading)
             .background(Palette.panel, in: RoundedRectangle(cornerRadius: 10))
@@ -321,7 +328,7 @@ struct CombinedQuotaMeter: View {
     let quota: CombinedQuota
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
-    static func percent(_ value: Double) -> String { "\(value.formatted(.number.precision(.fractionLength(0...1))))%" }
+    static func number(_ value: Double) -> String { value.formatted(.number.precision(.fractionLength(0...1))) }
 
     var coverage: String {
         if quota.totalCount == 0 { return "Add accounts to see quota" }
@@ -331,12 +338,18 @@ struct CombinedQuotaMeter: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
-            Text(title).font(.system(size: 11, weight: .medium)).foregroundStyle(Palette.secondary)
+            HStack(alignment: .firstTextBaseline) {
+                Text(title).font(.system(size: 11, weight: .medium)).foregroundStyle(Palette.secondary)
+                Spacer(minLength: 8)
+                if let percent = quota.remainingPercent {
+                    Text("\(Self.number(percent))% left").font(.system(size: 13, weight: .semibold)).monospacedDigit()
+                }
+            }
             HStack(alignment: .firstTextBaseline, spacing: 6) {
-                Text(quota.remainingTotal.map(Self.percent) ?? "—")
+                Text(quota.remainingCredits.map(Self.number) ?? "—")
                     .font(.system(size: 28, weight: .medium, design: .rounded)).monospacedDigit()
-                if quota.remainingTotal != nil {
-                    Text("left of \(Self.percent(quota.capacity))").font(.system(size: 11)).foregroundStyle(Palette.secondary)
+                if quota.remainingCredits != nil {
+                    Text("of \(Self.number(quota.capacity)) credits").font(.system(size: 11)).foregroundStyle(Palette.secondary)
                 }
             }
             GeometryReader { geometry in

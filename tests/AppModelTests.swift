@@ -314,8 +314,8 @@ func sampleSnapshot(used: Double = 25, selected: String = "work") -> Snapshot {
         ]
         let daily = CombinedQuota(accounts: accounts, window: \.daily, now: 1000)
         let weekly = CombinedQuota(accounts: accounts, window: \.weekly, now: 1000)
-        try expect(daily.remainingTotal == 100 && daily.capacity == 200 && daily.fillFraction == 0.5, "Combined daily quota must add account percentages against one 100% per included account")
-        try expect(weekly.remainingTotal == 120 && weekly.capacity == 300, "Daily and weekly quota must retain separate totals, including exhausted accounts as zero")
+        try expect(daily.remainingCredits == 100 && daily.capacity == 200 && daily.fillFraction == 0.5, "Combined daily quota must add account percentages against one 100% per included account")
+        try expect(weekly.remainingCredits == 120 && weekly.capacity == 300, "Daily and weekly quota must retain separate totals, including exhausted accounts as zero")
         try expect(daily.includedCount == 2 && daily.unavailableCount == 1 && daily.notApplicableCount == 1, "Partial coverage must distinguish unavailable and inapplicable quotas")
         try expect(weekly.includedCount == 3 && weekly.notApplicableCount == 0, "Each quota window must have its own capacity")
         let pool = [
@@ -323,9 +323,21 @@ func sampleSnapshot(used: Double = 25, selected: String = "work") -> Snapshot {
         ]
         let before = CombinedQuota(accounts: pool, window: \.weekly, now: 1000)
         let after = CombinedQuota(accounts: Array(pool.dropLast()), window: \.weekly, now: 1000)
-        try expect(before.remainingTotal == 180 && after.remainingTotal == 160, "Removing an account with quota left must lower the global total by exactly its remaining share")
+        try expect(before.remainingCredits == 180 && after.remainingCredits == 160, "Removing an account with quota left must lower the global total by exactly its remaining share")
         let added = CombinedQuota(accounts: pool + [quotaAccount(name: "extra", weekly: 90)], window: \.weekly, now: 1000)
-        try expect(added.remainingTotal == 190 && added.capacity == 400, "Adding an account with quota left must raise the global total, never lower it")
+        try expect(added.remainingCredits == 190 && added.capacity == 400, "Adding an account with quota left must raise the global total, never lower it")
+        try expect(daily.remainingPercent == 50 && weekly.remainingPercent == 40, "The percentage must be the share of combined credits left")
+        for (dailyLeft, weeklyLeft, expected) in [(30.0, 49.0, 30.0), (100, 10, 20), (100, 60, 100), (100, 50, 100), (80, 50, 80), (70, 30, 60), (20, 90, 20), (100, 0.5, 1)] {
+            let result = CombinedQuota(accounts: [quotaAccount(daily: 100 - dailyLeft, weekly: 100 - weeklyLeft)], window: \.daily, now: 1000)
+            try expect(result.remainingCredits == expected && result.capacity == 100, "Daily credits left must be capped at twice the weekly credits left, never above the daily reading: \(dailyLeft)/\(weeklyLeft)")
+        }
+        let weeklyUnaffected = CombinedQuota(accounts: [quotaAccount(daily: 0, weekly: 90)], window: \.weekly, now: 1000)
+        try expect(weeklyUnaffected.remainingCredits == 10, "Weekly credits must keep their raw remaining reading")
+        let noWeekly = Account(name: "daily-only", chrome_profile: nil, saved_login: true, usage: AccountUsage(
+            status: "ok", daily: QuotaWindow(used_percent: 10, resets_at: 2000, state: "available"),
+            weekly: QuotaWindow(used_percent: 95, resets_at: 2000, state: "not_applicable"), email: nil, plan: nil, fetched_at: 1000, message: ""
+        ))
+        try expect(CombinedQuota(accounts: [noWeekly], window: \.daily, now: 1000).remainingCredits == 90, "Plans without a weekly window must not cap daily credits")
         for account in [
             quotaAccount(status: "stale"), quotaAccount(status: "unavailable"), quotaAccount(status: "sign_in"),
             quotaAccount(savedLogin: false), quotaAccount(fetched: nil), quotaAccount(fetched: 879),
@@ -334,17 +346,17 @@ func sampleSnapshot(used: Double = 25, selected: String = "work") -> Snapshot {
             quotaAccount(daily: nil), quotaAccount(daily: -1), quotaAccount(daily: 101), quotaAccount(daily: .nan)
         ] {
             let result = CombinedQuota(accounts: [account], window: \.daily, now: 1000)
-            try expect(result.remainingTotal == nil && result.capacity == 0 && result.unavailableCount == 1, "Unknown, stale, signed-out or invalid readings must not inflate global quota")
+            try expect(result.remainingCredits == nil && result.capacity == 0 && result.unavailableCount == 1, "Unknown, stale, signed-out or invalid readings must not inflate global quota")
         }
         let boundary = CombinedQuota(accounts: [quotaAccount(fetched: 880)], window: \.daily, now: 1000)
-        try expect(boundary.remainingTotal == 75, "The freshness boundary must match the CLI's 120-second cache window")
+        try expect(boundary.remainingCredits == 75, "The freshness boundary must match the CLI's 120-second cache window")
         let exhausted = CombinedQuota(accounts: [quotaAccount(daily: 100)], window: \.daily, now: 1000)
         let full = CombinedQuota(accounts: [quotaAccount(daily: 0)], window: \.daily, now: 1000)
-        try expect(exhausted.remainingTotal == 0 && full.remainingTotal == 100 && full.fillFraction == 1, "Zero and full quota must be real values, not missing readings")
+        try expect(exhausted.remainingCredits == 0 && full.remainingCredits == 100 && full.fillFraction == 1, "Zero and full quota must be real values, not missing readings")
         let empty = CombinedQuota(accounts: [], window: \.daily, now: 1000)
-        try expect(empty.remainingTotal == nil && empty.totalCount == 0 && empty.fillFraction == 0, "An empty account list must not report free quota")
+        try expect(empty.remainingCredits == nil && empty.totalCount == 0 && empty.fillFraction == 0, "An empty account list must not report free quota")
         let inapplicable = CombinedQuota(accounts: [accounts[3]], window: \.daily, now: 1000)
-        try expect(inapplicable.remainingTotal == nil && inapplicable.notApplicableCount == 1 && inapplicable.unavailableCount == 0, "Inapplicable quotas must not be treated as exhausted or in need of refresh")
+        try expect(inapplicable.remainingCredits == nil && inapplicable.notApplicableCount == 1 && inapplicable.unavailableCount == 0, "Inapplicable quotas must not be treated as exhausted or in need of refresh")
     }
 
     static func combinedQuotaExhaustion() throws {
@@ -357,13 +369,13 @@ func sampleSnapshot(used: Double = 25, selected: String = "work") -> Snapshot {
         for (window, expected) in [(\AccountUsage.daily, 80.0), (\AccountUsage.weekly, 60.0)] {
             for account in blocked {
                 let solo = CombinedQuota(accounts: [account], window: window, now: 1000)
-                try expect(solo.remainingTotal == 0 && solo.includedCount == 1, "An account at \(account.name) must contribute zero to both global windows")
+                try expect(solo.remainingCredits == 0 && solo.includedCount == 1, "An account at \(account.name) must contribute zero to both global windows")
                 let mixed = CombinedQuota(accounts: [available, account], window: window, now: 1000)
-                try expect(mixed.remainingTotal == expected && mixed.capacity == 200, "Blocked accounts must contribute zero while keeping their share of capacity")
+                try expect(mixed.remainingCredits == expected && mixed.capacity == 200, "Blocked accounts must contribute zero while keeping their share of capacity")
                 try expect(mixed.includedCount == 2 && mixed.unavailableCount == 0, "Exhaustion must remain a valid reading, not missing data")
             }
             let exhausted = CombinedQuota(accounts: blocked, window: window, now: 1000)
-            try expect(exhausted.remainingTotal == 0 && exhausted.includedCount == 3, "When every account is blocked, both global meters must show zero")
+            try expect(exhausted.remainingCredits == 0 && exhausted.includedCount == 3, "When every account is blocked, both global meters must show zero")
         }
         let valid = quotaAccount().usage.daily
         let otherWindows = [
@@ -387,10 +399,12 @@ func sampleSnapshot(used: Double = 25, selected: String = "work") -> Snapshot {
                     status: "ok", daily: daily, weekly: weekly, email: nil, plan: nil, fetched_at: 1000, message: ""
                 ))
                 let result = CombinedQuota(accounts: [account], window: window, now: 1000)
-                if other.state == "not_applicable" || other.used_percent == 99.9 {
-                    try expect(result.remainingTotal == 75 && result.includedCount == 1, "Inapplicable or non-exhausted windows must not block the other allowance")
+                if other.used_percent == 99.9 && window == \AccountUsage.daily {
+                    try expect(abs((result.remainingCredits ?? 0) - 0.2) < 1e-9 && result.includedCount == 1, "A nearly exhausted weekly window must cap, not block, daily credits")
+                } else if other.state == "not_applicable" || other.used_percent == 99.9 {
+                    try expect(result.remainingCredits == 75 && result.includedCount == 1, "Inapplicable or non-exhausted windows must not block the other allowance")
                 } else {
-                    try expect(result.remainingTotal == nil && result.unavailableCount == 1, "Both applicable windows must be valid and unexpired before counting an account's quota")
+                    try expect(result.remainingCredits == nil && result.unavailableCount == 1, "Both applicable windows must be valid and unexpired before counting an account's quota")
                 }
             }
         }
@@ -406,12 +420,14 @@ func sampleSnapshot(used: Double = 25, selected: String = "work") -> Snapshot {
         let weeklyLimited = quotaAccount(name: "weekly-limit", daily: 25, weekly: 100, fetched: now, reset: now + 3600)
         let dailyLimited = quotaAccount(name: "daily-limit", daily: 100, weekly: 50, fetched: now, reset: now + 3600)
         let stale = quotaAccount(name: "stale", status: "stale", fetched: now, reset: now + 3600)
+        let weeklyCapped = quotaAccount(name: "weekly-capped", daily: 0, weekly: 90, fetched: now, reset: now + 3600)
         for (scenario, accounts, percentages) in [
-            ("complete", current, ["100%", "120%", "of 200%"]),
-            ("partial", current + [stale], ["100%", "120%", "of 200%"]),
-            ("weekly-limit", [current[0], weeklyLimited], ["75%", "40%", "of 200%"]),
-            ("daily-limit", [current[0], dailyLimited], ["75%", "40%", "of 200%"]),
-            ("exhausted", [weeklyLimited, dailyLimited], ["0%", "of 200%"])
+            ("complete", current, ["100", "120", "of 200 credits", "50% left", "60% left"]),
+            ("partial", current + [stale], ["100", "120", "of 200 credits", "50% left", "60% left"]),
+            ("weekly-limit", [current[0], weeklyLimited], ["75", "40", "of 200 credits", "37.5% left", "20% left"]),
+            ("daily-limit", [current[0], dailyLimited], ["75", "40", "of 200 credits", "37.5% left", "20% left"]),
+            ("weekly-capped", [weeklyCapped], ["20", "10", "of 100 credits", "20% left", "10% left"]),
+            ("exhausted", [weeklyLimited, dailyLimited], ["0% left", "of 200 credits"])
         ] {
             model.snapshot.accounts = accounts
             for width in [339.0, 895] {
@@ -421,9 +437,10 @@ func sampleSnapshot(used: Double = 25, selected: String = "work") -> Snapshot {
                 renderer.scale = 3
                 guard let image = renderer.cgImage else { throw TestFailure(description: "Could not render global quota") }
                 let labels = try recognizedText(in: image)
-                for label in ["Global quota", "Daily left", "Weekly left", "Sum of accounts", "one full account", "accounts included", "either limit", "both windows"] + percentages {
+                for label in ["Global quota", "Daily left", "Weekly left", "100 credits", "one full account", "weekly credits left", "accounts included", "either limit"] + percentages {
                     try expect(labels.contains(label), "The \(scenario) global quota panel must keep \(label) visible at \(width) points; found: \(labels)")
                 }
+                try expect(!labels.contains("120%") && !labels.contains("of 200%"), "Summed credits must not be shown as percentages above 100")
                 if scenario == "partial" {
                     try expect(labels.contains("Partial readings") && labels.contains("excluded"), "Partial totals must visibly disclose excluded accounts")
                 } else {
@@ -439,7 +456,7 @@ func sampleSnapshot(used: Double = 25, selected: String = "work") -> Snapshot {
         model.snapshot.selected = "work"
         let image = try await workspaceImage(model: model, defaults: defaults, width: 1180, height: 820)
         let labels = try recognizedText(in: image)
-        try expect(labels.contains("Global quota") && labels.contains("100%") && labels.contains("120%"), "The All accounts dashboard must display live combined quota")
+        try expect(labels.contains("Global quota") && labels.contains("50% left") && labels.contains("60% left") && labels.contains("of 200 credits"), "The All accounts dashboard must display live combined quota")
         if CommandLine.arguments.count > 2 {
             let path = URL(fileURLWithPath: CommandLine.arguments[2]).appendingPathComponent("global-quota-overview.png")
             try NSBitmapImageRep(cgImage: image).representation(using: .png, properties: [:])!.write(to: path)

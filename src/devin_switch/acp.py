@@ -25,8 +25,22 @@ LOCAL_COMMANDS = [
         "description": "Resume this chat with another saved account; no model request",
         "input": {"hint": "optional account alias"},
     },
+    {
+        "name": "switch-continue",
+        "description": f"Switch accounts, then send “{handoff.CONTINUE_PROMPT}” to resume the work",
+        "input": {"hint": "optional account alias"},
+    },
     {"name": "switch-status", "description": "Show this chat's saved account and exact session ID"},
+    {
+        "name": "auto-switch",
+        "description": "Show or set switching automatically when usage runs out (all chats)",
+        "input": {"hint": "on or off"},
+    },
 ]
+LOCAL_NAMES = {"/" + command["name"] for command in LOCAL_COMMANDS}
+AGENT_STOPPED = "_cognition.ai/agent_stopped"
+RESOURCE_EXHAUSTED = -32011
+AUTO_SWITCH_LIMIT = 3
 BLOCKED_COMMANDS = {"login", "logout", "org", "new", "resume"}
 LIVE_CONTROLS = {
     "session/set_config_option",
@@ -48,9 +62,24 @@ BLANK_RELEASED = (
 
 
 class RpcError(SwitchError):
-    def __init__(self, message: str, code: int = -32603):
+    def __init__(self, message: str, code: int = -32603, data: object = None):
         super().__init__(message)
         self.code = code
+        self.data = data
+
+
+def quota_exhausted(error: RpcError) -> bool:
+    # Rate limits share this kind but carry a retry delay; they are not exhausted quota.
+    data = error.data if isinstance(error.data, dict) else {}
+    return (
+        error.code == RESOURCE_EXHAUSTED
+        and data.get("cognition.ai/errorKind") == "resource_exhausted"
+        and data.get("cognition.ai/retryAfterSeconds") is None
+    )
+
+
+def continue_params(session_id: str) -> dict:
+    return {"sessionId": session_id, "prompt": [{"type": "text", "text": handoff.CONTINUE_PROMPT}]}
 
 
 def failure_detail(error: Exception) -> str:
@@ -130,6 +159,7 @@ class Backend:
         self.model = None
         self.suppress_replay = False
         self.stopping = False
+        self.stop_cause = None
         self.last_activity = time.monotonic()
         bridge.backends.add(self)
 
@@ -219,6 +249,7 @@ class Backend:
                 raise RpcError(
                     f"Native ACP rejected the request (RPC code {code}). No prompt was replayed.",
                     code,
+                    error.get("data") if isinstance(error, dict) else None,
                 )
             result = response.get("result", {})
             if not isinstance(result, dict):
@@ -326,6 +357,7 @@ class Chat:
     controls: set[asyncio.Task] | None = None
     suspended: bool = False
     blank: bool = False
+    canceled: bool = False
     next_idle_check: float = 0
 
     @asynccontextmanager
@@ -391,6 +423,13 @@ class Bridge:
             self.client_requests[identifier] = (backend, message["id"])
             await self.emit({**message, "id": identifier})
             return
+        params = message.get("params")
+        if (
+            message.get("method") == AGENT_STOPPED
+            and isinstance(params, dict)
+            and params.get("sessionId") == backend.session_id
+        ):
+            backend.stop_cause = params.get("cause")
         if message.get("method") == "session/update":
             update = message.get("params", {}).get("update", {})
             kind = update.get("sessionUpdate")
@@ -402,7 +441,8 @@ class Bridge:
                 update["availableCommands"] = [
                     item
                     for item in update.get("availableCommands", [])
-                    if item.get("name") not in BLOCKED_COMMANDS | {"switch", "switch-status"}
+                    if "/" + str(item.get("name")) not in LOCAL_NAMES
+                    and item.get("name") not in BLOCKED_COMMANDS
                 ] + LOCAL_COMMANDS
                 backend.commands = update["availableCommands"]
             if backend.suppress_replay:
@@ -497,6 +537,8 @@ class Bridge:
             raise RpcError("Load the exact saved conversation before using it.", -32602)
         chat = self.chats[session_id]
         if notification:
+            if method == "session/cancel":
+                chat.canceled = True
             if chat.suspended:
                 if method == "session/cancel":
                     return {}
@@ -535,20 +577,66 @@ class Bridge:
                 self.chats.pop(session_id)
                 return {}
             if method == "session/prompt":
-                if await self.local_prompt(chat, params):
-                    return {"stopReason": "end_turn"}
+                chat.canceled = False
+                if (result := await self.local_prompt(chat, params)) is not None:
+                    return result
                 await self.reconnect(chat)
                 chat.blank = False
-                controls = chat.controls = set()
-                try:
-                    return await self.forward_request(chat.backend, method, params)
-                finally:
-                    chat.controls = None
-                    await asyncio.gather(*controls, return_exceptions=True)
+                return await self.prompt_turn(chat, params)
             if method == "session/cancel" and chat.suspended:
                 return {}
             await self.reconnect(chat)
             return await self.forward_request(chat.backend, method, params)
+
+    async def prompt_turn(self, chat, params):
+        tried = {chat.backend.account.name}
+        while True:
+            backend = chat.backend
+            backend.stop_cause = None
+            controls = chat.controls = set()
+            result = error = None
+            try:
+                result = await self.forward_request(backend, "session/prompt", params)
+            except RpcError as exc:
+                error = exc
+            finally:
+                chat.controls = None
+                await asyncio.gather(*controls, return_exceptions=True)
+            exhausted = (
+                quota_exhausted(error)
+                if error
+                else backend.stop_cause == "quota_exhausted"
+                and result.get("stopReason") != "cancelled"
+            )
+            if (
+                not exhausted
+                or chat.canceled
+                or len(tried) > AUTO_SWITCH_LIMIT
+                or not await asyncio.to_thread(handoff.auto_switch_enabled, self.native.store)
+            ):
+                if error:
+                    raise error
+                return result
+            await self.note(
+                chat.session_id,
+                f"{backend.account.name} is out of usage. Auto-switch is on; "
+                "choosing another saved login…",
+            )
+            try:
+                await self.switch(chat, None, exclude=frozenset(tried), follow_up=True)
+            except (SwitchError, OSError) as exc:
+                await self.note(
+                    chat.session_id,
+                    f"Automatic switch stopped: {failure_detail(exc)} "
+                    "Turn it off with /auto-switch off.",
+                )
+                if error:
+                    raise error from exc
+                return result
+            if chat.canceled:
+                return {"stopReason": "cancelled"}
+            tried.add(chat.backend.account.name)
+            params = continue_params(chat.session_id)
 
     async def forward_request(self, backend, method, params):
         result = await backend.request(method, params)
@@ -651,30 +739,44 @@ class Bridge:
         ).strip()
         words = text.split()
         command = words[0] if words else ""
+        done = {"stopReason": "end_turn"}
         if command.lstrip("/") in BLOCKED_COMMANDS and command.startswith("/"):
             await self.note(
                 chat.session_id,
                 "Manage logins in Terminal with ds login. "
                 "Use /switch to change this chat's account.",
             )
-            return True
+            return done
         if command == "!ds" and words[1:2] == ["switch"]:
-            words = ["/switch", *words[2:]]
-            command = "/switch"
-        if command not in {"/switch", "/switch-status"}:
-            return False
-        if len(blocks) != 1 or len(words) > (2 if command == "/switch" else 1):
+            options = words[2:]
+            command = "/switch-continue" if "--continue" in options else "/switch"
+            words = [command, *(word for word in options if word != "--continue")]
+        if command not in LOCAL_NAMES:
+            return None
+        limit = 2 if command in {"/switch", "/switch-continue", "/auto-switch"} else 1
+        if (
+            len(blocks) != 1
+            or len(words) > limit
+            or (command == "/auto-switch" and words[1:] not in ([], ["on"], ["off"]))
+        ):
             await self.note(
                 chat.session_id,
-                "Send /switch [ALIAS] or /switch-status alone, without attachments.",
+                "Send /switch [ALIAS], /switch-continue [ALIAS], /switch-status, or "
+                "/auto-switch [on|off] alone, without attachments.",
             )
-            return True
+            return done
+        store = self.native.store
+        if command == "/auto-switch":
+            if len(words) == 2:
+                await asyncio.to_thread(handoff.set_auto_switch, store, words[1] == "on")
+            await self.note(
+                chat.session_id, await asyncio.to_thread(handoff.auto_switch_status, store)
+            )
+            return done
         if command == "/switch-status":
             connected = chat.backend.process.poll() is None and not chat.backend.writer.is_closing()
             try:
-                saved = await asyncio.to_thread(
-                    acp_state.saved_chat, self.native.store, chat.session_id
-                )
+                saved = await asyncio.to_thread(acp_state.saved_chat, store, chat.session_id)
                 history = "saved" if saved else "not saved yet"
             except (SwitchError, OSError):
                 history = "unavailable"
@@ -685,16 +787,19 @@ class Bridge:
                 if chat.suspended
                 else ("open" if connected else "closed")
             )
+            automatic = await asyncio.to_thread(handoff.auto_switch_enabled, store)
             await self.note(
                 chat.session_id,
                 f"Account: {chat.backend.account.name}. Session: {chat.session_id}. "
                 f"Connection: {connection}. "
-                f"Shared history: {history}. Desktop login is unchanged.",
+                f"Shared history: {history}. Auto-switch: {'on' if automatic else 'off'}. "
+                "Desktop login is unchanged.",
             )
-            return True
+            return done
+        follow_up = command == "/switch-continue"
         try:
             await self.reconnect(chat)
-            await self.switch(chat, words[1] if len(words) == 2 else None)
+            await self.switch(chat, words[1] if len(words) == 2 else None, follow_up=follow_up)
         except (SwitchError, OSError) as exc:
             await self.note(
                 chat.session_id,
@@ -702,7 +807,12 @@ class Bridge:
                 if isinstance(exc, SwitchError)
                 else "GUI switch failed safely. No prompt was replayed.",
             )
-        return True
+            return done
+        if not follow_up:
+            return done
+        if chat.canceled:
+            return {"stopReason": "cancelled"}
+        return await self.prompt_turn(chat, continue_params(chat.session_id))
 
     async def publish_settings(self, chat):
         for update in (
@@ -827,7 +937,7 @@ class Bridge:
                 raise SwitchError(f"{stage}: {failure_detail(exc)}") from exc
             raise
 
-    async def switch(self, chat, account_name):
+    async def switch(self, chat, account_name, *, exclude=frozenset(), follow_up=False):
         old = chat.backend
         store = self.native.store
         if old.process.poll() is not None or old.writer.is_closing():
@@ -842,7 +952,9 @@ class Bridge:
             account = store.account(account_name)
         else:
             await self.note(chat.session_id, "Checking saved accounts for remaining usage…")
-            account, _ = await asyncio.to_thread(handoff.choose_best, self.native, old.account.name)
+            account, _ = await asyncio.to_thread(
+                handoff.choose_best, self.native, old.account.name, exclude
+            )
         if account.name == old.account.name:
             raise SwitchError("This GUI chat already uses that account.")
         await asyncio.to_thread(acp_state.check_login, self.native, account)
@@ -896,7 +1008,12 @@ class Bridge:
         await self.note(
             chat.session_id,
             f"Switched {old.account.name} → {account.name}. Same conversation; "
-            "desktop login and other chats are unchanged. Send your next message when ready.",
+            "desktop login and other chats are unchanged. "
+            + (
+                f"Sending “{handoff.CONTINUE_PROMPT}”…"
+                if follow_up
+                else "Send your next message when ready."
+            ),
         )
 
     async def queued_switch(self, chat, path):

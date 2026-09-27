@@ -594,3 +594,122 @@ def test_handoff_keeps_launch_metadata_readable_by_older_managers(signed_in: Nat
 def test_setup_and_cancel_reject_account_argument(store, flag):
     with pytest.raises(SwitchError, match="not both"):
         cli.execute(cli.parser().parse_args(["switch", "ansuman-2", flag]), store)
+
+
+def test_switch_continue_resumes_exact_chat_with_one_continue_prompt(
+    signed_in: Native, tmp_path: Path, monkeypatch, capsys
+):
+    store = signed_in.store
+    setup_project(store, tmp_path, monkeypatch)
+    seed_history(store, tmp_path)
+    monkeypatch.setattr(cli, "find_binary", lambda: signed_in.binary)
+    launches = []
+
+    def interactive(self, account, arguments):
+        launches.append((account.name, arguments))
+        if len(launches) < 3:
+            monkeypatch.setenv("DS_RUN_ID", self.run_id)
+            command = ["switch", "--continue"] if len(launches) == 1 else ["switch"]
+            assert cli.execute(cli.parser().parse_args(command), store) == 0
+            record_exit(store)
+        return 0
+
+    monkeypatch.setattr(Native, "interactive", interactive)
+    arguments = ["run", "--account", "ansuman-1", "--", "--sandbox", "--", "private-initial"]
+    assert cli.execute(cli.parser().parse_args(arguments), store) == 0
+    assert launches == [
+        ("ansuman-1", ("--sandbox", "--", "private-initial")),
+        ("ansuman-2", ("--sandbox", "--resume", "exact-chat", "--", "continue")),
+        ("ansuman-1", ("--sandbox", "--resume", "exact-chat")),
+    ]
+    output = capsys.readouterr()
+    assert "Then sending “continue”" in output.out
+    assert "Sending “continue”" in output.err
+    assert "ds run --account ansuman-2 -- --sandbox --resume exact-chat -- continue" in output.err
+
+
+def test_auto_switch_setting_defaults_on_and_fails_closed(store, capsys):
+    assert handoff.auto_switch_enabled(store)
+    handoff.settings_path(store).write_text('{"other": 1}')
+    assert handoff.auto_switch_enabled(store)
+    assert cli.execute(cli.parser().parse_args(["auto-switch", "off"]), store) == 0
+    assert not handoff.auto_switch_enabled(store)
+    assert json.loads(handoff.settings_path(store).read_text()) == {
+        "other": 1,
+        "auto_switch": False,
+    }
+    assert "off" in capsys.readouterr().out
+    assert cli.execute(cli.parser().parse_args(["auto-switch", "on"]), store) == 0
+    assert handoff.auto_switch_enabled(store)
+    for invalid in ("not json", "[]", '{"auto_switch": "yes"}'):
+        handoff.settings_path(store).write_text(invalid)
+        assert not handoff.auto_switch_enabled(store)
+    assert cli.execute(cli.parser().parse_args(["auto-switch"]), store) == 0
+    assert "off" in capsys.readouterr().out
+
+
+def test_continue_is_rejected_for_queued_gui_handoffs(store):
+    for command in (
+        ["switch", "--continue", "--session", "chat"],
+        ["switch", "--continue", "--cancel"],
+    ):
+        with pytest.raises(SwitchError):
+            cli.execute(cli.parser().parse_args(command), store)
+
+
+def test_best_account_skips_logins_already_tried(signed_in, monkeypatch):
+    with signed_in.store.lock():
+        third = signed_in.store.add("ansuman-3", None)
+    signed_in.store.credentials(third).write_text("valid-third")
+    assert handoff.choose_best(signed_in, "ansuman-1", frozenset({"ansuman-2"}))[0] == third
+    with pytest.raises(SwitchError, match="confirmed remaining usage"):
+        handoff.choose_best(signed_in, "ansuman-1", frozenset({"ansuman-2", "ansuman-3"}))
+
+
+@pytest.mark.parametrize(
+    "case", ["exhausted", "remaining", "unknown", "disabled", "no-controller", "pending"]
+)
+def test_automatic_terminal_handoff_requires_confirmed_exhaustion(
+    signed_in: Native, tmp_path, monkeypatch, case
+):
+    import time
+
+    store = signed_in.store
+    setup_project(store, tmp_path, monkeypatch)
+    monkeypatch.setattr(handoff, "controller_available", lambda *_: case != "no-controller")
+
+    def refresh(store, account, *, force):
+        assert force
+        now = time.time()
+        if account.name == "ansuman-1" and case == "unknown":
+            return usage.Usage(status="unavailable")
+        used = 100 if account.name == "ansuman-1" and case != "remaining" else 20
+        return usage.Usage(
+            status="ok",
+            daily=usage.Window(used, now + 3600, "available"),
+            weekly=usage.Window(40, now + 86400, "available"),
+            fetched_at=now,
+            checked_at=now,
+        )
+
+    monkeypatch.setattr(usage, "refresh_account", refresh)
+    if case == "disabled":
+        handoff.set_auto_switch(store, False)
+    account = store.account("ansuman-1")
+    with sessions.managed(signed_in, account.name, (), can_handoff=True) as (runner, _, _):
+        path = handoff.state_path(store, runner.run_id, "request")
+        if case == "pending":
+            handoff.queue(
+                store, {"id": runner.run_id, "account": account.name}, store.accounts()[1]
+            )
+        message = handoff.queue_automatic(runner, account)
+        if case == "exhausted":
+            assert "ansuman-2" in message and "continue" in message
+            request = json.loads(path.read_text())
+            assert request["account"] == "ansuman-2"
+            assert request["continue"] is True and request["automatic"] is True
+        else:
+            assert message is None
+            assert path.exists() == (case == "pending")
+            if case == "pending":
+                assert json.loads(path.read_text())["automatic"] is False

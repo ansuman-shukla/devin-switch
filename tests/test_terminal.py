@@ -259,3 +259,145 @@ def test_one_command_automatically_resumes_with_best_account_on_real_pty(
         if process.poll() is None:
             process.terminate()
             process.wait(timeout=5)
+
+
+def test_automatic_request_sends_exit_keys_without_waiting_for_requester(store, monkeypatch):
+    run_id = "e" * 32
+    path = handoff.state_path(store, run_id, "request")
+    private_directory(path.parent)
+    write_json(
+        path,
+        {"account": "ansuman-2", "requester_pid": os.getpid(), "created_at": 0, "automatic": True},
+    )
+    monkeypatch.setattr(terminal, "process_exists", lambda _: True)
+    request = terminal.ExitRequest(store, run_id)
+    assert request.advance(0) == (b"\x1b", "")
+    assert request.advance(0.3) == (b"\x04", "")
+
+
+def test_quota_watch_matches_styled_split_alert_once_per_cooldown(monkeypatch):
+    calls = []
+    monkeypatch.setattr(
+        handoff, "queue_automatic", lambda native, account: calls.append(account) or "switching"
+    )
+    watch = terminal.QuotaWatch("native", "ansuman-1", cooldown=10)
+    watch.feed(b"The agent mentioned quota limits\r\n\x1b]0;title\x07", 0)
+    watch.feed(b"\x1b[1;3", 1)
+    watch.feed(b"1mQuota\x1b[0m\x1b[2C\x1b[1mexhau", 1)
+    watch.feed(b"sted\x1b[0m", 1)
+    watch.worker.join(5)
+    assert calls == ["ansuman-1"] and watch.message() == "switching" and watch.message() == ""
+    watch.feed(b"Quota exhausted", 5)
+    assert calls == ["ansuman-1"]
+    watch.feed(b"Usage limit reached", 12)
+    watch.worker.join(5)
+    assert calls == ["ansuman-1", "ansuman-1"]
+
+
+def test_quota_watch_reports_check_failures_without_raising(monkeypatch):
+    def fail(native, account):
+        raise OSError("sensitive-native-diagnostic")
+
+    monkeypatch.setattr(handoff, "queue_automatic", fail)
+    watch = terminal.QuotaWatch("native", "ansuman-1")
+    watch.feed(b"Quota exhausted", 0)
+    watch.worker.join(5)
+    message = watch.message()
+    assert "unchanged" in message and "sensitive" not in message
+
+
+@pytest.mark.parametrize("exhausted", [True, False])
+def test_quota_alert_automatically_resumes_and_continues_on_real_pty(
+    signed_in: Native, tmp_path: Path, monkeypatch, exhausted: bool
+):
+    monkeypatch.setattr(desktop.browser, "profiles", lambda: ())
+    store = signed_in.store
+    project = tmp_path / "project"
+    project.mkdir()
+    with store.lock():
+        third = store.add("ansuman-3", None)
+    store.credentials(third).write_text("valid-third")
+    with sqlite3.connect(store.root / "shared/cli/sessions.db") as connection:
+        connection.execute(
+            "CREATE TABLE sessions (id TEXT, title TEXT, working_directory TEXT, "
+            "last_activity_at INTEGER, hidden INTEGER DEFAULT 0)"
+        )
+        connection.execute(
+            "INSERT INTO sessions VALUES ('exact-chat', 'Chat', ?, 1, 0)", (str(project),)
+        )
+    binary = tmp_path / "fake native"
+    binary.write_text(
+        "#!/usr/bin/env python3\n"
+        "import json, os, pathlib, subprocess, sys, termios, tty\n"
+        "if sys.argv[1:] == ['auth', 'status']:\n"
+        "    print('Logged in as offline@example.invalid')\n"
+        "    sys.exit(0)\n"
+        "account = pathlib.Path(os.environ['XDG_DATA_HOME']).parent.name\n"
+        "settings = termios.tcgetattr(0)\n"
+        "tty.setraw(0)\n"
+        "print('START ' + json.dumps({'account': account, 'args': sys.argv[1:]}), flush=True)\n"
+        "print('READY-' + account, flush=True)\n"
+        "while True:\n"
+        "    key = os.read(0, 1)\n"
+        "    if key == b'\\x04':\n"
+        "        break\n"
+        "    if key == b'q':\n"
+        "        sys.stdout.write('\\x1b[1;31mQuota\\x1b[0m\\x1b[1C'\n"
+        "                         '\\x1b[1mexhausted\\x1b[0m\\r\\n')\n"
+        "        sys.stdout.flush()\n"
+        "config = pathlib.Path(os.environ['XDG_CONFIG_HOME']) / 'devin/config.json'\n"
+        "event = {'hook_event_name':'SessionEnd','session_id':'exact-chat', "
+        "'reason':'prompt_input_exit'}\n"
+        "for entry in json.loads(config.read_text())['hooks']['SessionEnd']:\n"
+        "    for hook in entry['hooks']:\n"
+        "        subprocess.run(hook['command'], shell=True, input=json.dumps(event), text=True)\n"
+        "termios.tcsetattr(0, termios.TCSADRAIN, settings)\n"
+    )
+    binary.chmod(0o700)
+    driver = tmp_path / "tty driver.py"
+    driver.write_text(
+        "import time\n"
+        "from devin_switch import cli, usage\n"
+        "def refresh(store, account, *, force):\n"
+        "    assert force\n"
+        "    now = time.time()\n"
+        f"    used = {{'ansuman-1': {100 if exhausted else 70}, 'ansuman-2': 60}}.get("
+        "account.name, 30)\n"
+        "    return usage.Usage(status='ok', fetched_at=now, checked_at=now, "
+        "daily=usage.Window(used, now+3600, 'available'), "
+        "weekly=usage.Window(10, now+86400, 'available'))\n"
+        "usage.refresh_account = refresh\n"
+        "raise SystemExit(cli.main())\n"
+    )
+    master, slave = pty.openpty()
+    process = subprocess.Popen(
+        (sys.executable, str(driver), "run", "--account", "ansuman-1", "--", "--sandbox"),
+        env={**os.environ, "DS_BINARY": str(binary)},
+        cwd=project,
+        stdin=slave,
+        stdout=slave,
+        stderr=slave,
+        start_new_session=True,
+        preexec_fn=terminal.claim_terminal,
+    )
+    try:
+        read_until(master, b"READY-ansuman-1")
+        os.write(master, b"q")
+        if exhausted:
+            output = read_until(master, b"READY-ansuman-3")
+            assert b"ansuman-1 is out of usage" in output
+            assert b'"args": ["--sandbox", "--resume", "exact-chat", "--", "continue"]' in output
+            assert store.selected().name == "ansuman-3"
+        else:
+            read_until(master, b"exhausted")
+            time.sleep(1.5)
+            assert not list((store.root / "handoffs").glob("*.request.json"))
+        os.write(master, b"\x04")
+        assert process.wait(timeout=10) == 0
+        assert not any(run["active"] for run in sessions.runs(store))
+    finally:
+        os.close(master)
+        os.close(slave)
+        if process.poll() is None:
+            process.terminate()
+            process.wait(timeout=5)

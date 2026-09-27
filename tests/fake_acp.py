@@ -64,6 +64,7 @@ async def handle(message):
                         "sessionId": params.get("sessionId"),
                         "args": sys.argv[1:],
                         "gh_config_dir": os.environ.get("GH_CONFIG_DIR"),
+                        "text": (params.get("prompt") or [{}])[0].get("text"),
                     }
                 )
                 + "\n"
@@ -134,6 +135,27 @@ async def handle(message):
             )
             connection.commit()
         text = params["prompt"][0]["text"]
+        if account in os.environ.get("FAKE_QUOTA_ACCOUNTS", "").split(","):
+            style = os.environ.get("FAKE_QUOTA_STYLE", "error")
+            if style == "stopped":
+                emit(
+                    {
+                        "method": "_cognition.ai/agent_stopped",
+                        "params": {"sessionId": loaded, "cause": "quota_exhausted"},
+                    }
+                )
+                emit({"id": message["id"], "result": {"stopReason": "end_turn"}})
+                return
+            data = {"cognition.ai/errorKind": "resource_exhausted", "cognition.ai/retryable": True}
+            if style == "rate":
+                data["cognition.ai/retryAfterSeconds"] = 30
+            emit(
+                {
+                    "id": message["id"],
+                    "error": {"code": -32011, "message": "Quota exhausted.", "data": data},
+                }
+            )
+            return
         if text == "slow":
             await asyncio.sleep(0.5)
         if text == "wait":

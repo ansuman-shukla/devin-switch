@@ -725,6 +725,11 @@ def test_gui_background_lease_does_not_keep_old_chat_live(acp_native, tmp_path):
         "/switch ansuman-1",
         "/switch-status extra",
         "!ds switch ansuman-1",
+        "/switch-continue missing",
+        "/switch-continue ansuman-1",
+        "!ds switch --continue ansuman-1",
+        "/switch-continue ansuman-2 extra",
+        "/auto-switch maybe",
     ],
 )
 def test_gui_invalid_local_commands_do_not_reach_model(acp_native, tmp_path, text):
@@ -1364,5 +1369,189 @@ def test_gui_handoff_failure_reports_destination_and_recovery_stages(
             assert "The conversation is saved" not in output
             assert acp_native.store.selected().name == "ansuman-1"
             assert not acp_state.live(acp_native.store)
+
+    asyncio.run(scenario())
+
+
+def fresh_usage(exhausted=()):
+    import time
+
+    def refresh(store, account, *, force):
+        assert force and not store.locked("lock")
+        now = time.time()
+        used = 100 if account.name in exhausted else 20
+        return usage.Usage(
+            status="ok",
+            fetched_at=now,
+            checked_at=now,
+            daily=usage.Window(used, now + 3600, "available"),
+            weekly=usage.Window(40, now + 86400, "available"),
+        )
+
+    return refresh
+
+
+def prompts(native):
+    return [(call["account"], call["text"]) for call in logged(native) if call["text"] is not None]
+
+
+def prompt_params(session_id, text):
+    return {"sessionId": session_id, "prompt": [{"type": "text", "text": text}]}
+
+
+@pytest.mark.parametrize("style", ["error", "stopped"])
+def test_gui_quota_exhaustion_switches_and_continues_in_the_same_turn(
+    acp_native, tmp_path, monkeypatch, style
+):
+    monkeypatch.setattr(usage, "refresh_account", fresh_usage())
+    monkeypatch.setenv("FAKE_QUOTA_ACCOUNTS", "ansuman-1")
+    monkeypatch.setenv("FAKE_QUOTA_STYLE", style)
+
+    async def scenario():
+        async with in_process(acp_native) as (bridge, messages):
+            created = await bridge.dispatch("session/new", {"cwd": str(tmp_path), "mcpServers": []})
+            session_id = created["sessionId"]
+            await bridge.dispatch(
+                "session/set_config_option",
+                {"sessionId": session_id, "configId": "mode", "value": "plan"},
+            )
+            result = await bridge.dispatch("session/prompt", prompt_params(session_id, "work"))
+            assert result == {"stopReason": "end_turn"}
+            chat = bridge.chats[session_id]
+            assert chat.backend.account.name == "ansuman-2"
+            assert chat.backend.configs["mode"]["currentValue"] == "plan"
+            assert acp_native.store.selected().name == "ansuman-2"
+            assert prompts(acp_native) == [("ansuman-1", "work"), ("ansuman-2", "continue")]
+            text = json.dumps(messages)
+            assert "ansuman-1 is out of usage" in text and "Sending" in text
+            assert chat.controls is None and not chat.gate.locked()
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("case", ["disabled", "rate-limited", "canceled"])
+def test_gui_quota_error_without_auto_switch_is_returned_unchanged(
+    acp_native, tmp_path, monkeypatch, case
+):
+    monkeypatch.setattr(usage, "refresh_account", fresh_usage())
+    monkeypatch.setenv("FAKE_QUOTA_ACCOUNTS", "ansuman-1")
+    monkeypatch.setenv("FAKE_QUOTA_STYLE", "rate" if case == "rate-limited" else "error")
+    if case == "disabled":
+        acp.handoff.set_auto_switch(acp_native.store, False)
+
+    async def scenario():
+        async with in_process(acp_native) as (bridge, messages):
+            created = await bridge.dispatch("session/new", {"cwd": str(tmp_path), "mcpServers": []})
+            session_id = created["sessionId"]
+            chat = bridge.chats[session_id]
+            if case == "canceled":
+                forward = bridge.forward_request
+
+                async def canceled_during_turn(backend, method, params):
+                    try:
+                        return await forward(backend, method, params)
+                    finally:
+                        await bridge.dispatch(
+                            "session/cancel", {"sessionId": session_id}, notification=True
+                        )
+
+                monkeypatch.setattr(bridge, "forward_request", canceled_during_turn)
+            with pytest.raises(acp.RpcError) as raised:
+                await bridge.dispatch("session/prompt", prompt_params(session_id, "work"))
+            assert raised.value.code == -32011
+            assert chat.backend.account.name == "ansuman-1"
+            assert acp_native.store.selected().name == "ansuman-1"
+            assert prompts(acp_native) == [("ansuman-1", "work")]
+            assert "out of usage" not in json.dumps(messages)
+
+    asyncio.run(scenario())
+
+
+def test_gui_auto_switch_never_revisits_exhausted_logins(acp_native, tmp_path, monkeypatch):
+    monkeypatch.setattr(usage, "refresh_account", fresh_usage())
+    monkeypatch.setenv("FAKE_QUOTA_ACCOUNTS", "ansuman-1,ansuman-2")
+
+    async def scenario():
+        async with in_process(acp_native) as (bridge, messages):
+            created = await bridge.dispatch("session/new", {"cwd": str(tmp_path), "mcpServers": []})
+            session_id = created["sessionId"]
+            with pytest.raises(acp.RpcError):
+                await bridge.dispatch("session/prompt", prompt_params(session_id, "work"))
+            assert prompts(acp_native) == [("ansuman-1", "work"), ("ansuman-2", "continue")]
+            assert bridge.chats[session_id].backend.account.name == "ansuman-2"
+            assert "Automatic switch stopped" in json.dumps(messages)
+
+    asyncio.run(scenario())
+
+
+def test_gui_auto_switch_canceled_during_handoff_sends_no_continue(
+    acp_native, tmp_path, monkeypatch
+):
+    monkeypatch.setattr(usage, "refresh_account", fresh_usage())
+    monkeypatch.setenv("FAKE_QUOTA_ACCOUNTS", "ansuman-1")
+
+    async def scenario():
+        async with in_process(acp_native) as (bridge, _):
+            created = await bridge.dispatch("session/new", {"cwd": str(tmp_path), "mcpServers": []})
+            session_id = created["sessionId"]
+            switch = bridge.switch
+
+            async def canceled_switch(chat, *args, **kwargs):
+                await switch(chat, *args, **kwargs)
+                chat.canceled = True
+
+            monkeypatch.setattr(bridge, "switch", canceled_switch)
+            result = await bridge.dispatch("session/prompt", prompt_params(session_id, "work"))
+            assert result == {"stopReason": "cancelled"}
+            assert bridge.chats[session_id].backend.account.name == "ansuman-2"
+            assert prompts(acp_native) == [("ansuman-1", "work")]
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("text", ["/switch-continue ansuman-2", "!ds switch --continue ansuman-2"])
+def test_gui_switch_continue_resumes_work_on_destination(acp_native, tmp_path, text):
+    async def scenario():
+        async with connect(acp_native) as client:
+            session_id = await client.new(tmp_path)
+            result = await client.prompt(session_id, text)
+            assert result["result"]["stopReason"] == "end_turn"
+            assert client.agent_replies() == [
+                {
+                    "account": "ansuman-2",
+                    "session": session_id,
+                    "settings": {"mode": "ask", "model": "test-model"},
+                }
+            ]
+            assert prompts(acp_native) == [("ansuman-2", "continue")]
+            assert acp_native.store.selected().name == "ansuman-2"
+            commands = [
+                message["params"]["update"]["availableCommands"]
+                for message in client.messages
+                if message.get("method") == "session/update"
+                and message["params"]["update"]["sessionUpdate"] == "available_commands_update"
+            ]
+            assert all(
+                {"switch", "switch-continue", "auto-switch"} <= {item["name"] for item in batch}
+                for batch in commands
+            )
+
+    asyncio.run(scenario())
+
+
+def test_gui_auto_switch_toggle_is_global_and_local(acp_native, tmp_path):
+    async def scenario():
+        async with connect(acp_native) as client:
+            session_id = await client.new(tmp_path)
+            await client.prompt(session_id, "/switch-status")
+            assert "Auto-switch: on" in client.texts()[-1]
+            await client.prompt(session_id, "/auto-switch off")
+            assert "off" in client.texts()[-1]
+            assert not acp.handoff.auto_switch_enabled(acp_native.store)
+            await client.prompt(session_id, "/switch-status")
+            assert "Auto-switch: off" in client.texts()[-1]
+            await client.prompt(session_id, "/auto-switch on")
+            assert acp.handoff.auto_switch_enabled(acp_native.store)
+            assert not prompts(acp_native)
 
     asyncio.run(scenario())

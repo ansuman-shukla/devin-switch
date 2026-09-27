@@ -169,10 +169,43 @@ without discarding the handoff. `!ds switch --cancel` cancels a pending request.
 
 The saved transcript survives, but unsent input and in-memory tool shells are not transferred.
 Switch does not replay initial prompts or prompt files; send your next message when the chat
-reopens. Sandbox, permission-mode, and export flags are retained, and native resume uses the
+reopens, or use **`!ds switch --continue [ALIAS]`** to have the reopened chat send exactly
+`continue` so the agent picks up where it left off. Sandbox, permission-mode, and export flags
+are retained, and native resume uses the
 saved model rather than reapplying the initial `--model` override. Piped/non-interactive runs,
 custom `--config` overrides, and unsupported native options are forwarded normally without
 automatic handoff support.
+
+### Switch automatically when usage runs out
+
+Automatic switching is **on by default** for terminal (`ds run`) and GUI (ACP) chats:
+
+```sh
+ds auto-switch        # show the current setting
+ds auto-switch off    # stop switching automatically
+ds auto-switch on
+```
+
+When a chat runs out of usage, Switch moves the **same conversation** to the saved login with
+the most remaining usage (using the same ranking as `!ds switch`), then sends exactly `continue`.
+It also makes that login the default. This setting applies to every chat right away, with no
+restart needed. If the setting file is unreadable, automatic switching stays off.
+
+- **GUI chats** use the native CLI's typed quota signals: a `-32011` / `resource_exhausted`
+  prompt error, or an `agent_stopped` event with cause `quota_exhausted`. The switch and the
+  `continue` happen inside the same Desktop turn, so output keeps streaming into the chat.
+  Rate limits that include a retry delay do not trigger a switch. Stopping the turn in Desktop
+  cancels the pending `continue`. Each turn switches at most three times and never goes back
+  to a login it already tried. If no login has confirmed remaining usage, the original quota
+  error is shown.
+- **Terminal chats** watch the CLI's rendered "Quota exhausted" / "Usage limit reached" alert,
+  then check usage again for the current account. The chat switches only if that fresh reading
+  confirms at least one quota window is at 0%, so the same words appearing in conversation
+  text do not cause a switch. The exit, exact-conversation resume, and failure rules match
+  `!ds switch`.
+
+Only the literal `continue` message is sent. The original prompt is never replayed.
+`ds switch --session ID` handoffs queued from another terminal never send a prompt.
 
 ### Switch accounts and resume from the shell
 
@@ -260,13 +293,19 @@ Inside a Switch-managed GUI chat:
 /switch-status
 /switch
 /switch work
+/switch-continue
+/switch-continue work
+/auto-switch off
 ```
 
-`/switch-status` reports the bound account, exact conversation ID, and whether the
-conversation is saved in shared history. `/switch` refreshes usage and chooses another
-eligible account; an alias chooses explicitly. These are local control commands, so
-they work without a model response or remaining credits. `!ds switch [ALIAS]` is also
-recognized locally in this agent. Send a control command by itself, without attachments.
+`/switch-status` reports the bound account, exact conversation ID, whether the
+conversation is saved in shared history, and whether auto-switch is on. `/switch` refreshes
+usage and chooses another eligible account; an alias chooses explicitly. These are local
+control commands, so they work without a model response or remaining credits.
+`/switch-continue` performs the same handoff and then sends `continue` to the destination
+within the same turn. `/auto-switch [on|off]` shows or changes the global setting.
+`!ds switch [--continue] [ALIAS]` is also recognized locally in this agent. Send a control
+command by itself, without attachments.
 
 A newly opened GUI chat can have a native session ID **without a saved conversation**.
 The local `/switch-status` and `/switch` commands do not create saved history. Switch
@@ -362,7 +401,9 @@ extension.
 | `ds use ALIAS` | Change the default for future launches |
 | `ds next` | Select another profile with a saved login; does not measure quota |
 | `!ds switch [ALIAS]` | Resume this chat automatically with the best reported allowance, or a chosen account |
+| `!ds switch --continue [ALIAS]` | Same, then send `continue` so the agent keeps working |
 | `!ds switch --cancel` | Cancel this chat's queued handoff |
+| `ds auto-switch [on\|off]` | Show or set automatic switch-and-continue when usage runs out (default on) |
 | `ds run [--account ALIAS] -- ARGS` | Launch Devin CLI with the selected profile |
 | `ds sessions` | List shared history for the current project |
 | `ds verify FIRST SECOND` | Check A → B → A login and local-history visibility |

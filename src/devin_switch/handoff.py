@@ -17,6 +17,42 @@ HOOK_COMMAND = (
     'else "$DS_EXECUTABLE" -m devin_switch.cli _session-end; fi; fi'
 )
 HOOK = {"matcher": "", "hooks": [{"type": "command", "command": HOOK_COMMAND, "timeout": 5}]}
+CONTINUE_PROMPT = "continue"
+
+
+def settings_path(store: Store) -> Path:
+    return store.root / "settings.json"
+
+
+def auto_switch_enabled(store: Store) -> bool:
+    try:
+        value = json.loads(settings_path(store).read_text())
+    except FileNotFoundError:
+        return True
+    except (OSError, ValueError):
+        return False
+    return isinstance(value, dict) and value.get("auto_switch", True) is True
+
+
+def set_auto_switch(store: Store, enabled: bool) -> None:
+    with store.lock(timeout=5):
+        try:
+            current = json.loads(settings_path(store).read_text())
+        except (OSError, ValueError):
+            current = {}
+        write_json(
+            settings_path(store),
+            {**(current if isinstance(current, dict) else {}), "auto_switch": enabled},
+        )
+
+
+def auto_switch_status(store: Store) -> str:
+    if auto_switch_enabled(store):
+        return (
+            "Automatic switching is on: when a chat runs out of usage, it resumes with the saved "
+            f"login reporting the most remaining usage and sends “{CONTINUE_PROMPT}”."
+        )
+    return "Automatic switching is off. Out-of-usage chats stop until you switch manually."
 
 
 def json_source(text: str) -> str:
@@ -106,10 +142,16 @@ def enable(store: Store, account: Account) -> None:
             temporary.unlink(missing_ok=True)
 
 
-def choose_best(native: Native, current_account: str) -> tuple[Account, float]:
+def choose_best(
+    native: Native, current_account: str, exclude: frozenset[str] = frozenset()
+) -> tuple[Account, float]:
     store = native.store
     with store.lock():
-        accounts = [account for account in store.accounts() if account.name != current_account]
+        accounts = [
+            account
+            for account in store.accounts()
+            if account.name != current_account and account.name not in exclude
+        ]
 
     def check(account: Account) -> tuple[Account, float] | None:
         try:
@@ -200,14 +242,51 @@ def state_path(store: Store, run_id: str, kind: str) -> Path:
     return store.root / "handoffs" / f"{run_id}.{kind}.json"
 
 
-def queue(store: Store, run: dict, account: Account) -> None:
+def queue(
+    store: Store, run: dict, account: Account, *, follow_up: bool = False, automatic: bool = False
+) -> None:
     if account.name == run["account"]:
         raise SwitchError(f"This chat already uses {account.name}. Choose a different account.")
     path = state_path(store, run["id"], "request")
     private_directory(path.parent)
     state_path(store, run["id"], "exit").unlink(missing_ok=True)
     write_json(
-        path, {"account": account.name, "requester_pid": os.getpid(), "created_at": time.time()}
+        path,
+        {
+            "account": account.name,
+            "requester_pid": os.getpid(),
+            "created_at": time.time(),
+            "continue": follow_up,
+            "automatic": automatic,
+        },
+    )
+
+
+def queue_automatic(native: Native, account: Account) -> str | None:
+    """Queue a continuing handoff only when fresh usage confirms this account is exhausted."""
+    store = native.store
+    if native.run_id is None or not auto_switch_enabled(store):
+        return None
+    with store.account_lock(account, shared=True):
+        reading = usage.refresh_account(store, account, force=True)
+    if usage.remaining_allowance(reading) != 0:
+        return None
+    try:
+        destination, remaining = choose_best(native, account.name)
+    except SwitchError as exc:
+        return f"{account.name} is out of usage and automatic switching could not continue. {exc}"
+    with store.lock(timeout=5):
+        if not controller_available(store, native.run_id) or (
+            state_path(store, native.run_id, "request").exists()
+        ):
+            return None
+        with store.account_lock(destination, shared=True):
+            native.require_login(destination)
+        run = {"id": native.run_id, "account": account.name}
+        queue(store, run, destination, follow_up=True, automatic=True)
+    return (
+        f"{account.name} is out of usage. Switching to {destination.name} "
+        f"({remaining:g}% remaining) and sending “{CONTINUE_PROMPT}”."
     )
 
 
@@ -250,7 +329,9 @@ def finish(
                 "Saved history and the default account are unchanged."
             )
         try:
-            account = store.account(json.loads(path.read_text())["account"])
+            request = json.loads(path.read_text())
+            account = store.account(request["account"])
+            follow_up = request.get("continue") is True
             session_id = json.loads(state_path(store, native.run_id, "exit").read_text())[
                 "session_id"
             ]
@@ -265,7 +346,8 @@ def finish(
             raise SwitchError(
                 "The exit conversation belongs to another folder; nothing was resumed."
             )
-        return account.name, (*options, "--resume", session_id)
+        prompt = ("--", CONTINUE_PROMPT) if follow_up else ()
+        return account.name, (*options, "--resume", session_id, *prompt)
 
 
 def recovery_command(account: str, arguments: tuple[str, ...]) -> str:

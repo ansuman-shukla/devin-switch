@@ -60,8 +60,19 @@ def parser() -> argparse.ArgumentParser:
         ),
     )
     switch.add_argument("account", nargs="?")
+    switch.add_argument(
+        "--continue",
+        dest="follow_up",
+        action="store_true",
+        help=f"After reopening, send “{handoff.CONTINUE_PROMPT}” so the agent resumes its work",
+    )
     switch.add_argument("--session", help="Target an exact live Switch-managed GUI conversation")
     switch.add_argument("--cancel", action="store_true", help="Cancel a pending switch")
+    auto = commands.add_parser(
+        "auto-switch",
+        help="Show or set automatic switching when a chat runs out of usage",
+    )
+    auto.add_argument("state", nargs="?", choices=("on", "off"))
     close = commands.add_parser("close", help="Release a saved GUI chat's process when idle")
     close.add_argument("--run", required=True, help="Exact launch ID from ds sessions --gui")
     commands.add_parser("list", help="List registered accounts and the current selection")
@@ -194,7 +205,9 @@ def execute(args: argparse.Namespace, store: Store) -> int:
                         with store.lock(timeout=5):
                             handoff.enable(store, account)
                         print(
-                            "Low on usage? !ds switch resumes here with the best available login.",
+                            "Low on usage? !ds switch resumes here with the best available login; "
+                            "add --continue to keep working."
+                            + (" Auto-switch is on." if handoff.auto_switch_enabled(store) else ""),
                             file=sys.stderr,
                             flush=True,
                         )
@@ -207,17 +220,32 @@ def execute(args: argparse.Namespace, store: Store) -> int:
                 return code
             name, arguments = next_launch
             native = replace(native, select_on_start=True)
+            follow_up = (
+                f"Sending “{handoff.CONTINUE_PROMPT}” so the agent picks up where it left off."
+                if arguments[-2:] == ("--", handoff.CONTINUE_PROMPT)
+                else "No prompt is replayed. Send your next message when ready."
+            )
             print(
                 f"Reopening with {name}; this becomes the default for new chats on launch.\n"
-                "No prompt is replayed. Send your next message when ready.\n"
+                f"{follow_up}\n"
                 f"If reopening fails: {handoff.recovery_command(name, arguments)}",
                 file=sys.stderr,
                 flush=True,
             )
+    if args.command == "auto-switch":
+        if args.state:
+            handoff.set_auto_switch(store, args.state == "on")
+        print(handoff.auto_switch_status(store))
+        return 0
     if args.command == "switch":
-        if args.account and args.cancel:
-            raise SwitchError("Use an account alias or --cancel, not both.")
+        if args.cancel and (args.account or args.follow_up):
+            raise SwitchError("Use an account alias or --continue, or --cancel, not both.")
         if args.session is not None or os.environ.get("DS_ACP_RUN_ID"):
+            if args.follow_up:
+                raise SwitchError(
+                    "In a GUI chat, type /switch-continue [ALIAS]; queued GUI handoffs "
+                    "never send prompts."
+                )
             from devin_switch import acp_state
 
             print(
@@ -243,10 +271,11 @@ def execute(args: argparse.Namespace, store: Store) -> int:
             run = handoff.current(store)
             with store.account_lock(account, shared=True):
                 native.require_login(account)
-                handoff.queue(store, run, account)
+                handoff.queue(store, run, account, follow_up=args.follow_up)
         print(
             f"Switching {run['account']} → {account.name} ({detail}).\n"
-            "Reopening here automatically and setting this account as the app's default.",
+            "Reopening here automatically and setting this account as the app's default."
+            + (f" Then sending “{handoff.CONTINUE_PROMPT}”." if args.follow_up else ""),
             flush=True,
         )
         return 0

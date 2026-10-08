@@ -126,6 +126,13 @@ that profile. Paste the token **only into the native CLI's Terminal prompt**—n
 an issue, screenshot, README, or chat. Switch does not collect it in its own prompts.
 For native default-browser login instead, use `ds login work --default-browser`.
 
+### Enroll a batch of Team seats
+
+To add many plus-address seats (`you+1@gmail.com`, `you+2@gmail.com`, …) at once, follow
+[docs/enrolling-accounts.md](docs/enrolling-accounts.md). `scripts/enroll_accounts.py`
+creates the Chrome profiles and aliases and drives each sign-in through your local Chrome,
+typing login codes straight into `ds login` without displaying them.
+
 ### Switch inside a chat when an account runs out
 
 Start your chat with `ds run` as usual. When you hit a limit, enter this at the chat prompt:

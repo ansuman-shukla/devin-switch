@@ -148,7 +148,9 @@ def choose_best(
     native: Native, current_account: str, exclude: frozenset[str] = frozenset()
 ) -> tuple[Account, float]:
     store = native.store
-    with store.lock():
+    # Wait briefly: other windows take this lock to open chats, and failing here makes
+    # the relay hand the quota error to the agent.
+    with store.lock(timeout=5):
         accounts = [
             account
             for account in store.accounts()

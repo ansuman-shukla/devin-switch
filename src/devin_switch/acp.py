@@ -57,6 +57,7 @@ LIVE_CONTROLS = {
     "session/set_mode",
     "session/set_model",
     "_cognition.ai/command/revise",
+    "_cognition.ai/subagent/cancel",
 }
 OPENING = {"session/new", "session/load"}
 BACKGROUND_UPDATES = {

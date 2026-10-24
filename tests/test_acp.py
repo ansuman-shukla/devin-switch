@@ -1172,6 +1172,26 @@ def test_gui_reload_does_not_duplicate_a_replayed_background_subagent(
     asyncio.run(scenario())
 
 
+def test_gui_stop_subagent_reaches_the_native_during_a_turn(acp_native, tmp_path):
+    async def scenario():
+        async with connect(acp_native) as client:
+            session_id = await client.new(tmp_path)
+            turn = asyncio.create_task(client.prompt(session_id, "busy"))
+            await wait_for_text(client, "live progress")
+            stop = client.request(
+                "_cognition.ai/subagent/cancel", {"sessionId": session_id, "agentId": "bg1"}
+            )
+            assert "result" in await asyncio.wait_for(stop, 5)
+            assert not turn.done()
+            assert "_cognition.ai/subagent/cancel" in [
+                call["method"] for call in logged(acp_native)
+            ]
+            await client.send({"method": "session/cancel", "params": {"sessionId": session_id}})
+            assert (await turn)["result"]["stopReason"] == "cancelled"
+
+    asyncio.run(scenario())
+
+
 def test_gui_switch_preserves_workspace_and_mcp_context_without_persisting_it(
     acp_native, tmp_path, monkeypatch
 ):

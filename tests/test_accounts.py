@@ -8,6 +8,7 @@ from pathlib import Path
 import pytest
 
 from devin_switch import cli, handoff
+from devin_switch import native as native_module
 from devin_switch.native import AUTH_ENVIRONMENT, Native
 from devin_switch.store import Store, SwitchError, validate_name
 
@@ -336,6 +337,29 @@ def test_zero_exit_status_is_not_proof_of_authentication(native: Native) -> None
     native.store.credentials(first).write_text("expired-or-invalid")
     assert native.capture(first, ("auth", "status")) == "Not logged in.\n"
     assert native.authenticated(first) is False
+
+
+def test_confirmed_login_is_reused_until_credentials_change(native: Native, monkeypatch) -> None:
+    first = native.store.account("ansuman-1")
+    credentials = native.store.credentials(first)
+    credentials.write_text("valid-first")
+    checks = []
+    capture = Native.capture
+    monkeypatch.setattr(
+        Native,
+        "capture",
+        lambda self, *args, **kw: checks.append(args) or capture(self, *args, **kw),
+    )
+    assert native.authenticated(first) and native.authenticated(first)
+    assert len(checks) == 1
+    credentials.write_text("expired-first")
+    assert native.authenticated(first) is False
+    assert native.authenticated(first) is False
+    assert len(checks) == 3
+    credentials.write_text("valid-again")
+    monkeypatch.setattr(native_module, "LOGIN_CHECK_TTL", 0)
+    assert native.authenticated(first) and native.authenticated(first)
+    assert len(checks) == 5
 
 
 def test_linked_credentials_rejected(native: Native, tmp_path: Path) -> None:

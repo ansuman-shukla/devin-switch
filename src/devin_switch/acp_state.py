@@ -122,6 +122,53 @@ def queue_close(store: Store, run_id: str) -> str:
     )
 
 
+def request_handover(store: Store, session_id: str, own: set[str]) -> tuple[list[str], list[str]]:
+    """Ask other windows' GUI connections holding this conversation to release it when idle.
+
+    Returns the runs newly asked to close and every live GUI run to wait for. Terminal
+    launches, older bridges without lifecycle sidecars and runs with a pending switch are
+    left alone, so their usual duplicate-launch error still applies.
+    """
+    asked, holders = [], []
+    with store.lock(timeout=5):
+        for run in sessions.runs(store):
+            if (
+                not run["active"]
+                or run["kind"] != "chat"
+                or run["session_id"] != session_id
+                or run["id"] in own
+            ):
+                continue
+            try:
+                state = lifecycle(store, run["id"])
+            except SwitchError:
+                continue
+            if state is None or request_path(store, run["id"]).exists():
+                continue
+            if state == "open":
+                set_lifecycle(store, run["id"], "close_requested")
+                asked.append(run["id"])
+            holders.append(run["id"])
+    return asked, holders
+
+
+def held(store: Store, session_id: str, holders: list[str]) -> bool:
+    return any(
+        run["active"] and run["id"] in holders and run["session_id"] == session_id
+        for run in sessions.runs(store)
+    )
+
+
+def cancel_handover(store: Store, asked: list[str]) -> None:
+    with store.lock(timeout=5):
+        for run_id in asked:
+            try:
+                if lifecycle(store, run_id) == "close_requested":
+                    set_lifecycle(store, run_id, "open")
+            except SwitchError:
+                continue
+
+
 def check_switchable(store: Store, run_id: str) -> None:
     if lifecycle(store, run_id) not in (None, "open"):
         raise SwitchError(

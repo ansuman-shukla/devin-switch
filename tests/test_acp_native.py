@@ -3,7 +3,6 @@ import json
 import os
 import sqlite3
 from contextlib import asynccontextmanager
-from datetime import datetime
 from pathlib import Path
 
 import pytest
@@ -114,15 +113,6 @@ def test_installed_acp_shared_history_without_login(
                     item["sessionId"] == "acp-continuity-test"
                     for item in listed["result"]["sessions"]
                 ), listed
-                expected = listed["result"]["sessions"][0]
-                adapted = (await Bridge(native, None).list_sessions({"cwd": str(tmp_path)}))[
-                    "sessions"
-                ][0]
-                for key in ("sessionId", "cwd", "title"):
-                    assert adapted[key] == expected[key]
-                assert datetime.fromisoformat(adapted["updatedAt"]) == datetime.fromisoformat(
-                    expected["updatedAt"]
-                )
 
     asyncio.run(scenario())
 

@@ -448,16 +448,129 @@ def test_terminal_gui_switch_is_queued_until_turn_finishes(acp_native, tmp_path)
     asyncio.run(scenario())
 
 
-def test_gui_duplicate_resume_and_removal_are_blocked(acp_native, tmp_path):
+def test_gui_other_window_takes_over_an_idle_chat_and_hands_it_back(acp_native, tmp_path):
     async def scenario():
         async with connect(acp_native) as first, connect(acp_native) as second:
             session_id = await first.new(tmp_path)
-            blocked = await second.request(
-                "session/load", {"sessionId": session_id, "cwd": str(tmp_path), "mcpServers": []}
+            await first.prompt(session_id, "hello")
+            owner = next(
+                run for run in acp_state.live(acp_native.store) if run["session_id"] == session_id
             )
-            assert "error" in blocked
+            setup = {"sessionId": session_id, "cwd": str(tmp_path), "mcpServers": []}
+            loaded = await second.request("session/load", setup)
+            assert "result" in loaded, loaded
+            live = [
+                run for run in acp_state.live(acp_native.store) if run["session_id"] == session_id
+            ]
+            assert len(live) == 1 and live[0]["id"] != owner["id"]
+            taken = live[0]["id"]
             with pytest.raises(SwitchError, match="in use"):
                 acp_native.store.remove(acp_native.store.account("ansuman-1"))
+            await second.prompt(session_id, "here")
+            assert second.agent_replies()[-1]["session"] == session_id
+            reply = await first.prompt(session_id, "back")
+            assert "result" in reply, reply
+            assert first.agent_replies()[-1]["session"] == session_id
+            live = [
+                run for run in acp_state.live(acp_native.store) if run["session_id"] == session_id
+            ]
+            assert len(live) == 1 and live[0]["id"] not in (owner["id"], taken)
+            prompts = [call for call in logged(acp_native) if call["method"] == "session/prompt"]
+            assert len(prompts) == 3
+
+    asyncio.run(scenario())
+
+
+def test_gui_other_window_leaves_a_busy_chat_alone(acp_native, tmp_path, monkeypatch):
+    monkeypatch.setattr(acp, "HANDOVER_TIMEOUT", 1)
+
+    async def scenario():
+        async with connect(acp_native, auto_respond=False) as first:
+            session_id = await first.new(tmp_path)
+            owner = next(
+                run for run in acp_state.live(acp_native.store) if run["session_id"] == session_id
+            )
+            pending = asyncio.create_task(first.prompt(session_id, "permission"))
+            request = await asyncio.wait_for(first.requests.get(), 5)
+            async with in_process(acp_native) as (second, _):
+                with pytest.raises(SwitchError, match="busy in another Devin window"):
+                    await second.dispatch(
+                        "session/load",
+                        {"sessionId": session_id, "cwd": str(tmp_path), "mcpServers": []},
+                    )
+                assert session_id not in second.chats
+            assert acp_state.lifecycle(acp_native.store, owner["id"]) == "open"
+            response = {"outcome": {"outcome": "selected", "optionId": "reject"}}
+            await first.send({"id": request["id"], "result": response})
+            assert "result" in await pending
+            assert first.agent_replies()[-1]["decision"]["result"] == response
+            await asyncio.sleep(0.3)
+            assert [run["id"] for run in acp_state.live(acp_native.store)] == [owner["id"]]
+
+    asyncio.run(scenario())
+
+
+def test_gui_terminal_launch_of_the_same_chat_still_blocks_gui_load(acp_native, tmp_path):
+    async def scenario():
+        async with connect(acp_native) as first:
+            session_id = await first.new(tmp_path)
+            owner = next(
+                run for run in acp_state.live(acp_native.store) if run["session_id"] == session_id
+            )
+            acp_state.lifecycle_path(acp_native.store, owner["id"]).unlink()
+            async with in_process(acp_native) as (second, _):
+                with pytest.raises(SwitchError, match="already has an open CLI launch"):
+                    await second.dispatch(
+                        "session/load",
+                        {"sessionId": session_id, "cwd": str(tmp_path), "mcpServers": []},
+                    )
+            assert [run["id"] for run in acp_state.live(acp_native.store)] == [owner["id"]]
+
+    asyncio.run(scenario())
+
+
+def test_gui_concurrent_loads_of_one_chat_share_an_agent(acp_native, tmp_path):
+    async def scenario():
+        async with connect(acp_native) as first:
+            session_id = await first.new(tmp_path)
+        async with connect(acp_native) as client:
+            setup = {"sessionId": session_id, "cwd": str(tmp_path), "mcpServers": []}
+            results = await asyncio.gather(
+                client.request("session/load", setup), client.request("session/load", setup)
+            )
+            assert all("result" in result for result in results), results
+            live = [
+                run for run in acp_state.live(acp_native.store) if run["session_id"] == session_id
+            ]
+            assert len(live) == 1
+
+    asyncio.run(scenario())
+
+
+def test_gui_session_list_is_the_natives_own_listing_from_one_reused_agent(
+    acp_native, tmp_path, monkeypatch
+):
+    async def scenario():
+        async with in_process(acp_native) as (bridge, _):
+            created = await bridge.dispatch("session/new", {"cwd": str(tmp_path), "mcpServers": []})
+            params = {
+                "cwd": str(tmp_path),
+                "limit": 1,
+                "_meta": {"cognition.ai/archivedStatus": "ALL"},
+            }
+            first = await bridge.dispatch("session/list", params)
+            second = await bridge.dispatch("session/list", {})
+            assert first["nextCursor"] == "fake-next" and "nextCursor" not in second
+            assert [item["sessionId"] for item in first["sessions"]] == [created["sessionId"]]
+            assert first["sessions"][0]["_meta"] == {"fake/row": True}
+            lists = [call for call in logged(acp_native) if call["method"] == "session/list"]
+            assert len({call["pid"] for call in lists}) == 1
+            bridge.lister.last_activity -= acp.LISTER_IDLE
+            await bridge.close_lister()
+            assert bridge.lister is None
+            await bridge.dispatch("session/list", {})
+            lists = [call for call in logged(acp_native) if call["method"] == "session/list"]
+            assert len({call["pid"] for call in lists}) == 2
 
     asyncio.run(scenario())
 
@@ -1169,6 +1282,7 @@ def test_gui_idle_reconnect_failure_never_sends_prompt(acp_native, tmp_path, mon
                 monkeypatch.setenv("FAKE_FAIL_LOAD_ACCOUNT", "ansuman-1")
             if reason == "ignored_settings":
                 monkeypatch.setenv("FAKE_IGNORE_CONFIG_ACCOUNT", "ansuman-1")
+            monkeypatch.setattr(acp, "HANDOVER_TIMEOUT", 0.5)
             async with in_process(acp_native) as (other, _):
                 if reason == "duplicate":
                     await other.dispatch("session/load", chat.setup)

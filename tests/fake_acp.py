@@ -371,9 +371,11 @@ async def handle(message):
     elif method == "session/list":
         result = {
             "sessions": [
-                {"sessionId": row[0], "cwd": row[2], "title": row[1]}
+                {"sessionId": row[0], "cwd": row[2], "title": row[1], "_meta": {"fake/row": True}}
                 for row in connection.execute("SELECT * FROM sessions")
-            ]
+                if not params.get("cwd") or row[2] == params["cwd"]
+            ],
+            **({"nextCursor": "fake-next"} if params.get("limit") else {}),
         }
     if "id" in message:
         emit({"id": message["id"], "result": result})

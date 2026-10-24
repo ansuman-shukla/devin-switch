@@ -7,7 +7,6 @@ import sys
 import time
 from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass, field
-from datetime import UTC, datetime
 from pathlib import Path
 
 from devin_switch import acp_state, handoff, relay, sessions
@@ -19,6 +18,8 @@ LIFECYCLE_TIMEOUT = 30
 SHUTDOWN_TIMEOUT = 10
 IDLE_TIMEOUT = 15 * 60
 IDLE_RECHECK = 30
+HANDOVER_TIMEOUT = 10
+LISTER_IDLE = 60
 LOCAL_COMMANDS = [
     {
         "name": "switch",
@@ -58,6 +59,10 @@ BACKGROUND_UPDATES = {
     "session_info_update",
     "usage_update",
 }
+BUSY_ELSEWHERE = (
+    "This chat is busy in another Devin window. Let its turn finish or stop it there, "
+    "then open it here again."
+)
 BLANK_RELEASED = (
     "This empty chat was closed after 15 idle minutes to free its agent. Nothing was sent "
     "to the model; start a new chat."
@@ -422,6 +427,9 @@ class Bridge:
         self.tasks = set()
         self.queued = set()
         self.releasing = set()
+        self.opening = {}
+        self.lister = None
+        self.listing = asyncio.Lock()
 
     def spawn(self, coroutine):
         task = asyncio.create_task(coroutine)
@@ -539,10 +547,8 @@ class Bridge:
             self.initialization = copy.deepcopy(params)
             self.initialization["protocolVersion"] = 1
             probe = Backend(self, self.default_account(), Path.cwd(), chat=False)
-            try:
-                result = await probe.start()
-            finally:
-                await probe.close()
+            result = await probe.start()
+            self.lister = probe
             result["authMethods"] = []
             result["agentInfo"] = {
                 "name": "devin-switch",
@@ -683,25 +689,50 @@ class Bridge:
         return result
 
     async def list_sessions(self, params):
-        history = await asyncio.to_thread(sessions.history, self.native.store)
-        items = []
-        for item in history:
-            if params.get("cwd") and item["project"] != params["cwd"]:
-                continue
-            timestamp = item["last_activity_at"]
-            if timestamp > 100_000_000_000:
-                timestamp /= 1000
-            items.append(
-                {
-                    "sessionId": item["id"],
-                    "cwd": item["project"],
-                    "title": item["title"] or "Untitled chat",
-                    "updatedAt": datetime.fromtimestamp(timestamp, UTC).isoformat(),
-                }
-            )
-        return {"sessions": items}
+        """Let the native list shared history: Desktop needs its filters, paging and _meta."""
+        async with self.listing:
+            lister = self.lister
+            if lister is None or lister.process.poll() is not None or lister.writer.is_closing():
+                self.lister = None
+                if lister:
+                    await lister.close()
+                lister = Backend(self, self.default_account(), Path.cwd(), chat=False)
+                await lister.start()
+                self.lister = lister
+        return await lister.request("session/list", params, LIFECYCLE_TIMEOUT)
+
+    async def close_lister(self):
+        async with self.listing:
+            lister = self.lister
+            if (
+                lister
+                and not lister.pending
+                and time.monotonic() - lister.last_activity >= LISTER_IDLE
+            ):
+                self.lister = None
+                await lister.close()
+
+    async def claim(self, session_id):
+        """Take a saved conversation over from another window's idle GUI connection."""
+        store = self.native.store
+        own = {backend.lease.run.id for backend in self.backends if backend.lease}
+        asked, holders = await asyncio.to_thread(acp_state.request_handover, store, session_id, own)
+        deadline = time.monotonic() + HANDOVER_TIMEOUT
+        while holders and await asyncio.to_thread(acp_state.held, store, session_id, holders):
+            if time.monotonic() >= deadline:
+                await asyncio.to_thread(acp_state.cancel_handover, store, asked)
+                raise SwitchError(BUSY_ELSEWHERE)
+            await asyncio.sleep(0.2)
 
     async def open_session(self, method, params):
+        if method == "session/new":
+            return await self.open_once(method, params)
+        # Desktop retries a slow load; let the retry reuse the first load's agent.
+        acp_state.session_key(params.get("sessionId"))
+        async with self.opening.setdefault(params["sessionId"], asyncio.Lock()):
+            return await self.open_once(method, params)
+
+    async def open_once(self, method, params):
         cwd = params.get("cwd")
         if not isinstance(cwd, str) or not Path(cwd).is_absolute() or not Path(cwd).is_dir():
             raise RpcError("Choose an existing absolute project directory.", -32602)
@@ -748,6 +779,8 @@ class Bridge:
                 or self.default_account()
             )
         )
+        if session_id:
+            await self.claim(session_id)
         backend = Backend(self, account, project, session_id)
         backend.suppress_replay = method == "session/resume"
         try:
@@ -931,6 +964,7 @@ class Bridge:
         candidate.suppress_replay = not replay
         stage = "starting the native agent"
         try:
+            await self.claim(chat.session_id)
             await candidate.start()
             stage = "loading the saved conversation"
             result = await candidate.request("session/load", setup, LIFECYCLE_TIMEOUT)
@@ -1194,6 +1228,12 @@ class Bridge:
 
     async def poll(self):
         while True:
+            if (
+                self.lister
+                and not self.listing.locked()
+                and time.monotonic() - self.lister.last_activity >= LISTER_IDLE
+            ):
+                self.spawn(self.close_lister())
             for chat in list(self.chats.values()):
                 if chat.suspended:
                     continue

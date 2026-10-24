@@ -25,6 +25,7 @@ HOOK_COMMAND = (
 )
 HOOK = {"matcher": "", "hooks": [{"type": "command", "command": HOOK_COMMAND, "timeout": 5}]}
 CONTINUE_PROMPT = "continue"
+CHECK_BATCH = 4
 
 
 def settings_path(store: Store) -> Path:
@@ -163,15 +164,28 @@ def choose_best(
         except SwitchError:
             return None
 
-    with ThreadPoolExecutor(max_workers=4) as executor:
-        available = [result for result in executor.map(check, accounts) if result is not None]
-    for account, remaining in sorted(available, key=lambda result: (-result[1], result[0].name)):
-        try:
-            with store.account_lock(account, shared=True):
-                if native.authenticated(account):
-                    return account, remaining
-        except SwitchError:
-            continue
+    # Refreshing every login takes ~35 s with 126 of them, while the relay holds the
+    # request that ran out. Take the next login that confirms credits instead of the best
+    # one: saved readings (of any age) only decide the order, a few fresh checks at a time.
+    now = time.time()
+    hints = {
+        account.name: usage.cached_remaining(usage.read_cached(store, account, now=now), now=now)
+        for account in accounts
+    }
+    # Known-exhausted logins go after unknown ones, which may have reset or been unused.
+    accounts.sort(key=lambda account: (-(hints[account.name] or -2), account.name))
+    with ThreadPoolExecutor(max_workers=CHECK_BATCH) as executor:
+        for start in range(0, len(accounts), CHECK_BATCH):
+            for result in executor.map(check, accounts[start : start + CHECK_BATCH]):
+                if result is None:
+                    continue
+                account, remaining = result
+                try:
+                    with store.account_lock(account, shared=True):
+                        if native.authenticated(account):
+                            return account, remaining
+                except SwitchError:
+                    continue
     raise SwitchError(
         "No other saved login has confirmed remaining usage. This chat is unchanged. "
         "If usage is unavailable, choose an account explicitly: !ds switch ALIAS."

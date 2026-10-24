@@ -219,6 +219,28 @@ def remaining_allowance(reading: Usage, *, now: float | None = None) -> float | 
         return None
 
 
+def cached_remaining(reading: Usage, *, now: float | None = None) -> float:
+    """A ranking hint from a saved reading of any age; never proof of availability.
+
+    Windows that have reset since the reading count as full; unknown readings rank last.
+    """
+    now = time.time() if now is None else now
+    remaining = []
+    try:
+        for window in (reading.daily, reading.weekly):
+            if window.state == "not_applicable":
+                continue
+            if window.resets_at is not None and finite_number(window.resets_at) <= now:
+                remaining.append(100.0)
+            elif window.state == "available" and window.used_percent is not None:
+                remaining.append(100 - finite_number(window.used_percent))
+            else:
+                return -1.0
+    except ValueError:
+        return -1.0
+    return min(remaining) if remaining else -1.0
+
+
 def refresh_account(store: Store, account: Account, *, force: bool = False) -> Usage:
     now = time.time()
     previous = read_cached(store, account, now=now)

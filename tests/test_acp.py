@@ -1554,7 +1554,7 @@ def test_gui_quota_exhaustion_switches_and_continues_in_the_same_turn(
             assert acp_native.store.selected().name == "ansuman-2"
             assert prompts(acp_native) == [("ansuman-1", "work"), ("ansuman-2", "continue")]
             text = json.dumps(messages)
-            assert "ansuman-1 is out of usage" in text and "Sending" in text
+            assert "Out of usage on ansuman-1" in text and "Sending" in text
             assert chat.controls is None and not chat.gate.locked()
 
     asyncio.run(scenario())
@@ -1909,6 +1909,39 @@ def test_gui_relay_returns_quota_unchanged_when_it_cannot_rotate(
             assert store.selected().name == "ansuman-1"
             assert acp_state.bound_account(store, session_id).name == "ansuman-1"
             assert prompts(acp_native) == [("ansuman-1", "infer")]
+
+    asyncio.run(scenario())
+
+
+def test_gui_quota_that_reaches_the_agent_continues_in_the_same_process(
+    acp_native, relayed, tmp_path, monkeypatch
+):
+    store = acp_native.store
+    monkeypatch.setattr(usage, "refresh_account", fresh_usage(exhausted={"ansuman-1"}))
+    # The relay cannot replay this request, so the agent sees the quota error itself.
+    monkeypatch.setattr(acp.relay, "ROTATION_LIMIT", 0)
+    relayed.exhausted = {"ansuman-1"}
+
+    async def scenario():
+        async with in_process(acp_native) as (bridge, messages):
+            created = await bridge.dispatch("session/new", {"cwd": str(tmp_path), "mcpServers": []})
+            session_id = created["sessionId"]
+            backend = bridge.chats[session_id].backend
+            result = await bridge.dispatch("session/prompt", prompt_params(session_id, "infer"))
+            assert result == {"stopReason": "end_turn"}
+            assert bridge.chats[session_id].backend is backend
+            assert backend.account.name == backend.relay.active.account.name == "ansuman-2"
+            assert acp_state.bound_account(store, session_id).name == "ansuman-2"
+            await bridge.dispatch("session/prompt", prompt_params(session_id, "infer"))
+            assert relayed.inference()[-1] == ("ansuman-2", "ansuman-2")
+            calls = [call for call in logged(acp_native) if call["text"] is not None]
+            assert [call["text"] for call in calls] == ["infer", "continue", "infer"]
+            assert len({call["pid"] for call in calls}) == 1
+            text = json.dumps(messages)
+            assert "Out of usage on ansuman-1. Continuing on ansuman-2 in the same agent" in text
+            log = (store.root / "logs" / "relay.log").read_text()
+            assert "quota passed to the agent" in log and "recover ansuman-1 -> ansuman-2" in log
+            assert all(relay_key not in log for relay_key in relayed.keys)
 
     asyncio.run(scenario())
 

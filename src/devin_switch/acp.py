@@ -245,7 +245,9 @@ class Backend:
         """Route the native's API traffic through a relay that can change logins in place."""
         self.loop = asyncio.get_running_loop()
         self.relay = relay.Relay(
-            issued, lambda current, tried: self.bridge.rotate(self, issued, current, tried)
+            issued,
+            lambda current, tried: self.bridge.rotate(self, issued, current, tried),
+            self.bridge.native.store.root / "logs" / "relay.log",
         )
         try:
             await self.request(
@@ -660,10 +662,31 @@ class Bridge:
                 if error:
                     raise error
                 return result
+            if backend.relay:
+                tried |= backend.relay.recently_exhausted()
+            spent = ", ".join(sorted(tried)) or backend.account.name
+            if backend.relay and backend.process.poll() is None:
+                # Subagents live only in this process: continue in it on another login.
+                try:
+                    login = await asyncio.to_thread(backend.relay.recover, frozenset(tried))
+                except (SwitchError, OSError):
+                    login = None
+                if login is not None:
+                    backend.account = login.account
+                    tried.add(login.account.name)
+                    await self.note(
+                        chat.session_id,
+                        f"Out of usage on {spent}. Continuing on {login.account.name} in the "
+                        "same agent, so subagents keep running. "
+                        f"Sending “{handoff.CONTINUE_PROMPT}”…",
+                    )
+                    if chat.canceled:
+                        return {"stopReason": "cancelled"}
+                    params = continue_params(chat.session_id)
+                    continue
             await self.note(
                 chat.session_id,
-                f"{backend.account.name} is out of usage. Auto-switch is on; "
-                "choosing another saved login…",
+                f"Out of usage on {spent}. Auto-switch is on; restarting on another saved login…",
             )
             try:
                 await self.switch(chat, None, exclude=frozenset(tried), follow_up=True)
@@ -1046,6 +1069,7 @@ class Bridge:
 
     async def switch(self, chat, account_name, *, exclude=frozenset(), follow_up=False):
         old = chat.backend
+        source = old.account
         store = self.native.store
         if old.process.poll() is not None or old.writer.is_closing():
             raise SwitchError(
@@ -1060,9 +1084,10 @@ class Bridge:
         else:
             await self.note(chat.session_id, "Checking saved accounts for remaining usage…")
             account, _ = await asyncio.to_thread(
-                handoff.choose_best, self.native, old.account.name, exclude
+                handoff.choose_best, self.native, source.name, exclude
             )
-        if account.name == old.account.name:
+        # The relay may have moved this chat to another login meanwhile.
+        if account.name in (source.name, old.account.name):
             raise SwitchError("This GUI chat already uses that account.")
         await asyncio.to_thread(acp_state.check_login, self.native, account)
         await asyncio.to_thread(
@@ -1114,7 +1139,7 @@ class Bridge:
         await self.publish_settings(chat)
         await self.note(
             chat.session_id,
-            f"Switched {old.account.name} → {account.name}. Same conversation; "
+            f"Switched {source.name} → {account.name}. Same conversation; "
             "desktop login and other chats are unchanged. "
             + (
                 f"Sending “{handoff.CONTINUE_PROMPT}”…"

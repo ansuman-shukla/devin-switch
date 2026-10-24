@@ -16,15 +16,20 @@ import re
 import ssl
 import sys
 import threading
+import time
 import tomllib
 from collections.abc import Callable
 from dataclasses import dataclass
+from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
 from urllib.parse import urlsplit
 
 from devin_switch.store import Account, Store
 
 ROTATION_LIMIT = 3
+EXHAUSTED_MEMORY = 600
+LOG_LIMIT = 1_000_000
 UPSTREAM_TIMEOUT = 300
 CHUNK = 64 * 1024
 END_STREAM = 0x02
@@ -111,17 +116,68 @@ def first_frame(response: http.client.HTTPResponse) -> bytes:
 
 
 class Relay:
-    def __init__(self, issued: Login, rotate: Callable[[Login, frozenset[str]], Login | None]):
+    def __init__(
+        self,
+        issued: Login,
+        rotate: Callable[[Login, frozenset[str]], Login | None],
+        log: Path | None = None,
+    ):
         self.issued = issued
         self.active = issued
         self.rotate = rotate
+        self.log = log
         self.lock = threading.Lock()
+        self.log_lock = threading.Lock()
+        self.exhausted: dict[str, float] = {}
         self.server = Server(self)
         threading.Thread(target=self.server.serve_forever, name="ds-relay", daemon=True).start()
 
     @property
     def url(self) -> str:
         return f"http://127.0.0.1:{self.server.server_address[1]}"
+
+    def record(self, event: str) -> None:
+        """Append a key-free line to the relay log: endpoint names, statuses and aliases only."""
+        if self.log is None:
+            return
+        line = f"{datetime.now().isoformat(timespec='milliseconds')} {event}\n"
+        with self.log_lock:
+            try:
+                self.log.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+                if self.log.exists() and self.log.stat().st_size > LOG_LIMIT:
+                    self.log.replace(self.log.with_suffix(".log.1"))
+                with open(self.log, "a") as handle:
+                    handle.write(line)
+            except OSError:
+                pass
+
+    def mark_exhausted(self, name: str) -> None:
+        with self.lock:
+            self.exhausted[name] = time.monotonic()
+
+    def recently_exhausted(self) -> frozenset[str]:
+        now = time.monotonic()
+        return frozenset(
+            name for name, seen in self.exhausted.items() if now - seen < EXHAUSTED_MEMORY
+        )
+
+    def recover(self, tried: frozenset[str]) -> Login | None:
+        """After a quota error reached the native: a login to continue on in the same process.
+
+        Keeps the active login when the relay already moved past every exhausted one, and
+        otherwise rotates to the next login with credits.
+        """
+        with self.lock:
+            tried = tried | self.recently_exhausted()
+            if self.active.account.name not in tried:
+                return self.active
+            replacement = self.rotate(self.active, tried)
+            if replacement is None or not compatible(self.issued, replacement):
+                self.record(f"recover failed tried={','.join(sorted(tried))}")
+                return None
+            self.record(f"recover {self.active.account.name} -> {replacement.account.name}")
+            self.active = replacement
+            return replacement
 
     def advance(self, tried: frozenset[str]) -> Login | None:
         """The login to replay with after every login in `tried` reported exhausted usage."""
@@ -130,16 +186,28 @@ class Relay:
             if current.account.name not in tried:
                 return current
             if len(tried) > ROTATION_LIMIT:
+                self.record(f"rotation limit reached tried={','.join(sorted(tried))}")
                 return None
+            started = time.monotonic()
             replacement = self.rotate(current, tried)
             if replacement is None or not compatible(self.issued, replacement):
+                self.record(f"rotate from {current.account.name} failed")
                 return None
+            self.record(
+                f"rotate {current.account.name} -> {replacement.account.name} "
+                f"in {time.monotonic() - started:.1f}s"
+            )
             self.active = replacement
             return replacement
 
     def close(self) -> None:
         self.server.shutdown()
         self.server.server_close()
+
+
+def endpoint(path: str) -> str:
+    """The RPC method name of a request path, without query strings."""
+    return path.split("?", 1)[0].rsplit("/", 1)[-1][:80]
 
 
 class Server(ThreadingHTTPServer):
@@ -184,11 +252,16 @@ class Handler(BaseHTTPRequestHandler):
             streaming = (response.getheader("Content-Type") or "").startswith("application/connect")
             head = first_frame(response) if streaming else b""
             if head and quota_frame(head, response.getheader("Connect-Content-Encoding")):
+                relay.mark_exhausted(login.account.name)
+                relay.record(f"quota {login.account.name} {endpoint(self.path)}")
                 replacement = relay.advance(frozenset(tried))
                 if replacement is not None:
                     connection.close()
                     login = replacement
                     continue
+                relay.record(f"quota passed to the agent {endpoint(self.path)}")
+            elif response.status >= 400:
+                relay.record(f"status {response.status} {login.account.name} {endpoint(self.path)}")
             break
         try:
             self.pass_through(response, head)

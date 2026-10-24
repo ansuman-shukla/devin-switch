@@ -4,6 +4,7 @@ import os
 import sqlite3
 import subprocess
 import sys
+from dataclasses import asdict
 from pathlib import Path
 
 import pytest
@@ -413,33 +414,56 @@ def test_hook_command_quotes_runtime_and_noops_outside_switch(tmp_path, frozen):
     assert result.stdout.splitlines() == expected
 
 
-def test_best_account_uses_limiting_quota_not_alphabetical_order(signed_in, monkeypatch):
+def test_next_account_with_credits_is_chosen_without_checking_the_rest(signed_in, monkeypatch):
     import time
 
     store = signed_in.store
     with store.lock():
-        third = store.add("ansuman-3", None)
-    store.credentials(third).write_text("valid-third")
+        extra = [store.add(f"ansuman-{number}", None) for number in range(3, 12)]
+    for account in extra:
+        store.credentials(account).write_text(f"valid-{account.name}")
+    now = time.time()
+
+    def saved(account, used):
+        reading = usage.Usage(
+            status="ok",
+            daily=usage.Window(used, now + 1000, "available"),
+            weekly=usage.Window(used, now + 1000, "available"),
+            fetched_at=now - 3600,
+            checked_at=now - 3600,
+        )
+        (store.directory(account.name) / "usage.json").write_text(
+            json.dumps(
+                {
+                    "credential_fingerprint": usage.fingerprint(
+                        usage.credential_bytes(store, account)
+                    ),
+                    "usage": asdict(reading),
+                }
+            )
+        )
+
+    # Saved (stale) readings only order the checks: exhausted and unknown logins go last.
+    saved(store.account("ansuman-2"), 100)
+    saved(store.account("ansuman-7"), 10)
+    saved(store.account("ansuman-9"), 50)
     checked = []
 
     def refresh(store, account, *, force):
         assert force
-        if account.name == "ansuman-2":
-            with store.lock():
-                pass
         checked.append(account.name)
-        now = time.time()
-        used = (0, 95) if account.name == "ansuman-2" else (35, 40)
+        used = {"ansuman-9": 100, "ansuman-7": 60}.get(account.name, 0)
         return usage.Usage(
             status="ok",
-            daily=usage.Window(used[0], now + 1000, "available"),
-            weekly=usage.Window(used[1], now + 1000, "available"),
-            fetched_at=now,
+            daily=usage.Window(used, time.time() + 1000, "available"),
+            weekly=usage.Window(used, time.time() + 1000, "available"),
+            fetched_at=time.time(),
         )
 
     monkeypatch.setattr(usage, "refresh_account", refresh)
-    assert handoff.choose_best(signed_in, "ansuman-1") == (third, 60)
-    assert set(checked) == {"ansuman-2", "ansuman-3"}
+    account, remaining = handoff.choose_best(signed_in, "ansuman-1")
+    assert (account.name, remaining) == ("ansuman-7", 40)
+    assert sorted(checked) == ["ansuman-10", "ansuman-11", "ansuman-7", "ansuman-9"]
 
 
 @pytest.mark.parametrize("status", ["stale", "unavailable", "sign_in"])

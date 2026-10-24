@@ -301,13 +301,26 @@ class Lease:
             self.close(ended=True)
             raise
 
-    def attach(self, session_id: str) -> None:
+    def attach(self, session_id: str, project: Path | None = None, *, saved: bool = False) -> None:
+        """Bind this run to a conversation; a warm spare also takes the chat's project.
+
+        `saved` repeats the checks a chat lease makes when created for a saved conversation.
+        """
         session_key(session_id)
         with self.store.lock(timeout=5):
+            if saved:
+                chat = sessions.resumable(self.store, session_id)
+                if project is not None and chat["project"] != str(project):
+                    raise SwitchError("Resume this conversation from its original project.")
             others = [run for run in sessions.runs(self.store) if run["id"] != self.run.id]
             if blocker := sessions.resume_blocker({"id": session_id}, others):
                 raise SwitchError(blocker)
-            self.run = replace(self.run, session_id=session_id)
+            self.run = replace(
+                self.run,
+                session_id=session_id,
+                kind="chat",
+                project=str(project) if project is not None else self.run.project,
+            )
             write_json(self.path, asdict(self.run))
 
     def adopt(self, account: Account) -> None:

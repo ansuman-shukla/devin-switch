@@ -575,6 +575,77 @@ def test_gui_session_list_is_the_natives_own_listing_from_one_reused_agent(
     asyncio.run(scenario())
 
 
+async def warm(bridge):
+    async with asyncio.timeout(10):
+        while bridge.filling or bridge.spare is None:
+            await asyncio.sleep(0.01)
+    return bridge.spare
+
+
+def test_gui_chats_open_on_a_warm_logged_in_agent(acp_native, tmp_path):
+    store = acp_native.store
+
+    async def scenario():
+        async with in_process(acp_native) as (bridge, _):
+            spare = await warm(bridge)
+            assert spare.account.name == "ansuman-1"
+            assert not any(run["kind"] == "chat" for run in sessions.runs(store) if run["active"])
+            created = await bridge.dispatch("session/new", {"cwd": str(tmp_path), "mcpServers": []})
+            session_id = created["sessionId"]
+            assert bridge.chats[session_id].backend is spare
+            run = next(run for run in sessions.runs(store) if run["id"] == spare.lease.run.id)
+            assert (run["kind"], run["project"], run["session_id"]) == (
+                "chat",
+                str(tmp_path),
+                session_id,
+            )
+            replacement = await warm(bridge)
+            assert replacement is not spare
+            await bridge.dispatch("session/close", {"sessionId": session_id})
+            loaded = await bridge.dispatch(
+                "session/load", {"sessionId": session_id, "cwd": str(tmp_path), "mcpServers": []}
+            )
+            assert "configOptions" in loaded
+            assert bridge.chats[session_id].backend is replacement
+            calls = logged(acp_native)
+            loads = [call for call in calls if call["method"] == "session/load"]
+            assert [call["pid"] for call in loads] == [replacement.process.pid]
+            # Another login's chat starts its own agent and leaves the spare for the default.
+            other = await warm(bridge)
+            acp_state.bind(store, session_id, store.account("ansuman-2"))
+            await bridge.dispatch("session/close", {"sessionId": session_id})
+            await bridge.dispatch(
+                "session/load", {"sessionId": session_id, "cwd": str(tmp_path), "mcpServers": []}
+            )
+            assert bridge.chats[session_id].backend.account.name == "ansuman-2"
+            assert bridge.spare is other and other.process.poll() is None
+            other.last_activity -= acp.SPARE_IDLE
+            await bridge.drop_spare()
+            assert bridge.spare is None and other.process.poll() is not None
+
+    asyncio.run(scenario())
+
+
+def test_gui_warm_agent_rechecks_a_saved_chat_before_loading_it(acp_native, tmp_path):
+    async def scenario():
+        async with in_process(acp_native) as (bridge, _):
+            created = await bridge.dispatch("session/new", {"cwd": str(tmp_path), "mcpServers": []})
+            session_id = created["sessionId"]
+            await bridge.dispatch("session/close", {"sessionId": session_id})
+            spare = await warm(bridge)
+            other = tmp_path / "other"
+            other.mkdir()
+            with pytest.raises(SwitchError, match="original project"):
+                await bridge.dispatch(
+                    "session/load", {"sessionId": session_id, "cwd": str(other), "mcpServers": []}
+                )
+            assert spare.process.poll() is not None
+            assert session_id not in bridge.chats
+            assert not any(call["method"] == "session/load" for call in logged(acp_native))
+
+    asyncio.run(scenario())
+
+
 def test_gui_native_crash_is_reported_without_leaking_diagnostics(acp_native, tmp_path):
     async def scenario():
         async with connect(acp_native) as client:
@@ -687,6 +758,10 @@ def test_gui_auto_switch_uses_fresh_quotas_and_bound_account(
     checked = []
 
     def refresh(store, account, *, force):
+        # Other launches may hold the store lock briefly; the caller must not hold it here.
+        deadline = time.monotonic() + 2
+        while store.locked("lock") and time.monotonic() < deadline:
+            time.sleep(0.02)
         assert force and not store.locked("lock")
         checked.append(account.name)
         now = time.time()
@@ -1282,6 +1357,10 @@ def test_gui_idle_reconnect_failure_never_sends_prompt(acp_native, tmp_path, mon
                 monkeypatch.setenv("FAKE_FAIL_LOAD_ACCOUNT", "ansuman-1")
             if reason == "ignored_settings":
                 monkeypatch.setenv("FAKE_IGNORE_CONFIG_ACCOUNT", "ansuman-1")
+            # The warm spare started before the fake CLI's failure switches were set.
+            while bridge.filling:
+                await asyncio.sleep(0.01)
+            await bridge.drop_spare()
             monkeypatch.setattr(acp, "HANDOVER_TIMEOUT", 0.5)
             async with in_process(acp_native) as (other, _):
                 if reason == "duplicate":
@@ -1375,7 +1454,10 @@ def test_gui_idle_releases_blank_chat_without_restarting_it(acp_native, tmp_path
             assert chat.session_id not in bridge.chats
             calls = logged(acp_native)
             assert not any(call["method"] in {"session/prompt", "session/load"} for call in calls)
-            assert len({call["pid"] for call in calls}) == 2
+            sessions_served = {
+                call["pid"] for call in calls if call["method"].startswith("session/")
+            }
+            assert sessions_served == {backend.process.pid}
 
     asyncio.run(scenario())
 
@@ -1508,6 +1590,10 @@ def fresh_usage(exhausted=()):
     import time
 
     def refresh(store, account, *, force):
+        # Other launches may hold the store lock briefly; the caller must not hold it here.
+        deadline = time.monotonic() + 2
+        while store.locked("lock") and time.monotonic() < deadline:
+            time.sleep(0.02)
         assert force and not store.locked("lock")
         now = time.time()
         used = 100 if account.name in exhausted else 20
@@ -1861,7 +1947,9 @@ def test_gui_relay_keeps_subagents_running_when_usage_runs_out_mid_task(
             # One native process and one turn: no restart, no replayed or "continue" prompt.
             assert chat.backend.process.pid == pid
             assert prompts(acp_native) == [("ansuman-1", "subagents")]
-            assert [c["method"] for c in logged(acp_native)].count("authenticate") == 1
+            assert [c["method"] for c in logged(acp_native) if c["pid"] == pid].count(
+                "authenticate"
+            ) == 1
             calls = relayed.inference()
             assert all(header == body for header, body in calls)
             assert calls[0] == ("ansuman-1", "ansuman-1")

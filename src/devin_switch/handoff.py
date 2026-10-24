@@ -362,8 +362,6 @@ def queue_automatic(
             state_path(store, native.run_id, "request").exists()
         ):
             return None
-        with store.account_lock(destination, shared=True):
-            native.require_login(destination)
         run = {"id": native.run_id, "account": account.name}
         queue(store, run, destination, follow_up=True, automatic=True)
     return (

@@ -56,7 +56,7 @@ def test_snapshot_keeps_accounts_when_chrome_profiles_are_not_readable(
     state = desktop.snapshot(signed_in.store)
     assert [account["name"] for account in state["accounts"]] == ["ansuman-1", "ansuman-2"]
     assert state["profiles"] == ()
-    assert "permission" in str(state["chrome_error"]).lower()
+    assert state["chrome_error"] == browser.BLOCKED
 
 
 def test_add_validates_chrome_profile_and_keeps_existing_account(

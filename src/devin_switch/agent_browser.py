@@ -58,6 +58,10 @@ INSTRUCTIONS = (
     "pageId from list_pages/new_page. Call browser_close when the browser work is done. After "
     "idling the browser closes by itself and the next tool call reopens it with fresh pages."
 )
+COPY_HINT = (
+    "Profiles copied earlier keep working; copy another with `ds browser refresh PROFILE` from "
+    "an app that has Full Disk Access."
+)
 NEEDS_PROFILE = (
     "No browser profile is selected and no default is set. Call browser_profile with the "
     "profile to use (email, profile name or directory); call it without arguments to list them."
@@ -130,9 +134,33 @@ def label(profile: browser.ChromeProfile) -> str:
     return f"{profile.directory} ({profile.email or profile.name})"
 
 
-def resolve(query: str) -> browser.ChromeProfile:
+def copied(store: Store) -> tuple[browser.ChromeProfile, ...]:
+    items = []
+    for path in (store.root / "browser/profiles").glob("*/source.json"):
+        try:
+            source = json.loads(path.read_text())
+            if (path.parent / "user-data").is_dir():
+                items.append(
+                    browser.ChromeProfile(
+                        source["directory"], source.get("name", ""), source.get("email", "")
+                    )
+                )
+        except (OSError, ValueError, KeyError, TypeError, AttributeError):
+            continue
+    return tuple(sorted(items, key=lambda item: item.directory))
+
+
+def profiles(store: Store) -> tuple[tuple[browser.ChromeProfile, ...], bool]:
+    """Chrome's profiles, or only the copied ones (flagged True) when macOS blocks Chrome's data."""
+    try:
+        return browser.profiles(), False
+    except browser.ChromeBlocked:
+        return copied(store), True
+
+
+def resolve(store: Store, query: str) -> browser.ChromeProfile:
     wanted = query.strip().casefold()
-    items = browser.profiles()
+    items, blocked = profiles(store)
     for key in (
         lambda item: item.directory.casefold(),
         lambda item: slug(item.directory),
@@ -145,6 +173,10 @@ def resolve(query: str) -> browser.ChromeProfile:
         if matches:
             choices = ", ".join(label(item) for item in matches)
             raise SwitchError(f"{query!r} matches several Chrome profiles: {choices}. Pick one.")
+    if blocked:
+        raise browser.ChromeBlocked(
+            f"{query!r} is not a copied Chrome profile. {browser.BLOCKED} {COPY_HINT}"
+        )
     raise SwitchError(f"No Chrome profile matches {query!r}. List them with: ds browser status")
 
 
@@ -168,13 +200,19 @@ def installed(store: Store) -> bool:
 
 def default_profile(store: Store) -> browser.ChromeProfile | None:
     directory = settings(store).get("default")
-    return resolve(directory) if isinstance(directory, str) else None
+    return resolve(store, directory) if isinstance(directory, str) else None
 
 
 def clone(store: Store, profile: browser.ChromeProfile) -> None:
     source = browser.CHROME_DATA / profile.directory
-    if not source.is_dir():
-        raise SwitchError(f"Chrome's folder for {profile.directory!r} is missing.")
+    try:
+        os.listdir(source)
+    except (FileNotFoundError, NotADirectoryError) as exc:
+        raise SwitchError(f"Chrome's folder for {profile.directory!r} is missing.") from exc
+    except PermissionError as exc:
+        raise browser.ChromeBlocked(
+            f"Cannot copy logins from {label(profile)}. {browser.BLOCKED}"
+        ) from exc
     folder = private_folder(store, profile.directory)
     staging = folder / "user-data.partial"
     shutil.rmtree(staging, ignore_errors=True)
@@ -194,7 +232,12 @@ def clone(store: Store, profile: browser.ChromeProfile) -> None:
     staging.rename(data)
     write_json(
         folder / "source.json",
-        {"directory": profile.directory, "email": profile.email, "cloned_at": time.time()},
+        {
+            "directory": profile.directory,
+            "name": profile.name,
+            "email": profile.email,
+            "cloned_at": time.time(),
+        },
     )
 
 
@@ -470,7 +513,8 @@ class Lease:
 def overview(store: Store, current: browser.ChromeProfile | None = None) -> str:
     default = settings(store).get("default")
     lines = ["Chrome profiles (name one by email, profile name, or directory):"]
-    for profile in browser.profiles():
+    items, blocked = profiles(store)
+    for profile in items:
         cloned = (folder_for(store, profile.directory) / "user-data").is_dir()
         live = running(store, profile.directory) if cloned else None
         tags = [
@@ -488,13 +532,15 @@ def overview(store: Store, current: browser.ChromeProfile | None = None) -> str:
                 f"- {profile.directory}: {profile.name} <{profile.email or 'no account'}>"
                 + (f" [{', '.join(tags)}]" if tags else "")
             )
+    if blocked:
+        lines.append(f"Only copied profiles are listed. {browser.BLOCKED} {COPY_HINT}")
     return "\n".join(lines)
 
 
 def profile_rows(store: Store, attached: browser.ChromeProfile | None = None) -> list[dict]:
     default = settings(store).get("default")
     rows = []
-    for profile in browser.profiles():
+    for profile in profiles(store)[0]:
         folder = folder_for(store, profile.directory)
         cloned = (folder / "user-data").is_dir()
         live = running(store, profile.directory) if cloned else None
@@ -526,7 +572,7 @@ def view(store: Store, stdin=sys.stdin, stdout=sys.stdout) -> None:
         if op == "profiles":
             return {"profiles": profile_rows(store, lease.profile if lease.held else None)}
         if op == "attach":
-            profile = resolve(str(request.get("profile") or ""))
+            profile = resolve(store, str(request.get("profile") or ""))
             message = lease.acquire(profile)
             current = running(store, profile.directory)
             if not current:
@@ -725,7 +771,7 @@ class Proxy:
     async def choose(self, arguments: dict) -> str:
         if not arguments.get("profile"):
             return await asyncio.to_thread(overview, self.store, self.profile)
-        profile = await asyncio.to_thread(resolve, str(arguments["profile"]))
+        profile = await asyncio.to_thread(resolve, self.store, str(arguments["profile"]))
         async with self.lock:
             if isinstance(arguments.get("headed"), bool):
                 self.headed = arguments["headed"]
@@ -852,7 +898,7 @@ def grant(store: Store, account: Account) -> None:
 
 
 def install(store: Store, default: str | None) -> str:
-    chosen = resolve(default) if default else None
+    chosen = resolve(store, default) if default else None
     prefix = command_prefix()
     entry = {"command": prefix[0], "args": [*prefix[1:], "browser", "mcp"]}
     user = user_config_home(store) / "devin"
@@ -897,19 +943,19 @@ def command(args, store: Store) -> int:
     elif args.action == "install":
         print(install(store, args.default))
     elif args.action == "default":
-        profile = resolve(args.profile)
+        profile = resolve(store, args.profile)
         save_settings(store, default=profile.directory)
         print(f"Chats that name no profile now use {label(profile)}.")
     elif args.action == "status":
         print(overview(store))
     elif args.action == "refresh":
-        profile = resolve(args.profile)
+        profile = resolve(store, args.profile)
         if state(store, profile.directory):
             raise SwitchError("That agent browser is running; close it first: ds browser stop.")
         clone(store, profile)
         print(f"Copied current logins from {label(profile)}.")
     elif args.action == "stop":
-        targets = [resolve(args.profile)] if args.profile else browser.profiles()
+        targets = [resolve(store, args.profile)] if args.profile else profiles(store)[0]
         for profile in targets:
             if current := state(store, profile.directory):
                 stop(current)

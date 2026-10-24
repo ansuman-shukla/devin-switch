@@ -292,6 +292,12 @@ The agent never attaches to the Chrome you are using:
   minutes, or when they exit. A supervisor closes the instance about 10 seconds after the last
   chat releases it, and the next browser tool call reopens it with fresh pages.
 
+**macOS 27 and later** only let Chrome itself and apps with Full Disk Access read Chrome's
+profile folder. Agents don't need that access to use profiles Switch already copied: they
+list and open those copies. Copying a profile for the first time (or `ds browser refresh`)
+still reads Chrome's folder, so run it from an app that has Full Disk Access, for example a
+terminal you granted it to.
+
 `ds browser status` lists profiles and running instances, and `ds browser stop` closes them
 immediately. The server runs `npx -y chrome-devtools-mcp@1.10.1`, so Node.js is required.
 

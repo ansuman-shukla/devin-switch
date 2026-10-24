@@ -67,6 +67,27 @@ def infer():
     return data[5 : 5 + int.from_bytes(data[1:5], "big")].decode()
 
 
+def background_started(session_id, agent="bg1", background=True):
+    update(
+        session_id,
+        {
+            "sessionUpdate": "tool_call_update",
+            "toolCallId": agent,
+            "status": "in_progress",
+            "_meta": {
+                "cognition.ai/subagent_started": {
+                    "agentId": agent,
+                    "title": f"Title {agent}",
+                    "task": f"Task for {agent}",
+                    "profile": "subagent_general",
+                    "depth": 0,
+                    "isBackground": background,
+                }
+            },
+        },
+    )
+
+
 def subagent_update(session_id, key, value):
     update(
         session_id,
@@ -205,6 +226,9 @@ async def handle(message):
                     "content": {"type": "text", "text": "historical replay"},
                 },
             )
+            # The native replays foreground subagents only; this stands in for one that doesn't.
+            if os.environ.get("FAKE_REPLAY_BACKGROUND"):
+                background_started(session_id)
         elif not os.environ.get("FAKE_SAVE_ON_PROMPT"):
             connection.execute(
                 "INSERT INTO sessions VALUES (?, ?, ?, ?, 0)",
@@ -295,6 +319,10 @@ async def handle(message):
             )
             emit({"id": message["id"], "result": {"stopReason": "end_turn"}})
             return
+        if text == "background-subagent":
+            background_started(loaded)
+        if text == "foreground-subagent":
+            background_started(loaded, "fg1", background=False)
         if text == "slow":
             await asyncio.sleep(0.5)
         if text == "wait":

@@ -14,7 +14,7 @@ import sqlite3
 import time
 from pathlib import Path
 
-from devin_switch import acp_state
+from devin_switch import acp_state, sessions
 from devin_switch.store import Store, SwitchError, private_directory, write_json
 
 STARTED = "cognition.ai/subagent_started"
@@ -175,6 +175,27 @@ def listing(store: Store, session_id: str) -> list[dict]:
         for agent, info in group.items()
     ]
     return sorted(entries, key=lambda entry: entry["started_at"])
+
+
+def window(store: Store, host: int) -> list[dict]:
+    """Running subagents of the live GUI chats a Desktop window's extension host started."""
+    parents = sessions.process_parents()
+    try:
+        titles = {chat["id"]: chat["title"] or "" for chat in sessions.history(store)}
+    except SwitchError:
+        titles = {}
+    return [
+        {
+            **entry,
+            "project": run["project"],
+            "chat": titles.get(run["session_id"], ""),
+            "recent": progress(store, run["session_id"], entry["id"]),
+        }
+        for run in acp_state.live(store)
+        if sessions.started_by(store, run["id"], host, parents)
+        for entry in listing(store, run["session_id"])
+        if entry["status"] == "running"
+    ]
 
 
 def resume_text(store: Store, session_id: str, agents: dict) -> str:

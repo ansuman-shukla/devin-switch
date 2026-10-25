@@ -58,6 +58,29 @@ def process_started(pid: int) -> str | None:
     return " ".join(fields[:5])
 
 
+def process_parents() -> dict[int, int]:
+    result = subprocess.run(
+        ("/bin/ps", "-axo", "pid=,ppid="), capture_output=True, text=True, timeout=2, check=True
+    )
+    pairs = (line.split() for line in result.stdout.splitlines())
+    return {int(pid): int(ppid) for pid, ppid in pairs}
+
+
+def started_by(store: Store, run_id: str, ancestor: int, parents: dict[int, int]) -> bool:
+    """Whether the run's recorded process descends from `ancestor`, e.g. a Desktop window."""
+    try:
+        pid = json.loads((store.root / "runtime" / f"{run_id}.json").read_text())["pid"]
+    except (OSError, ValueError, KeyError, TypeError):
+        return False
+    seen = set()
+    while type(pid) is int and pid > 1 and pid not in seen:
+        if pid == ancestor:
+            return True
+        seen.add(pid)
+        pid = parents.get(pid)
+    return False
+
+
 def record_process(store: Store, run_id: str, pid: int, *, role: str) -> None:
     directory = store.root / "runtime"
     private_directory(directory)

@@ -109,6 +109,12 @@ def parser() -> argparse.ArgumentParser:
     stop.add_argument("profile", nargs="?")
     actions.add_parser("mcp", help="Serve the browser MCP server over stdio (started by Devin)")
     actions.add_parser("view", help="Serve the Desktop browser panel over stdio (JSON lines)")
+    running = commands.add_parser(
+        "subagents", help="List running subagents of a Desktop window's chats (JSON)"
+    )
+    running.add_argument(
+        "--window", type=int, required=True, help="The window's extension host process ID"
+    )
     chat = commands.add_parser("chat", help="Inspect the Desktop chat this process belongs to")
     chat_actions = chat.add_subparsers(dest="action", required=True, metavar="ACTION")
     chat_actions.add_parser("id", help="Print the conversation id (used by the whiteboard MCP)")
@@ -193,6 +199,11 @@ def execute(args: argparse.Namespace, store: Store) -> int:
         from devin_switch import acp_state
 
         print(acp_state.queue_close(store, args.run))
+        return 0
+    if args.command == "subagents":
+        from devin_switch import subagents
+
+        print(json.dumps({"subagents": subagents.window(store, args.window)}))
         return 0
     if args.command == "sessions" and args.gui:
         from devin_switch import acp_state

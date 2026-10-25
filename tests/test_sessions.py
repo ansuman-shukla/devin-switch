@@ -9,7 +9,7 @@ from pathlib import Path
 
 import pytest
 
-from devin_switch import cli, desktop
+from devin_switch import acp_state, cli, desktop, sessions, subagents
 from devin_switch.native import Native
 from devin_switch.store import Store, SwitchError
 
@@ -506,3 +506,72 @@ def test_process_probe_does_not_count_zombies(monkeypatch):
         ),
     )
     assert sessions.process_started(12345) is None
+
+
+def test_process_parents_reads_the_real_process_tree() -> None:
+    assert sessions.process_parents()[os.getpid()] == os.getppid()
+
+
+def test_started_by_follows_recorded_process_ancestry(store: Store) -> None:
+    run = "a" * 32
+    sessions.record_process(store, run, os.getpid(), role="native")
+    tree = {os.getpid(): 40, 40: 30, 30: 1}
+    assert sessions.started_by(store, run, 30, tree)
+    assert not sessions.started_by(store, run, 99, tree)
+    assert not sessions.started_by(store, run, 30, {os.getpid(): 40, 40: os.getpid()})
+    assert not sessions.started_by(store, "b" * 32, 30, tree)
+
+
+def test_window_lists_only_running_subagents_of_its_own_chats(
+    store: Store,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    tmp_path: Path,
+    save_subagent_transcript,
+) -> None:
+    (store.root / "shared/cli").mkdir(parents=True, exist_ok=True)
+    seed_history(store, tmp_path)
+    here, there, unknown = "a" * 32, "b" * 32, "c" * 32
+    monkeypatch.setattr(
+        acp_state,
+        "live",
+        lambda _: [
+            {"id": here, "session_id": "first-chat", "project": str(tmp_path)},
+            {"id": there, "session_id": "second-chat", "project": "/elsewhere"},
+            {"id": unknown, "session_id": "first-chat", "project": str(tmp_path)},
+        ],
+    )
+    for run, pid in ((here, 300), (there, 301)):
+        sessions.record_process(store, run, os.getpid(), role="native")
+        (store.root / "runtime" / f"{run}.json").write_text(json.dumps({"pid": pid}))
+    tree = {300: 200, 200: 100, 100: 1, 301: 201, 201: 999, 999: 1}
+    monkeypatch.setattr(sessions, "process_parents", lambda: tree)
+    subagents.record(store, "first-chat", subagents.STARTED, {"agentId": "old", "title": "Old"})
+    subagents.interrupt_running(store, "first-chat")
+    started = {"agentId": "ticker", "title": "Ticker", "profile": "general", "isBackground": True}
+    subagents.record(store, "first-chat", subagents.STARTED, started)
+    subagents.record(store, "second-chat", subagents.STARTED, {"agentId": "far", "title": "Far"})
+    save_subagent_transcript(store, "first-chat", "ticker")
+
+    def listed(window: int) -> list[dict]:
+        monkeypatch.setattr(sys, "argv", ["ds", "subagents", "--window", str(window)])
+        assert cli.main() == 0
+        return json.loads(capsys.readouterr().out)["subagents"]
+
+    (entry,) = listed(100)
+    assert {k: entry[k] for k in ("id", "title", "status", "background", "project", "chat")} == {
+        "id": "ticker",
+        "title": "Ticker",
+        "status": "running",
+        "background": True,
+        "project": str(tmp_path),
+        "chat": "First task",
+    }
+    assert entry["last_step"] == "tool: ticker ran the tests: 3 passed"
+    assert entry["recent"] == (
+        'assistant: called exec {"command": "pytest -q"}\ntool: ticker ran the tests: 3 passed'
+    )
+    assert [(e["id"], e["chat"], e["project"]) for e in listed(999)] == [
+        ("far", "Second task", "/elsewhere")
+    ]
+    assert listed(12345) == []

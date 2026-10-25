@@ -210,6 +210,49 @@ def test_installed_bridge_keeps_blank_chat_on_switch_and_releases_it_idle(
     asyncio.run(scenario())
 
 
+def test_installed_bridge_manages_shared_mcp_servers_for_desktop_customize(
+    store, tmp_path, monkeypatch
+):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setattr(Native, "require_login", lambda self, account: None)
+    native = Native(store, Path(os.environ["DS_TEST_NATIVE"]))
+    first, second = store.accounts()
+    store.select(first)
+
+    async def scenario():
+        bridge = Bridge(native, lambda message: asyncio.sleep(0))
+        try:
+            await bridge.dispatch(
+                "initialize",
+                {
+                    "protocolVersion": 1,
+                    "clientCapabilities": {"_meta": {"cognition.ai/mcp": True}},
+                    "clientInfo": {"name": "windsurf", "version": "0.3.0"},
+                },
+            )
+            config = {"command": "true", "args": []}
+            await bridge.dispatch(
+                "_cognition.ai/mcp/installServer", {"serverId": "switch-gui", "config": config}
+            )
+            assert "switch-gui" in native.capture(second, ("mcp", "list"))
+            listed = await bridge.dispatch("_cognition.ai/mcp/listServers", {})
+            (server,) = [item for item in listed["servers"] if item["serverId"] == "switch-gui"]
+            await bridge.dispatch(
+                "_cognition.ai/mcp/removeServer",
+                {"serverId": "switch-gui", "sourcePath": server["sourcePath"]},
+            )
+            assert "switch-gui" not in native.capture(second, ("mcp", "list"))
+        finally:
+            await bridge.close()
+        for account in (first, second):
+            path = store.directory(account.name) / "config/devin/mcp_config.json"
+            assert path.resolve() == (store.root / "shared/config/mcp_config.json").resolve()
+            assert not store.credentials(account).exists()
+
+    asyncio.run(scenario())
+
+
 def relay_test_native(store, tmp_path, monkeypatch):
     from fake_upstream import Upstream
 

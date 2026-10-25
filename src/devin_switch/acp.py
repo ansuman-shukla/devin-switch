@@ -662,6 +662,8 @@ class Bridge:
             return await self.list_sessions(params)
         if method in {"session/new", "session/load", "session/resume"}:
             return await self.open_session(method, params)
+        if method.startswith("_") and "sessionId" not in params and not notification:
+            return await self.ask_lister(method, params)
         session_id = params.get("sessionId")
         if session_id not in self.chats:
             raise RpcError("Load the exact saved conversation before using it.", -32602)
@@ -799,6 +801,10 @@ class Bridge:
 
     async def list_sessions(self, params):
         """Let the native list shared history: Desktop needs its filters, paging and _meta."""
+        return await self.ask_lister("session/list", params, LIFECYCLE_TIMEOUT)
+
+    async def ask_lister(self, method, params, timeout=None):
+        """Send a request that belongs to no chat (history, Customize's MCPs/skills/rules)."""
         async with self.listing:
             lister = self.lister
             if lister is None or lister.process.poll() is not None or lister.writer.is_closing():
@@ -808,7 +814,8 @@ class Bridge:
                 lister = Backend(self, self.default_account(), Path.cwd(), chat=False)
                 await lister.start()
                 self.lister = lister
-        return await lister.request("session/list", params, LIFECYCLE_TIMEOUT)
+            lister.last_activity = time.monotonic()
+        return await lister.request(method, params, timeout)
 
     async def close_lister(self):
         async with self.listing:

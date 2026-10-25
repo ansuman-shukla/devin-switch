@@ -139,7 +139,9 @@ class QuotaWatch:
     def check(self) -> None:
         try:
             message = handoff.queue_automatic(self.native, self.account, self.messages.put)
-        except (SwitchError, OSError):
+        except SwitchError as exc:
+            message = f"Automatic switching could not continue: {exc} This chat is unchanged."
+        except Exception:
             message = "Automatic switching could not check usage. This chat is unchanged."
         if message:
             self.messages.put(message)

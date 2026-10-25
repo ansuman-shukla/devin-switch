@@ -685,6 +685,73 @@ def test_gui_session_list_is_the_natives_own_listing_from_one_reused_agent(
     asyncio.run(scenario())
 
 
+def test_gui_customize_requests_without_a_chat_manage_the_shared_mcp_servers(
+    acp_native, tmp_path, monkeypatch
+):
+    shared = acp_native.store.root / "shared/config/mcp_config.json"
+    gate = tmp_path / "connect-gate"
+    monkeypatch.setenv("FAKE_MCP_CONNECT_GATE", str(gate))
+
+    async def scenario():
+        async with connect(acp_native) as client:
+            await client.send({"method": "_cognition.ai/mcp/removeServer", "params": {}})
+            stray = await client.request("_cognition.ai/mcp/listServers", {"sessionId": "other"})
+            assert stray["error"]["code"] == -32602
+            connecting = asyncio.create_task(
+                client.request("_cognition.ai/mcp/connectServer", {"serverId": "docs"})
+            )
+            async with asyncio.timeout(10):
+                while not any(
+                    call["method"].endswith("connectServer") for call in logged(acp_native)
+                ):
+                    await asyncio.sleep(0.01)
+            listing = await client.request("session/list", {})
+            assert "result" in listing and not connecting.done()
+            gate.touch()
+            assert (await connecting)["result"] == {}
+            server = {"command": "docs-mcp", "args": []}
+            installed = await client.request(
+                "_cognition.ai/mcp/installServer", {"serverId": "docs", "config": server}
+            )
+            assert installed["result"] == {}, installed
+            assert json.loads(shared.read_text())["mcpServers"] == {"docs": server}
+            assert {
+                "jsonrpc": "2.0",
+                "method": "_cognition.ai/mcp/serversChanged",
+                "params": {},
+            } in (client.messages)
+            listed = await client.request(
+                "_cognition.ai/mcp/listServers", {"workspaceDirs": [str(tmp_path)]}
+            )
+            assert [item["serverId"] for item in listed["result"]["servers"]] == ["docs"]
+            mentioned = await client.request(
+                "_cognition.ai/scope_search",
+                {"scope_type": "mcpServer", "query": "do", "cwd": str(tmp_path)},
+            )
+            assert [item["name"] for item in mentioned["result"]["items"]] == ["docs"]
+            removed = await client.request(
+                "_cognition.ai/mcp/removeServer",
+                {"serverId": "docs", "sourcePath": listed["result"]["servers"][0]["sourcePath"]},
+            )
+            assert removed["result"] == {}, removed
+            assert json.loads(shared.read_text())["mcpServers"] == {}
+            missing = await client.request("session/set_mode", {"modeId": "plan"})
+            assert missing["error"]["code"] == -32602
+        calls = [call for call in logged(acp_native) if call["method"].startswith("_cognition.ai/")]
+        assert [call["method"].rsplit("/", 1)[1] for call in calls] == [
+            "connectServer",
+            "installServer",
+            "listServers",
+            "scope_search",
+            "removeServer",
+        ]
+        assert {(call["pid"], call["account"], call["sessionId"]) for call in calls} == {
+            (calls[0]["pid"], "ansuman-1", None)
+        }
+
+    asyncio.run(scenario())
+
+
 async def warm(bridge):
     async with asyncio.timeout(10):
         while bridge.filling or bridge.spare is None:

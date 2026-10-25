@@ -22,6 +22,17 @@ class ChromeProfile:
     email: str
 
 
+BLOCKED = (
+    "macOS lets only Chrome and apps with Full Disk Access read Chrome's profiles. Give Full "
+    "Disk Access to the app running Switch (Devin Switch, Devin or your terminal) under System "
+    "Settings → Privacy & Security, then reopen it."
+)
+
+
+class ChromeBlocked(SwitchError):
+    """macOS 27 App Data Protection denied reading Chrome's data folder."""
+
+
 def profiles() -> tuple[ChromeProfile, ...]:
     try:
         state = json.loads((CHROME_DATA / "Local State").read_text())
@@ -33,10 +44,7 @@ def profiles() -> tuple[ChromeProfile, ...]:
     except FileNotFoundError as exc:
         raise SwitchError("No local Google Chrome profiles found.") from exc
     except PermissionError as exc:
-        raise SwitchError(
-            "macOS denied permission to read Chrome's profile list. Allow Devin Switch under "
-            "System Settings → Privacy & Security, then reopen the app."
-        ) from exc
+        raise ChromeBlocked(BLOCKED) from exc
     except (json.JSONDecodeError, KeyError, AttributeError, TypeError) as exc:
         raise SwitchError("Chrome's profile index could not be read.") from exc
 

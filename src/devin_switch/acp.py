@@ -57,6 +57,7 @@ LIVE_CONTROLS = {
     "session/set_mode",
     "session/set_model",
     "_cognition.ai/command/revise",
+    "_cognition.ai/subagent/cancel",
 }
 OPENING = {"session/new", "session/load"}
 BACKGROUND_UPDATES = {
@@ -362,6 +363,15 @@ class Backend:
             self.latest[update["sessionUpdate"]] = text
         else:
             self.transcript.append(text)
+
+    def replayed_subagents(self):
+        agents = set()
+        for text in self.transcript:
+            if subagents.STARTED in text:
+                meta = json.loads(text)["params"]["update"].get("_meta") or {}
+                if isinstance(event := meta.get(subagents.STARTED), dict):
+                    agents.add(event.get("agentId"))
+        return agents
 
     def record_prompt(self, params):
         """The native echoes prompts only when it replays a load, so keep them for a replay."""
@@ -880,15 +890,48 @@ class Bridge:
         except (SwitchError, OSError):
             pass
 
-    async def go_live(self, backend):
+    async def go_live(self, backend, *, replayed):
         """Start counting subagent events; ones an earlier process left running are now stopped."""
         backend.live = True
         try:
-            await asyncio.to_thread(
+            moved = await asyncio.to_thread(
                 subagents.interrupt_running, self.native.store, backend.session_id
             )
         except (SwitchError, OSError):
-            pass
+            moved = []
+        await self.show_subagents(backend, moved, replayed=replayed)
+
+    async def show_subagents(self, backend, moved, *, replayed):
+        """Keep Desktop's subagent cards: the native's load replay omits background subagents.
+
+        Add cards for running and interrupted background subagents it left out and mark
+        interrupted ones stopped. All of it goes into the record for later replays; Desktop is
+        sent it only after a replay, else it kept its view and just learns which were `moved`.
+        """
+        try:
+            state = await asyncio.to_thread(subagents.load, self.native.store, backend.session_id)
+        except (SwitchError, OSError):
+            return
+        shown = backend.replayed_subagents()
+        for agent, info in {**state["running"], **state["interrupted"]}.items():
+            listed = agent in shown
+            if not listed and info.get("background"):
+                await self.inject(backend, subagents.card(agent, info), emit=replayed)
+                listed = True
+            if listed and agent in state["interrupted"]:
+                stopped = subagents.stopped_card(agent, info)
+                await self.inject(backend, stopped, emit=replayed or agent in moved)
+
+    async def inject(self, backend, update, *, emit):
+        message = {
+            "jsonrpc": "2.0",
+            "method": "session/update",
+            "params": {"sessionId": backend.session_id, "update": update},
+        }
+        backend.record(message)
+        if emit:
+            async with backend.emitting:
+                await self.emit(message)
 
     async def offer_resume(self, chat):
         try:
@@ -987,6 +1030,8 @@ class Bridge:
                                 "session/load", setup, LIFECYCLE_TIMEOUT
                             )
                             chat.setup = setup
+                            if method == "session/load":
+                                await self.show_subagents(chat.backend, (), replayed=True)
                             return result
                         finally:
                             chat.backend.suppress_replay = False
@@ -1017,7 +1062,7 @@ class Bridge:
             chat = self.chats[session_id] = Chat(
                 session_id, setup, backend, blank=method == "session/new"
             )
-            await self.go_live(backend)
+            await self.go_live(backend, replayed=method == "session/load")
             self.spawn(self.offer_resume(chat))
             return result
         except BaseException:
@@ -1279,7 +1324,7 @@ class Bridge:
             if isinstance(result.get("models"), dict):
                 result["models"]["currentModelId"] = candidate.model
             candidate.suppress_replay = False
-            await self.go_live(candidate)
+            await self.go_live(candidate, replayed=replay)
             return candidate, result
         except BaseException as exc:
             closed = await candidate.close() if candidate is not None else True

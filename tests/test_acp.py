@@ -724,6 +724,11 @@ def test_gui_customize_requests_without_a_chat_manage_the_shared_mcp_servers(
                 "_cognition.ai/mcp/listServers", {"workspaceDirs": [str(tmp_path)]}
             )
             assert [item["serverId"] for item in listed["result"]["servers"]] == ["docs"]
+            mentioned = await client.request(
+                "_cognition.ai/scope_search",
+                {"scope_type": "mcpServer", "query": "do", "cwd": str(tmp_path)},
+            )
+            assert [item["name"] for item in mentioned["result"]["items"]] == ["docs"]
             removed = await client.request(
                 "_cognition.ai/mcp/removeServer",
                 {"serverId": "docs", "sourcePath": listed["result"]["servers"][0]["sourcePath"]},
@@ -737,6 +742,7 @@ def test_gui_customize_requests_without_a_chat_manage_the_shared_mcp_servers(
             "connectServer",
             "installServer",
             "listServers",
+            "scope_search",
             "removeServer",
         ]
         assert {(call["pid"], call["account"], call["sessionId"]) for call in calls} == {

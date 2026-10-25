@@ -455,8 +455,8 @@ connection cannot be loaded twice. Account-specific cloud history and ordinary
 Desktop history are not imported. Forking through the standard ACP session-fork
 method is not supported in this initial integration.
 
-Desktop's **Customize** page (MCPs, Skills, Rules, Hooks, Subagents) works through the
-bridge. Its "This computer" MCP list is Switch's shared MCP config, so servers you add,
+Desktop's **Customize** page (MCPs, Skills, Rules, Hooks, Subagents) and the composer's
+`@mcpServer:`, `@rule:` and `@skill:` mentions work through the bridge. Its "This computer" MCP list is Switch's shared MCP config, so servers you add,
 remove or turn off there apply to every saved login. Restart open chats afterwards.
 
 The automated checks cover protocol handoffs with a fake CLI and isolated native

@@ -114,7 +114,8 @@ def install() -> str:
     return "\n".join(
         (
             f"Installed the Switch panels {version} into the Desktop app.",
-            "Commands: 'Switch: Open Whiteboard' and 'Switch: Open Agent Browser'.",
+            "Commands: 'Switch: Open Whiteboard', 'Switch: Open Agent Browser' and "
+            "'Switch: Show Running Subagents'.",
             "Whiteboards from chats now open beside the chat in the window showing their folder.",
             "If the commands are missing, run 'Developer: Reload Window' once.",
         )

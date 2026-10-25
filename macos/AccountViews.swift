@@ -91,6 +91,19 @@ struct ChromeProfile: Decodable, Equatable, Identifiable {
     var prefix: String { "\(name) \(email)".lowercased().contains("nayanshi") ? "nayanshi" : "ansuman" }
 }
 
+struct SubagentRun: Decodable, Equatable, Identifiable {
+    let id: String
+    let title: String
+    let profile: String
+    let background: Bool
+    let started_at: Double
+    let status: String
+    let reason: String?
+    let last_step: String
+    var running: Bool { status == "running" }
+    var name: String { title.isEmpty ? (profile.isEmpty ? "Subagent" : profile) : title }
+}
+
 struct SessionRun: Decodable, Equatable, Identifiable {
     let id: String
     let account: String
@@ -100,6 +113,7 @@ struct SessionRun: Decodable, Equatable, Identifiable {
     let session_id: String?
     let active: Bool
     var gui_lifecycle: String? = nil
+    var subagents: [SubagentRun]? = nil
     var canClose: Bool { active && kind == "chat" && session_id != nil && gui_lifecycle == "open" }
 }
 
@@ -141,6 +155,7 @@ enum Palette {
     static let secondary = Color(white: 0.58)
     static let line = Color.white.opacity(0.09)
     static let green = Color(red: 0.35, green: 0.78, blue: 0.49)
+    static let stopped = Color(red: 0.93, green: 0.62, blue: 0.33)
 }
 
 struct SidebarButton: ButtonStyle {
@@ -391,14 +406,19 @@ struct OpenSessionsPanel: View {
                     .font(.system(size: 12)).foregroundStyle(Palette.secondary)
             }
             ForEach(openRuns) { run in
-                ViewThatFits(in: .horizontal) {
-                    HStack(alignment: .top, spacing: 16) {
-                        sessionInfo(run).frame(minWidth: 180)
-                        sessionStatus(run).frame(minWidth: 130, maxWidth: 180)
+                VStack(alignment: .leading, spacing: 14) {
+                    ViewThatFits(in: .horizontal) {
+                        HStack(alignment: .top, spacing: 16) {
+                            sessionInfo(run).frame(minWidth: 180)
+                            sessionStatus(run).frame(minWidth: 130, maxWidth: 180)
+                        }
+                        VStack(alignment: .leading, spacing: 14) {
+                            sessionInfo(run)
+                            sessionStatus(run)
+                        }
                     }
-                    VStack(alignment: .leading, spacing: 14) {
-                        sessionInfo(run)
-                        sessionStatus(run)
+                    if let agents = run.subagents, !agents.isEmpty {
+                        SubagentList(agents: agents)
                     }
                 }.padding(14).background(Palette.background, in: RoundedRectangle(cornerRadius: 7))
             }
@@ -437,6 +457,102 @@ struct OpenSessionsPanel: View {
                     .accessibilityLabel("Close GUI connection \(run.session_id ?? run.id)")
             }
         }
+    }
+}
+
+func elapsedDescription(since start: Double, now: Double = Date().timeIntervalSince1970) -> String {
+    let minutes = Int(max(0, now - start) / 60)
+    if minutes < 1 { return "under 1m" }
+    if minutes >= 60 { return "\(minutes / 60)h \(minutes % 60)m" }
+    return "\(minutes)m"
+}
+
+struct SubagentList: View {
+    @EnvironmentObject var model: AppModel
+    let agents: [SubagentRun]
+    @State private var copied = false
+
+    var summary: String {
+        let running = agents.filter(\.running).count
+        let stopped = agents.count - running
+        return [running > 0 ? "\(running) running" : nil, stopped > 0 ? "\(stopped) stopped" : nil]
+            .compactMap { $0 }.joined(separator: " · ")
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Rectangle().fill(Palette.line).frame(height: 1)
+            HStack(spacing: 8) {
+                Label("Subagents", systemImage: "person.2").font(.system(size: 12, weight: .semibold))
+                Text(summary).font(.system(size: 11)).foregroundStyle(Palette.secondary)
+                Spacer(minLength: 0)
+            }
+            ForEach(agents) { SubagentRow(agent: $0) }
+            if agents.contains(where: { !$0.running }) {
+                ViewThatFits(in: .horizontal) {
+                    HStack(spacing: 12) { resumeHint; Spacer(minLength: 0); copyButton }
+                    VStack(alignment: .leading, spacing: 8) { resumeHint; copyButton }
+                }
+            }
+        }
+    }
+
+    var resumeHint: some View {
+        Text("Stopped subagents keep their saved progress. Send the command in this chat to continue them.")
+            .font(.system(size: 10)).foregroundStyle(Palette.secondary).fixedSize(horizontal: false, vertical: true)
+    }
+
+    var copyButton: some View {
+        Button {
+            model.copyResumeSubagentsCommand()
+            copied = true
+        } label: {
+            Label(copied ? "Copied" : "Copy \(AppModel.resumeSubagentsCommand)", systemImage: copied ? "checkmark" : "doc.on.doc")
+        }.buttonStyle(MonoButton()).fixedSize()
+            .help("Copy \(AppModel.resumeSubagentsCommand) to paste into this chat in Devin")
+            .accessibilityLabel("Copy \(AppModel.resumeSubagentsCommand) command")
+    }
+}
+
+struct SubagentRow: View {
+    let agent: SubagentRun
+
+    var body: some View {
+        HStack(alignment: .top, spacing: 10) {
+            Image(systemName: agent.running ? "arrow.triangle.2.circlepath" : "stop.circle")
+                .font(.system(size: 12, weight: .medium))
+                .foregroundStyle(agent.running ? Palette.green : Palette.stopped)
+                .frame(width: 16).padding(.top, 1)
+            VStack(alignment: .leading, spacing: 4) {
+                HStack(spacing: 6) {
+                    Text(agent.name).font(.system(size: 12, weight: .medium)).lineLimit(1).help(agent.name)
+                    if agent.background {
+                        Text("Background").font(.system(size: 9, weight: .medium)).foregroundStyle(Palette.secondary)
+                            .padding(.horizontal, 6).padding(.vertical, 2)
+                            .background(Color.white.opacity(0.07), in: Capsule())
+                    }
+                    Spacer(minLength: 8)
+                    TimelineView(.everyMinute) { _ in
+                        Text(agent.running ? "Running · \(elapsedDescription(since: agent.started_at))" : "Stopped")
+                            .font(.system(size: 10)).monospacedDigit()
+                            .foregroundStyle(agent.running ? Palette.green : Palette.stopped)
+                    }
+                }
+                Text(detail).font(.system(size: 10)).foregroundStyle(Palette.secondary).lineLimit(1)
+                if !agent.last_step.isEmpty {
+                    Text("Last step: \(agent.last_step)")
+                        .font(.system(size: 10)).foregroundStyle(Palette.secondary)
+                        .lineLimit(2).truncationMode(.tail).help(agent.last_step)
+                }
+            }.frame(maxWidth: .infinity, alignment: .leading)
+        }.accessibilityElement(children: .combine)
+    }
+
+    var detail: String {
+        let started = "started \(Date(timeIntervalSince1970: agent.started_at).formatted(date: .omitted, time: .shortened))"
+        let profile = agent.profile.isEmpty ? [] : [agent.profile]
+        if agent.running { return (profile + [started]).joined(separator: " · ") }
+        return (["Stopped because \(agent.reason ?? "the agent stopped")"] + profile).joined(separator: " · ")
     }
 }
 

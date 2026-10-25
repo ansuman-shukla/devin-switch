@@ -66,6 +66,8 @@ func callBridge(_ payload: [String: String]) throws -> Reply {
         }
     }
     @AppStorage var project: String
+    var pasteboard = NSPasteboard.general
+    nonisolated static let resumeSubagentsCommand = "/resume-subagents"
     private let defaults: UserDefaults
     private let bridge: ([String: String]) async throws -> Reply
     private var refreshSubscriptions = Set<AnyCancellable>()
@@ -110,6 +112,11 @@ func callBridge(_ payload: [String: String]) throws -> Reply {
     func closeSession(_ run: SessionRun) {
         guard run.canClose, !blocked else { return }
         perform(["action": "close_session", "run": run.id])
+    }
+
+    func copyResumeSubagentsCommand() {
+        pasteboard.clearContents()
+        pasteboard.setString(Self.resumeSubagentsCommand, forType: .string)
     }
 
     func chooseChat(_ account: Account) {

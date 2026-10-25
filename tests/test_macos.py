@@ -16,6 +16,7 @@ INTEL_CI_RENDER_SCENARIOS = {
     "combined-quota-render",
     "adaptive-layout",
     "session-close-control",
+    "session-subagents",
 }
 
 
@@ -72,6 +73,7 @@ def model_tests(tmp_path_factory: pytest.TempPathFactory) -> Path:
         "session-close",
         "session-close-error",
         "session-close-control",
+        "session-subagents",
         "navigation",
         "rename-display",
         "rename-errors",

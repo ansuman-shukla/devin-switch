@@ -12,7 +12,6 @@ import json
 import re
 import sqlite3
 import time
-from datetime import UTC, datetime
 from pathlib import Path
 
 from devin_switch import acp_state
@@ -106,43 +105,6 @@ def forget(store: Store, session_id: str, agents) -> None:
         for agent in agents:
             state["interrupted"].pop(agent, None)
         save(store, state)
-
-
-def card(agent: str, info: dict) -> dict:
-    """The update Desktop draws a subagent card from, as the native sends when one starts."""
-    started = datetime.fromtimestamp(info.get("started_at") or time.time(), UTC)
-    return {
-        "sessionUpdate": "tool_call_update",
-        "toolCallId": agent,
-        "status": "in_progress",
-        "_meta": {
-            STARTED: {
-                "agentId": agent,
-                "title": info.get("title") or "",
-                "task": info.get("task") or "",
-                "profile": info.get("profile") or "",
-                "depth": 0,
-                "isBackground": bool(info.get("background")),
-            },
-            "cognition.ai/timestamp": started.isoformat(),
-        },
-    }
-
-
-def stopped_card(agent: str, info: dict) -> dict:
-    return {
-        "sessionUpdate": "tool_call_update",
-        "toolCallId": agent,
-        "status": "failed",
-        "_meta": {
-            COMPLETED: {
-                "agentId": agent,
-                "success": False,
-                "summary": f"Stopped before finishing because {info.get('reason')}. Send "
-                "/resume-subagents to have the agent continue it from its saved progress.",
-            }
-        },
-    }
 
 
 def summarize(message: dict) -> str:

@@ -7,6 +7,7 @@ const path = require('node:path');
 const { Cdp } = require('./cdp');
 const { BrowserView } = require('./browser');
 const { CanvasPanels } = require('./canvas');
+const { SubagentStatus, listSubagents } = require('./subagents');
 const { WhiteboardHost, whiteboardHome } = require('./whiteboard');
 
 const STATUS_POLL_MS = 5000;
@@ -225,6 +226,10 @@ function activate(context) {
   };
   const timer = setInterval(poll, STATUS_POLL_MS);
   void poll();
+  // Desktop starts this window's chats from this extension host, so its pid identifies their bridges.
+  const subagents = new SubagentStatus(vscode, () => listSubagents(config.command, process.pid));
+  const subagentTimer = setInterval(() => subagents.refresh(), STATUS_POLL_MS);
+  void subagents.refresh();
 
   const report = (error) => vscode.window.showErrorMessage(error.message);
   const canvases = new CanvasPanels(vscode);
@@ -240,11 +245,17 @@ function activate(context) {
   host.start();
   context.subscriptions.push(
     status,
+    subagents,
     { dispose: () => clearInterval(timer) },
+    { dispose: () => clearInterval(subagentTimer) },
     { dispose: () => helper.dispose() },
     { dispose: () => host.dispose() },
     { dispose: () => canvases.dispose() },
-    vscode.window.onDidChangeWindowState(() => host.update()),
+    vscode.window.onDidChangeWindowState(() => {
+      host.update();
+      void subagents.refresh();
+    }),
+    vscode.commands.registerCommand('switchPanels.showSubagents', () => subagents.show().catch(report)),
     vscode.workspace.onDidChangeWorkspaceFolders(() => host.update()),
     vscode.commands.registerCommand('switchPanels.openCanvas', () => pickBoard(host, canvases).catch(report)),
     vscode.commands.registerCommand('switchPanels.openBrowser', () => BrowserPanel.show(context, helper)),

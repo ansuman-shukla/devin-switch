@@ -1,8 +1,8 @@
 {
   "name": "panels",
   "displayName": "Switch Panels",
-  "description": "Live whiteboard and agent browser beside the chat.",
-  "version": "0.1.0",
+  "description": "Live whiteboard, agent browser and running subagents beside the chat.",
+  "version": "0.2.0",
   "publisher": "devin-switch",
   "license": "Apache-2.0",
   "engines": { "vscode": "^1.90.0" },
@@ -12,7 +12,8 @@
   "contributes": {
     "commands": [
       { "command": "switchPanels.openCanvas", "title": "Open Whiteboard", "category": "Switch" },
-      { "command": "switchPanels.openBrowser", "title": "Open Agent Browser", "category": "Switch" }
+      { "command": "switchPanels.openBrowser", "title": "Open Agent Browser", "category": "Switch" },
+      { "command": "switchPanels.showSubagents", "title": "Show Running Subagents", "category": "Switch" }
     ],
     "configuration": {
       "title": "Switch Panels",

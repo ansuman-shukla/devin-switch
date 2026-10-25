@@ -36,6 +36,7 @@ ANSI_ESCAPE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
 # confirmed login is trusted for this long unless its credentials file changes.
 LOGIN_CHECK_TTL = 300
 verified_logins: dict[tuple, float] = {}
+CAPTURE_TIMEOUT = 30
 TELEMETRY_VARIABLE = "OTEL_EXPORTER_OTLP_LOGS_ENDPOINT"
 RECEIVER_ENDPOINT = re.compile(r"http://127\.0\.0\.1:\d+/[0-9a-f]{32}/v1/logs")
 
@@ -129,15 +130,21 @@ class Native:
     def capture(
         self, account: Account, arguments: tuple[str, ...], *, cwd: Path | None = None
     ) -> str:
-        result = subprocess.run(
-            (str(self.binary), *arguments),
-            env=self.environment(account),
-            capture_output=True,
-            text=True,
-            timeout=30,
-            check=False,
-            cwd=cwd,
-        )
+        try:
+            result = subprocess.run(
+                (str(self.binary), *arguments),
+                env=self.environment(account),
+                capture_output=True,
+                text=True,
+                timeout=CAPTURE_TIMEOUT,
+                check=False,
+                cwd=cwd,
+            )
+        except subprocess.TimeoutExpired as exc:
+            raise SwitchError(
+                f"Devin {' '.join(arguments)} timed out for {account.name!r} "
+                f"after {CAPTURE_TIMEOUT:g} seconds."
+            ) from exc
         if result.returncode:
             # Native authentication errors can include credential material.
             raise SwitchError(

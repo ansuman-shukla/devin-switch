@@ -14,7 +14,7 @@ from otlp import encode_logs
 
 from devin_switch import desktop, handoff, sessions, terminal
 from devin_switch.native import Native
-from devin_switch.store import Store, private_directory, write_json
+from devin_switch.store import Store, SwitchError, private_directory, write_json
 
 
 def save_request(store: Store, run_id: str, pid: int = 12345) -> None:
@@ -340,9 +340,16 @@ def test_typed_quota_error_bypasses_text_cooldown_once_per_incident(monkeypatch)
     assert calls == ["ansuman-1", "ansuman-1"]
 
 
-def test_quota_watch_reports_check_failures_without_raising(monkeypatch):
+@pytest.mark.parametrize(
+    "error",
+    [
+        OSError("sensitive-native-diagnostic"),
+        subprocess.TimeoutExpired(("devin", "sensitive-native-diagnostic"), 30),
+    ],
+)
+def test_quota_watch_reports_check_failures_without_raising(monkeypatch, error):
     def fail(native, account, progress):
-        raise OSError("sensitive-native-diagnostic")
+        raise error
 
     monkeypatch.setattr(handoff, "queue_automatic", fail)
     watch = terminal.QuotaWatch("native", "ansuman-1")
@@ -350,6 +357,18 @@ def test_quota_watch_reports_check_failures_without_raising(monkeypatch):
     watch.worker.join(5)
     message = watch.message()
     assert "unchanged" in message and "sensitive" not in message
+
+
+def test_quota_watch_explains_switch_errors(monkeypatch):
+    def fail(native, account, progress):
+        raise SwitchError("Devin auth status timed out for 'ansuman-2' after 30 seconds.")
+
+    monkeypatch.setattr(handoff, "queue_automatic", fail)
+    watch = terminal.QuotaWatch("native", "ansuman-1")
+    watch.feed(b"Quota exhausted", 0)
+    watch.worker.join(5)
+    message = watch.message()
+    assert "timed out for 'ansuman-2'" in message and "unchanged" in message
 
 
 @pytest.mark.parametrize(

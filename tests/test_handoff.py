@@ -768,6 +768,43 @@ def test_automatic_terminal_handoff_requires_confirmed_exhaustion(
                 assert json.loads(path.read_text())["automatic"] is False
 
 
+def test_automatic_handoff_skips_a_login_whose_auth_check_hangs(
+    signed_in: Native, tmp_path, monkeypatch
+):
+    from dataclasses import replace
+
+    from devin_switch import native as native_module
+
+    store = signed_in.store
+    setup_project(store, tmp_path, monkeypatch)
+    add_logins(signed_in, 1)
+    store.credentials(store.account("ansuman-2")).write_text("valid-slow")
+    slow = tmp_path / "slow-cli"
+    slow.write_text(
+        "#!/bin/sh\n"
+        'if [ "$1 $2" = "auth status" ] && '
+        '[ "$(cat "$XDG_DATA_HOME/devin/credentials.toml")" = valid-slow ]; then exec sleep 5; fi\n'
+        f'exec "{signed_in.binary}" "$@"\n'
+    )
+    slow.chmod(0o700)
+    monkeypatch.setattr(native_module, "CAPTURE_TIMEOUT", 0.5)
+    monkeypatch.setattr(handoff, "controller_available", lambda *_: True)
+    monkeypatch.setattr(
+        usage,
+        "refresh_account",
+        lambda store, account, *, force: full_usage(100 if account.name == "ansuman-1" else 20),
+    )
+    native = replace(signed_in, binary=slow)
+    with pytest.raises(SwitchError, match="timed out for 'ansuman-2'"):
+        native.require_login(store.account("ansuman-2"))
+    account = store.account("ansuman-1")
+    with sessions.managed(native, account.name, (), can_handoff=True) as (runner, _, _):
+        message = handoff.queue_automatic(runner, account)
+        assert "Switching to ansuman-3" in message
+        request = json.loads(handoff.state_path(store, runner.run_id, "request").read_text())
+        assert request["account"] == "ansuman-3" and request["automatic"] is True
+
+
 def full_usage(used: float = 0) -> usage.Usage:
     import time
 

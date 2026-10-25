@@ -2173,49 +2173,8 @@ def test_gui_relay_keeps_subagents_running_when_usage_runs_out_mid_task(
     }
 
 
-def save_subagent_transcript(store, session_id, agent):
-    """Write a subagent chain and head the way the native saves them in shared history."""
-    import sqlite3
-
-    with sqlite3.connect(store.root / "shared/cli/sessions.db") as connection:
-        connection.execute(
-            "CREATE TABLE IF NOT EXISTS subagent_heads (session_id TEXT, agent_id TEXT, "
-            "chain_node_id INTEGER, updated_at INTEGER, PRIMARY KEY (session_id, agent_id))"
-        )
-        connection.execute(
-            "CREATE TABLE IF NOT EXISTS message_nodes (row_id INTEGER PRIMARY KEY, "
-            "session_id TEXT, node_id INTEGER, parent_node_id INTEGER, chat_message TEXT, "
-            "created_at INTEGER, metadata TEXT)"
-        )
-        steps = [
-            {"role": "system", "content": "You are a subagent"},
-            {"role": "user", "content": f"Task for {agent}"},
-            {
-                "role": "assistant",
-                "content": "",
-                "tool_calls": [{"name": "exec", "arguments": {"command": "pytest -q"}}],
-            },
-            {"role": "tool", "content": f"{agent} ran the tests: 3 passed"},
-        ]
-        for node, step in enumerate(steps, 1):
-            connection.execute(
-                "INSERT INTO message_nodes (session_id, node_id, parent_node_id, chat_message) "
-                "VALUES (?, ?, ?, ?)",
-                (
-                    session_id,
-                    100 * len(agent) + node,
-                    (100 * len(agent) + node - 1) if node > 1 else None,
-                    json.dumps(step),
-                ),
-            )
-        connection.execute(
-            "INSERT OR REPLACE INTO subagent_heads VALUES (?, ?, ?, 0)",
-            (session_id, agent, 100 * len(agent) + len(steps)),
-        )
-
-
 def test_gui_subagents_stopped_by_a_crash_resume_from_their_saved_progress(
-    acp_native, relayed, tmp_path, monkeypatch
+    acp_native, relayed, tmp_path, monkeypatch, save_subagent_transcript
 ):
     store = acp_native.store
     monkeypatch.setenv("FAKE_SUBAGENT_GATE", str(tmp_path / "never-opened"))

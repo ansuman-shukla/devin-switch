@@ -1,4 +1,7 @@
+import json
 import os
+import sqlite3
+from collections.abc import Callable
 from pathlib import Path
 
 import pytest
@@ -46,6 +49,51 @@ def signed_in(native: Native) -> Native:
     for account in native.store.accounts():
         native.store.credentials(account).write_text(f"valid-{account.name}")
     return native
+
+
+@pytest.fixture
+def save_subagent_transcript() -> Callable[[Store, str, str], None]:
+    def save(store: Store, session_id: str, agent: str) -> None:
+        """Write a subagent chain and head the way the native saves them in shared history."""
+        database = store.root / "shared/cli/sessions.db"
+        database.parent.mkdir(parents=True, exist_ok=True)
+        with sqlite3.connect(database) as connection:
+            connection.execute(
+                "CREATE TABLE IF NOT EXISTS subagent_heads (session_id TEXT, agent_id TEXT, "
+                "chain_node_id INTEGER, updated_at INTEGER, PRIMARY KEY (session_id, agent_id))"
+            )
+            connection.execute(
+                "CREATE TABLE IF NOT EXISTS message_nodes (row_id INTEGER PRIMARY KEY, "
+                "session_id TEXT, node_id INTEGER, parent_node_id INTEGER, chat_message TEXT, "
+                "created_at INTEGER, metadata TEXT)"
+            )
+            steps = [
+                {"role": "system", "content": "You are a subagent"},
+                {"role": "user", "content": f"Task for {agent}"},
+                {
+                    "role": "assistant",
+                    "content": "",
+                    "tool_calls": [{"name": "exec", "arguments": {"command": "pytest -q"}}],
+                },
+                {"role": "tool", "content": f"{agent} ran the tests: 3 passed"},
+            ]
+            for node, step in enumerate(steps, 1):
+                connection.execute(
+                    "INSERT INTO message_nodes (session_id, node_id, parent_node_id, chat_message) "
+                    "VALUES (?, ?, ?, ?)",
+                    (
+                        session_id,
+                        100 * len(agent) + node,
+                        (100 * len(agent) + node - 1) if node > 1 else None,
+                        json.dumps(step),
+                    ),
+                )
+            connection.execute(
+                "INSERT OR REPLACE INTO subagent_heads VALUES (?, ?, ?, 0)",
+                (session_id, agent, 100 * len(agent) + len(steps)),
+            )
+
+    return save
 
 
 @pytest.fixture(autouse=True)

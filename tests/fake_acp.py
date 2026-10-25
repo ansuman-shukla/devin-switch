@@ -67,6 +67,27 @@ def infer():
     return data[5 : 5 + int.from_bytes(data[1:5], "big")].decode()
 
 
+def background_started(session_id, agent="bg1", background=True):
+    update(
+        session_id,
+        {
+            "sessionUpdate": "tool_call_update",
+            "toolCallId": agent,
+            "status": "in_progress",
+            "_meta": {
+                "cognition.ai/subagent_started": {
+                    "agentId": agent,
+                    "title": f"Title {agent}",
+                    "task": f"Task for {agent}",
+                    "profile": "subagent_general",
+                    "depth": 0,
+                    "isBackground": background,
+                }
+            },
+        },
+    )
+
+
 def subagent_update(session_id, key, value):
     update(
         session_id,
@@ -205,6 +226,9 @@ async def handle(message):
                     "content": {"type": "text", "text": "historical replay"},
                 },
             )
+            # The native replays foreground subagents only; this stands in for one that doesn't.
+            if os.environ.get("FAKE_REPLAY_BACKGROUND"):
+                background_started(session_id)
         elif not os.environ.get("FAKE_SAVE_ON_PROMPT"):
             connection.execute(
                 "INSERT INTO sessions VALUES (?, ?, ?, ?, 0)",
@@ -295,6 +319,10 @@ async def handle(message):
             )
             emit({"id": message["id"], "result": {"stopReason": "end_turn"}})
             return
+        if text == "background-subagent":
+            background_started(loaded)
+        if text == "foreground-subagent":
+            background_started(loaded, "fg1", background=False)
         if text == "slow":
             await asyncio.sleep(0.5)
         if text == "wait":
@@ -404,6 +432,37 @@ async def handle(message):
         settings["model"] = params["modelId"]
     elif method == "_cognition.ai/command/revise":
         result = {"command": params["command"] + " --revised"}
+    elif method.startswith("_cognition.ai/mcp/") or method == "_cognition.ai/scope_search":
+        # Like the native, user-scope servers live in this login's config directory.
+        path = Path(os.environ["XDG_CONFIG_HOME"]) / "devin/mcp_config.json"
+        config = json.loads(path.read_text())
+        if method == "_cognition.ai/scope_search":
+            # The composer's @mcpServer: search; the native lists connected servers.
+            result = {
+                "items": [
+                    {"type": "resource_link", "name": name, "uri": f"mcp://{name}"}
+                    for name in config["mcpServers"]
+                    if params["scope_type"] == "mcpServer" and params["query"] in name
+                ]
+            }
+        elif method == "_cognition.ai/mcp/connectServer":
+            # Stands in for an OAuth sign-in that waits for the user's browser.
+            while not Path(os.environ["FAKE_MCP_CONNECT_GATE"]).exists():
+                await asyncio.sleep(0.01)
+        elif method == "_cognition.ai/mcp/listServers":
+            result = {
+                "servers": [
+                    {"serverId": name, "sourcePath": str(path), "connectionStatus": "not_started"}
+                    for name in config["mcpServers"]
+                ]
+            }
+        else:
+            if method == "_cognition.ai/mcp/installServer":
+                config["mcpServers"][params["serverId"]] = params["config"]
+            elif method == "_cognition.ai/mcp/removeServer":
+                config["mcpServers"].pop(params["serverId"])
+            path.write_text(json.dumps(config))
+            emit({"method": "_cognition.ai/mcp/serversChanged", "params": {}})
     elif method == "session/list":
         result = {
             "sessions": [

@@ -82,6 +82,30 @@ an extracted source archive instead, run `uv tool install --python 3.11 .` insid
 `uv` manages the Python environment; the installed package has no third-party Python runtime
 dependencies. The package is not currently published to PyPI.
 
+### Optional: keep typing `devin`
+
+To keep typing `devin` and still get account switching, add this function to `~/.zshrc`
+(it also works in `~/.bashrc`), then open a new terminal:
+
+```sh
+# devin: start chats through Devin Switch (ds run) for account switching.
+# Subcommands and help/version go to the real CLI. Bypass with: command devin ...
+devin() {
+  case "$1" in
+    auth|mcp|models|doctor|rules|skills|plugins|cloud|desktop|list|ls|rm|ssh|forward|update|version|migrate|sandbox|setup|uninstall|acp|help|-h|--help|-V|--version)
+      command devin "$@" ;;
+    *)
+      ds run -- "$@" ;;
+  esac
+}
+```
+
+Chat launches like `devin`, `devin -r SESSION_ID` and `devin --continue` then run as
+`ds run -- ARGS`. They use the saved default login, and `!ds switch` and automatic
+switching work in them. Subcommands such as `devin auth status` or `devin update` still go
+straight to the real CLI. Run `command devin ...` to skip Switch for one launch. Scripts and
+other shells that do not load this function still run the real CLI directly.
+
 ### Verify a download
 
 Download the release's `SHA256SUMS` alongside the files you want, then run from that folder:
@@ -217,7 +241,8 @@ restart needed. If the setting file is unreadable, automatic switching stays off
   then check usage again for the current account. The chat switches only if that fresh reading
   confirms at least one quota window is at 0%, so the same words appearing in conversation
   text do not cause a switch. The exit, exact-conversation resume, and failure rules match
-  `!ds switch`.
+  `!ds switch`. A login whose sign-in check fails or times out is skipped. If the check
+  cannot continue, the chat shows the reason and stays open on its current login.
 
 Only the literal `continue` message is sent. The original prompt is never replayed.
 `ds switch --session ID` handoffs queued from another terminal never send a prompt.
@@ -291,6 +316,12 @@ The agent never attaches to the Chrome you are using:
 - **Closed when finished.** Chats release the browser with `browser_close`, after 15 idle
   minutes, or when they exit. A supervisor closes the instance about 10 seconds after the last
   chat releases it, and the next browser tool call reopens it with fresh pages.
+
+**macOS 27 and later** only let Chrome itself and apps with Full Disk Access read Chrome's
+profile folder. Agents don't need that access to use profiles Switch already copied: they
+list and open those copies. Copying a profile for the first time (or `ds browser refresh`)
+still reads Chrome's folder, so run it from an app that has Full Disk Access, for example a
+terminal you granted it to.
 
 `ds browser status` lists profiles and running instances, and `ds browser stop` closes them
 immediately. The server runs `npx -y chrome-devtools-mcp@1.10.1`, so Node.js is required.
@@ -461,6 +492,10 @@ for each credential. Known conversations already open in a CLI or another GUI
 connection cannot be loaded twice. Account-specific cloud history and ordinary
 Desktop history are not imported. Forking through the standard ACP session-fork
 method is not supported in this initial integration.
+
+Desktop's **Customize** page (MCPs, Skills, Rules, Hooks, Subagents) and the composer's
+`@mcpServer:`, `@rule:` and `@skill:` mentions work through the bridge. Its "This computer" MCP list is Switch's shared MCP config, so servers you add,
+remove or turn off there apply to every saved login. Restart open chats afterwards.
 
 The automated checks cover protocol handoffs with a fake CLI and isolated native
 capability/history compatibility without real credentials or inference requests.

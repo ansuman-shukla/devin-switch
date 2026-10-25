@@ -177,21 +177,23 @@ def launches(store: Store, directory: str) -> list[str]:
     return path.read_text().splitlines() if path.exists() else []
 
 
-def test_profiles_resolve_by_directory_email_slug_or_unique_name(chrome: Path) -> None:
-    assert agent_browser.resolve("Profile 3").directory == "Profile 3"
-    assert agent_browser.resolve("ANSUMAN@example.invalid").directory == "Profile 3"
-    assert agent_browser.resolve("profile-7").directory == "Profile 7"
-    assert agent_browser.resolve("work").directory == "Profile 7"
+def test_profiles_resolve_by_directory_email_slug_or_unique_name(
+    store: Store, chrome: Path
+) -> None:
+    assert agent_browser.resolve(store, "Profile 3").directory == "Profile 3"
+    assert agent_browser.resolve(store, "ANSUMAN@example.invalid").directory == "Profile 3"
+    assert agent_browser.resolve(store, "profile-7").directory == "Profile 7"
+    assert agent_browser.resolve(store, "work").directory == "Profile 7"
     with pytest.raises(SwitchError, match="several"):
-        agent_browser.resolve("Ansuman")
+        agent_browser.resolve(store, "Ansuman")
     with pytest.raises(SwitchError, match="No Chrome profile"):
-        agent_browser.resolve("nobody@example.invalid")
+        agent_browser.resolve(store, "nobody@example.invalid")
 
 
 def test_clone_copies_session_storage_privately_and_refresh_replaces_it(
     store: Store, chrome: Path
 ) -> None:
-    profile = agent_browser.resolve("Profile 3")
+    profile = agent_browser.resolve(store, "Profile 3")
     agent_browser.clone(store, profile)
     data = agent_browser.folder_for(store, "Profile 3") / "user-data/Default"
     assert (data / "Cookies").read_text() == "cookies Profile 3"
@@ -335,6 +337,71 @@ def test_visible_mode_restarts_only_when_no_other_chat_uses_the_browser(
     assert "visible window" in text
     assert "--headless=new" not in launches(store, "Profile 3")[-1]
     first.close()
+
+
+@pytest.fixture
+def blocked(chrome: Path):
+    """Chrome's data folder as macOS 27 shows it to apps without Full Disk Access."""
+    chrome.chmod(0)
+    yield
+    chrome.chmod(0o700)
+
+
+def test_copied_profiles_keep_working_when_macos_blocks_chrome_data(
+    store: Store, fakes: None, chrome: Path, request: pytest.FixtureRequest
+) -> None:
+    agent_browser.clone(store, agent_browser.resolve(store, "Profile 3"))
+    cookies = agent_browser.folder_for(store, "Profile 3") / "user-data/Default/Cookies"
+    request.getfixturevalue("blocked")
+    with pytest.raises(browser.ChromeBlocked, match="Full Disk Access"):
+        browser.profiles()
+
+    chat = Client(store)
+    listing, error = chat.tool("browser_profile")
+    assert not error and "Profile 3: associum.ai <ansuman@example.invalid>" in listing
+    assert "Profile 7" not in listing and "Full Disk Access" in listing
+    text, error = chat.tool("browser_profile", profile="associum.ai")
+    assert not error and "headless" in text
+    page = json.loads(chat.tool("list_pages")[0])
+    assert page["data"] == str(cookies.parent.parent)
+
+    text, error = chat.tool("browser_profile", profile="work@example.invalid")
+    assert error and "Full Disk Access" in text and "ds browser refresh" in text
+    chat.tool("browser_close")
+    wait_until(lambda: agent_browser.state(store, "Profile 3") is None)
+    text, error = chat.tool("browser_profile", profile="Profile 3", refresh=True)
+    assert error and "Full Disk Access" in text
+    assert cookies.read_text() == "cookies Profile 3"
+    chat.close()
+
+    agent_browser.save_settings(store, default="Profile 3")
+    defaulted = Client(store)
+    assert json.loads(defaulted.tool("list_pages")[0])["data"] == page["data"]
+    defaulted.close()
+    viewer = Viewer(store)
+    assert [row["directory"] for row in viewer.ask("profiles")["profiles"]] == ["Profile 3"]
+    viewer.close()
+    wait_until(lambda: agent_browser.state(store, "Profile 3") is None)
+
+
+def test_copies_made_before_names_were_saved_still_resolve_when_blocked(
+    store: Store, chrome: Path, request: pytest.FixtureRequest
+) -> None:
+    agent_browser.clone(store, agent_browser.resolve(store, "Profile 7"))
+    source = agent_browser.folder_for(store, "Profile 7") / "source.json"
+    assert json.loads(source.read_text())["name"] == "Work"
+    legacy = {"directory": "Profile 7", "email": "work@example.invalid", "cloned_at": 1.0}
+    source.write_text(json.dumps(legacy))
+    unfinished = agent_browser.folder_for(store, "Profile 9")
+    unfinished.mkdir(parents=True)
+    (unfinished / "source.json").write_text(json.dumps({"directory": "Profile 9", "email": ""}))
+    request.getfixturevalue("blocked")
+    assert agent_browser.resolve(store, "WORK@example.invalid").directory == "Profile 7"
+    with pytest.raises(browser.ChromeBlocked, match="ds browser refresh"):
+        agent_browser.resolve(store, "Profile 9")
+    with pytest.raises(browser.ChromeBlocked, match="Full Disk Access"):
+        agent_browser.clone(store, agent_browser.resolve(store, "Profile 7"))
+    assert json.loads(source.read_text()) == legacy
 
 
 class Viewer:

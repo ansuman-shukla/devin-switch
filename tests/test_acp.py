@@ -685,6 +685,73 @@ def test_gui_session_list_is_the_natives_own_listing_from_one_reused_agent(
     asyncio.run(scenario())
 
 
+def test_gui_customize_requests_without_a_chat_manage_the_shared_mcp_servers(
+    acp_native, tmp_path, monkeypatch
+):
+    shared = acp_native.store.root / "shared/config/mcp_config.json"
+    gate = tmp_path / "connect-gate"
+    monkeypatch.setenv("FAKE_MCP_CONNECT_GATE", str(gate))
+
+    async def scenario():
+        async with connect(acp_native) as client:
+            await client.send({"method": "_cognition.ai/mcp/removeServer", "params": {}})
+            stray = await client.request("_cognition.ai/mcp/listServers", {"sessionId": "other"})
+            assert stray["error"]["code"] == -32602
+            connecting = asyncio.create_task(
+                client.request("_cognition.ai/mcp/connectServer", {"serverId": "docs"})
+            )
+            async with asyncio.timeout(10):
+                while not any(
+                    call["method"].endswith("connectServer") for call in logged(acp_native)
+                ):
+                    await asyncio.sleep(0.01)
+            listing = await client.request("session/list", {})
+            assert "result" in listing and not connecting.done()
+            gate.touch()
+            assert (await connecting)["result"] == {}
+            server = {"command": "docs-mcp", "args": []}
+            installed = await client.request(
+                "_cognition.ai/mcp/installServer", {"serverId": "docs", "config": server}
+            )
+            assert installed["result"] == {}, installed
+            assert json.loads(shared.read_text())["mcpServers"] == {"docs": server}
+            assert {
+                "jsonrpc": "2.0",
+                "method": "_cognition.ai/mcp/serversChanged",
+                "params": {},
+            } in (client.messages)
+            listed = await client.request(
+                "_cognition.ai/mcp/listServers", {"workspaceDirs": [str(tmp_path)]}
+            )
+            assert [item["serverId"] for item in listed["result"]["servers"]] == ["docs"]
+            mentioned = await client.request(
+                "_cognition.ai/scope_search",
+                {"scope_type": "mcpServer", "query": "do", "cwd": str(tmp_path)},
+            )
+            assert [item["name"] for item in mentioned["result"]["items"]] == ["docs"]
+            removed = await client.request(
+                "_cognition.ai/mcp/removeServer",
+                {"serverId": "docs", "sourcePath": listed["result"]["servers"][0]["sourcePath"]},
+            )
+            assert removed["result"] == {}, removed
+            assert json.loads(shared.read_text())["mcpServers"] == {}
+            missing = await client.request("session/set_mode", {"modeId": "plan"})
+            assert missing["error"]["code"] == -32602
+        calls = [call for call in logged(acp_native) if call["method"].startswith("_cognition.ai/")]
+        assert [call["method"].rsplit("/", 1)[1] for call in calls] == [
+            "connectServer",
+            "installServer",
+            "listServers",
+            "scope_search",
+            "removeServer",
+        ]
+        assert {(call["pid"], call["account"], call["sessionId"]) for call in calls} == {
+            (calls[0]["pid"], "ansuman-1", None)
+        }
+
+    asyncio.run(scenario())
+
+
 async def warm(bridge):
     async with asyncio.timeout(10):
         while bridge.filling or bridge.spare is None:
@@ -1026,6 +1093,166 @@ def test_gui_reload_mid_turn_replays_from_the_latest_native_load(acp_native, tmp
                 "live progress",
             ]
 
+            await client.send({"method": "session/cancel", "params": {"sessionId": session_id}})
+            assert (await turn)["result"]["stopReason"] == "cancelled"
+
+    asyncio.run(scenario())
+
+
+STARTED, COMPLETED = subagents.STARTED, subagents.COMPLETED
+
+
+def test_gui_reload_brings_back_a_running_background_subagent_card(acp_native, tmp_path):
+    """The native's load replay omits background subagents, so Desktop would lose their card."""
+
+    async def scenario():
+        async with connect(acp_native) as client:
+            session_id = await client.new(tmp_path)
+            await client.prompt(session_id, "background-subagent")
+            params = {"sessionId": session_id, "cwd": str(tmp_path), "mcpServers": []}
+
+            start = len(client.messages)
+            assert "result" in await client.request("session/load", params)
+            (card,) = subagent_events(client.messages[start:], STARTED)
+            assert card["agentId"] == "bg1"
+            assert (card["title"], card["task"], card["isBackground"]) == (
+                "Title bg1",
+                "Task for bg1",
+                True,
+            )
+            assert not subagent_events(client.messages[start:], COMPLETED)
+
+            start = len(client.messages)
+            assert "result" in await client.request("session/resume", params)
+            assert not subagent_events(client.messages[start:], STARTED)
+
+    asyncio.run(scenario())
+
+
+def test_gui_background_subagent_card_shows_it_stopped_after_a_handoff(acp_native, tmp_path):
+    async def scenario():
+        async with connect(acp_native) as client:
+            session_id = await client.new(tmp_path)
+            await client.prompt(session_id, "background-subagent")
+
+            start = len(client.messages)
+            await client.prompt(session_id, "/switch ansuman-2")
+            assert acp_native.store.selected().name == "ansuman-2"
+            # Desktop keeps its view across a handoff: flip the live card, don't add one.
+            assert not subagent_events(client.messages[start:], STARTED)
+            (stopped,) = subagent_events(client.messages[start:], COMPLETED)
+            assert (stopped["agentId"], stopped["success"]) == ("bg1", False)
+            assert "/resume-subagents" in stopped["summary"]
+
+            start = len(client.messages)
+            params = {"sessionId": session_id, "cwd": str(tmp_path), "mcpServers": []}
+            assert "result" in await client.request("session/load", params)
+            replay = client.messages[start:]
+            assert [card["agentId"] for card in subagent_events(replay, STARTED)] == ["bg1"]
+            assert [
+                (card["agentId"], card["success"]) for card in subagent_events(replay, COMPLETED)
+            ] == [("bg1", False)]
+            kinds = [
+                next(key for key in (STARTED, COMPLETED) if key in update.get("_meta", {}))
+                for update in replayed(replay, "tool_call_update")
+            ]
+            assert kinds == [STARTED, COMPLETED]
+
+    asyncio.run(scenario())
+
+
+def test_gui_reload_mid_turn_after_a_handoff_keeps_the_stopped_subagent_card(acp_native, tmp_path):
+    async def scenario():
+        async with connect(acp_native) as client:
+            session_id = await client.new(tmp_path)
+            await client.prompt(session_id, "background-subagent")
+            await client.prompt(session_id, "/switch ansuman-2")
+            turn = asyncio.create_task(client.prompt(session_id, "busy"))
+            await wait_for_text(client, "live progress")
+
+            start = len(client.messages)
+            params = {"sessionId": session_id, "cwd": str(tmp_path), "mcpServers": []}
+            await asyncio.wait_for(client.request("session/load", params), 5)
+            replay = client.messages[start:]
+            assert [card["agentId"] for card in subagent_events(replay, STARTED)] == ["bg1"]
+            assert [
+                (card["agentId"], card["success"]) for card in subagent_events(replay, COMPLETED)
+            ] == [("bg1", False)]
+
+            await client.send({"method": "session/cancel", "params": {"sessionId": session_id}})
+            assert (await turn)["result"]["stopReason"] == "cancelled"
+
+    asyncio.run(scenario())
+
+
+def test_gui_resume_in_a_new_bridge_only_marks_background_subagents_stopped(acp_native, tmp_path):
+    async def scenario():
+        async with connect(acp_native) as first:
+            session_id = await first.new(tmp_path)
+            await first.prompt(session_id, "background-subagent")
+        async with connect(acp_native) as second:
+            params = {"sessionId": session_id, "cwd": str(tmp_path), "mcpServers": []}
+            assert "result" in await second.request("session/resume", params)
+            assert not subagent_events(second.messages, STARTED)
+            (stopped,) = subagent_events(second.messages, COMPLETED)
+            assert (stopped["agentId"], stopped["success"]) == ("bg1", False)
+
+    asyncio.run(scenario())
+
+
+def test_gui_reload_leaves_foreground_subagents_to_the_native_replay(acp_native, tmp_path):
+    async def scenario():
+        async with connect(acp_native) as client:
+            session_id = await client.new(tmp_path)
+            await client.prompt(session_id, "foreground-subagent")
+            start = len(client.messages)
+            params = {"sessionId": session_id, "cwd": str(tmp_path), "mcpServers": []}
+            assert "result" in await client.request("session/load", params)
+            assert not subagent_events(client.messages[start:], STARTED)
+
+    asyncio.run(scenario())
+
+
+def test_gui_reload_does_not_duplicate_a_replayed_background_subagent(
+    acp_native, tmp_path, monkeypatch
+):
+    monkeypatch.setenv("FAKE_REPLAY_BACKGROUND", "1")
+
+    async def scenario():
+        async with connect(acp_native) as client:
+            session_id = await client.new(tmp_path)
+            await client.prompt(session_id, "background-subagent")
+            start = len(client.messages)
+            params = {"sessionId": session_id, "cwd": str(tmp_path), "mcpServers": []}
+            assert "result" in await client.request("session/load", params)
+            assert len(subagent_events(client.messages[start:], STARTED)) == 1
+            assert not subagent_events(client.messages[start:], COMPLETED)
+
+            # The replayed card of an interrupted subagent still has to show it stopped.
+            await client.prompt(session_id, "/switch ansuman-2")
+            start = len(client.messages)
+            assert "result" in await client.request("session/load", params)
+            assert len(subagent_events(client.messages[start:], STARTED)) == 1
+            (stopped,) = subagent_events(client.messages[start:], COMPLETED)
+            assert (stopped["agentId"], stopped["success"]) == ("bg1", False)
+
+    asyncio.run(scenario())
+
+
+def test_gui_stop_subagent_reaches_the_native_during_a_turn(acp_native, tmp_path):
+    async def scenario():
+        async with connect(acp_native) as client:
+            session_id = await client.new(tmp_path)
+            turn = asyncio.create_task(client.prompt(session_id, "busy"))
+            await wait_for_text(client, "live progress")
+            stop = client.request(
+                "_cognition.ai/subagent/cancel", {"sessionId": session_id, "agentId": "bg1"}
+            )
+            assert "result" in await asyncio.wait_for(stop, 5)
+            assert not turn.done()
+            assert "_cognition.ai/subagent/cancel" in [
+                call["method"] for call in logged(acp_native)
+            ]
             await client.send({"method": "session/cancel", "params": {"sessionId": session_id}})
             assert (await turn)["result"]["stopReason"] == "cancelled"
 

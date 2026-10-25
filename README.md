@@ -297,7 +297,8 @@ immediately. The server runs `npx -y chrome-devtools-mcp@1.10.1`, so Node.js is 
 
 ### Watch the agent's browser and canvas beside the chat
 
-`ds panels install` adds two panels to Devin Desktop (a small extension with no dependencies):
+`ds panels install` adds two panels and a subagent status badge to Devin Desktop (a small
+extension with no dependencies):
 
 ```
 ┌──────────── chat ────────────┬──────── Agent Browser / Canvas ────────┐
@@ -323,6 +324,12 @@ immediately. The server runs `npx -y chrome-devtools-mcp@1.10.1`, so Node.js is 
   directly, so no browser tab and no restart of open chats is needed.
   `Switch: Open Whiteboard` lists this workspace's boards (newest first) so you can reopen one
   yourself. Setting `switchPanels.whiteboardHome` points at a non-default `WHITEBOARD_HOME`.
+
+- **Running subagents**: while any chat in the window has subagents working, the status bar
+  shows `⟳ 2 subagents`. Hover for each one's chat, running time and latest step; click (or
+  `Switch: Show Running Subagents`) to pick one and see its latest saved steps. It only shows
+  what is running: resuming stopped subagents is left to the agent. Only Switch GUI chats are
+  tracked, not Desktop's built-in agent.
 
 Switch gives chats `WHITEBOARD_CHAT_COMMAND="ds chat id"` (unless you set it), so a chat keeps
 its board across account handoffs. `ds panels status` shows the installed version.

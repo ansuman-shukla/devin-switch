@@ -1,7 +1,10 @@
 import argparse
 import asyncio
 import importlib.util
+import sys
 import time
+import types
+from contextlib import asynccontextmanager
 from pathlib import Path
 
 import pytest
@@ -88,3 +91,156 @@ def test_redact_hides_code_like_values() -> None:
     text = "Copy your login code\nabcdefghijklmnopqrstuvwxyz0123\nCopy code"
     assert "abcdefghij" not in enroll.redact(text)
     assert "Copy your login code" in enroll.redact(text)
+
+
+@pytest.fixture
+def fake_playwright(monkeypatch: pytest.MonkeyPatch):
+    browser = FakeBrowser()
+
+    @asynccontextmanager
+    async def async_playwright():
+        yield types.SimpleNamespace(chromium=types.SimpleNamespace(connect_over_cdp=connect))
+
+    async def connect(url: str, timeout: int) -> "FakeBrowser":
+        return browser
+
+    module = types.ModuleType("playwright.async_api")
+    module.async_playwright = async_playwright
+    monkeypatch.setitem(sys.modules, "playwright", types.ModuleType("playwright"))
+    monkeypatch.setitem(sys.modules, "playwright.async_api", module)
+    return browser
+
+
+class FakePage:
+    def __init__(self, url: str = "about:blank", title: str = "") -> None:
+        self.url, self._title, self.opened = url, title, None
+
+    async def title(self) -> str:
+        return self._title
+
+    async def goto(self, url: str, timeout: int) -> None:
+        self.opened = url
+        self.url, self._title = FakeBrowser.landing
+
+    async def wait_for_timeout(self, ms: int) -> None:
+        pass
+
+
+class FakeContext:
+    def __init__(self, pages: list[FakePage]) -> None:
+        self.pages = pages
+
+    async def new_page(self) -> FakePage:
+        page = FakePage()
+        self.pages.append(page)
+        return page
+
+
+class FakeBrowser:
+    landing = ("https://mail.google.com/mail/u/0/#inbox", "Inbox - me@gmail.com - Gmail")
+
+    def __init__(self) -> None:
+        self.contexts = [FakeContext([FakePage("https://example.com", "Example")])]
+        self.connected = True
+
+    def is_connected(self) -> bool:
+        return self.connected
+
+
+def plan_args(*extra: str) -> argparse.Namespace:
+    return enroll.parser().parse_args(
+        ["--email", "me@gmail.com", "--first", "1", "--last", "2", "--first-alias", "1"]
+        + ["--pause", "0"]
+        + ["--pass-wait", "0", *extra]
+    )
+
+
+def fake_enroller(monkeypatch, failures: dict[str, int], browser: FakeBrowser) -> list[str]:
+    calls: list[str] = []
+
+    class Enroller:
+        def __init__(self, args: argparse.Namespace) -> None:
+            self.browser = browser
+
+        async def connect(self, playwright) -> None:
+            pass
+
+        async def enroll(self, target) -> str:
+            calls.append(target.alias)
+            if failures.get(target.alias, 0) > 0:
+                failures[target.alias] -= 1
+                raise enroll.EnrollError("rate limited")
+            return "Teams"
+
+    monkeypatch.setattr(enroll, "Enroller", Enroller)
+    monkeypatch.setattr(enroll, "signed_in", lambda alias: False)
+    return calls
+
+
+def test_failed_seat_is_retried_on_the_next_pass(monkeypatch, fake_playwright, capsys) -> None:
+    args = plan_args("--passes", "2")
+    calls = fake_enroller(monkeypatch, {"ansuman-2": 1}, fake_playwright)
+    assert asyncio.run(enroll.run(args, enroll.targets(args))) == 0
+    assert calls == ["ansuman-1", "ansuman-2", "ansuman-2"]
+    output = capsys.readouterr().out
+    assert "pass 1 left 1: ansuman-2" in output
+    assert "ALL DONE" in output
+
+
+def test_run_gives_up_after_the_last_pass(monkeypatch, fake_playwright, capsys) -> None:
+    args = plan_args("--passes", "2")
+    calls = fake_enroller(monkeypatch, {"ansuman-1": 5}, fake_playwright)
+    assert asyncio.run(enroll.run(args, enroll.targets(args))) == 1
+    assert calls == ["ansuman-1", "ansuman-2", "ansuman-1"]
+    assert "GAVE UP on: ansuman-1" in capsys.readouterr().out
+
+
+def test_lost_browser_connection_stops_the_run(monkeypatch, fake_playwright) -> None:
+    args = plan_args("--passes", "3")
+    calls = fake_enroller(monkeypatch, {"ansuman-1": 1}, fake_playwright)
+    fake_playwright.connected = False
+    with pytest.raises(enroll.EnrollError):
+        asyncio.run(enroll.run(args, enroll.targets(args)))
+    assert calls == ["ansuman-1"]
+
+
+@pytest.fixture
+def chrome_port(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    (tmp_path / "DevToolsActivePort").write_text("9222\n/devtools/browser/x\n")
+    monkeypatch.setattr(enroll, "CHROME_DATA", tmp_path)
+
+
+def connect(browser: FakeBrowser) -> "enroll.Enroller":
+    enroller = enroll.Enroller(plan_args())
+
+    async def go() -> None:
+        connect = types.SimpleNamespace(connect_over_cdp=lambda url, timeout: _ready(browser))
+        await enroller.connect(types.SimpleNamespace(chromium=connect))
+
+    asyncio.run(go())
+    return enroller
+
+
+async def _ready(value):
+    return value
+
+
+def test_connect_opens_gmail_for_the_account_when_no_tab_matches(chrome_port) -> None:
+    browser = FakeBrowser()
+    enroller = connect(browser)
+    assert enroller.gmail.opened == "https://mail.google.com/mail/?authuser=me@gmail.com"
+    assert enroller.gmail in browser.contexts[0].pages
+
+
+def test_connect_reuses_an_open_gmail_tab_in_any_context(chrome_port) -> None:
+    browser = FakeBrowser()
+    tab = FakePage(*FakeBrowser.landing)
+    browser.contexts.append(FakeContext([tab]))
+    assert connect(browser).gmail is tab
+    assert len(browser.contexts[0].pages) == 1
+
+
+def test_connect_fails_when_gmail_opens_for_another_account(chrome_port, monkeypatch) -> None:
+    monkeypatch.setattr(FakeBrowser, "landing", ("https://mail.google.com/", "other@gmail.com"))
+    with pytest.raises(enroll.EnrollError):
+        connect(FakeBrowser())

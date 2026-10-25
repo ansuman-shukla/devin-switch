@@ -23,6 +23,7 @@ QUOTA_FAILURE = re.compile(r"usage quota has been exhausted|quota exhausted", re
 TASK_LIMIT = 4000
 PROGRESS_LIMIT = 2000
 PROGRESS_STEPS = 6
+STEP_LIMIT = 240
 
 
 def path(store: Store, session_id: str) -> Path:
@@ -120,7 +121,7 @@ def summarize(message: dict) -> str:
     return f"{role}: {text[:600]}" if text else ""
 
 
-def progress(store: Store, session_id: str, agent: str) -> str:
+def progress(store: Store, session_id: str, agent: str, limit: int = PROGRESS_STEPS) -> str:
     """The last steps of a subagent's saved transcript, or "" when none is saved."""
     database = store.root / "shared/cli/sessions.db"
     if not database.exists():
@@ -134,7 +135,7 @@ def progress(store: Store, session_id: str, agent: str) -> str:
             if head is None:
                 return ""
             steps, node = [], head[0]
-            while node is not None and len(steps) < PROGRESS_STEPS * 3:
+            while node is not None and len(steps) < limit * 3:
                 row = connection.execute(
                     "SELECT parent_node_id, chat_message FROM message_nodes "
                     "WHERE session_id = ? AND node_id = ?",
@@ -152,8 +153,28 @@ def progress(store: Store, session_id: str, agent: str) -> str:
                         steps.append(line)
     except sqlite3.Error:
         return ""
-    text = "\n".join(reversed(steps[:PROGRESS_STEPS]))
+    text = "\n".join(reversed(steps[:limit]))
     return text[-PROGRESS_LIMIT:]
+
+
+def listing(store: Store, session_id: str) -> list[dict]:
+    """A chat's running and stopped subagents for the Mac app, oldest first."""
+    state = load(store, session_id)
+    entries = [
+        {
+            "id": agent,
+            "title": info.get("title") or "",
+            "profile": info.get("profile") or "",
+            "background": bool(info.get("background")),
+            "started_at": float(info.get("started_at") or 0),
+            "status": status,
+            "reason": info.get("reason"),
+            "last_step": progress(store, session_id, agent, limit=1)[:STEP_LIMIT],
+        }
+        for status, group in (("running", state["running"]), ("stopped", state["interrupted"]))
+        for agent, info in group.items()
+    ]
+    return sorted(entries, key=lambda entry: entry["started_at"])
 
 
 def resume_text(store: Store, session_id: str, agents: dict) -> str:

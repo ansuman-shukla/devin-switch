@@ -10,7 +10,7 @@ import uuid
 from dataclasses import asdict
 from pathlib import Path
 
-from devin_switch import acp_state, browser, enrollment, sessions, usage
+from devin_switch import acp_state, browser, enrollment, sessions, subagents, usage
 from devin_switch.cli import choose_next, selected_name
 from devin_switch.native import Native, find_binary
 from devin_switch.store import Store, SwitchError, private_directory
@@ -40,6 +40,7 @@ def snapshot(store: Store) -> dict[str, object]:
     overview = sessions.overview(store)
     for run in overview["runs"]:
         run["gui_lifecycle"] = None
+        run["subagents"] = []
         if (
             run["active"]
             and run["kind"] == "chat"
@@ -49,6 +50,11 @@ def snapshot(store: Store) -> dict[str, object]:
                 run["gui_lifecycle"] = acp_state.lifecycle(store, run["id"])
             except (SwitchError, OSError):
                 pass
+            if run["session_id"]:
+                try:
+                    run["subagents"] = subagents.listing(store, run["session_id"])
+                except (SwitchError, OSError):
+                    pass
     return {
         "accounts": tuple(
             {

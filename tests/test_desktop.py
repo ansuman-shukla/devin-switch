@@ -7,7 +7,7 @@ from pathlib import Path
 
 import pytest
 
-from devin_switch import browser, desktop
+from devin_switch import browser, desktop, subagents
 from devin_switch.native import Native
 from devin_switch.store import Store, SwitchError
 
@@ -57,6 +57,68 @@ def test_snapshot_keeps_accounts_when_chrome_profiles_are_not_readable(
     assert [account["name"] for account in state["accounts"]] == ["ansuman-1", "ansuman-2"]
     assert state["profiles"] == ()
     assert "permission" in str(state["chrome_error"]).lower()
+
+
+def test_snapshot_lists_subagents_only_for_open_gui_chats(
+    store: Store, monkeypatch: pytest.MonkeyPatch, save_subagent_transcript
+) -> None:
+    monkeypatch.setattr(browser, "profiles", lambda: ())
+    session_id = "chat-with-subagents"
+    gui, terminal, closed = ("a" * 32, "b" * 32, "c" * 32)
+    runs = [
+        {"id": run, "account": "ansuman-1", "project": "/p", "kind": "chat", "started_at": 1,
+         "session_id": session_id, "ended_at": None, "active": run != closed}
+        for run in (gui, terminal, closed)
+    ]  # fmt: skip
+    monkeypatch.setattr(
+        desktop.sessions,
+        "overview",
+        lambda _: {"runs": [dict(run) for run in runs], "sessions": [], "history_error": None},
+    )
+    started = {"title": "Explore", "task": "Look", "profile": "subagent_explore"}
+    subagents.record(store, session_id, subagents.STARTED, {"agentId": "early", **started})
+    subagents.interrupt_running(store, session_id)
+    subagents.record(
+        store,
+        session_id,
+        subagents.STARTED,
+        {"agentId": "later", "title": "Ticker", "profile": "general", "isBackground": True},
+    )
+    save_subagent_transcript(store, session_id, "early")
+    with store.lock(f"acp-controller-{gui}.lock"), store.lock(f"acp-controller-{closed}.lock"):
+        state = desktop.snapshot(store)
+    by_id = {run["id"]: run for run in state["runs"]}
+    listed = by_id[gui]["subagents"]
+    assert [{k: v for k, v in entry.items() if k != "started_at"} for entry in listed] == [
+        {
+            "id": "early",
+            "title": "Explore",
+            "profile": "subagent_explore",
+            "background": False,
+            "status": "stopped",
+            "reason": "the agent restarted",
+            "last_step": "tool: early ran the tests: 3 passed",
+        },
+        {
+            "id": "later",
+            "title": "Ticker",
+            "profile": "general",
+            "background": True,
+            "status": "running",
+            "reason": None,
+            "last_step": "",
+        },
+    ]
+    assert 0 < listed[0]["started_at"] <= listed[1]["started_at"]
+    assert by_id[terminal]["subagents"] == [] and by_id[closed]["subagents"] == []
+    json.dumps(state)
+
+
+def test_subagent_listing_keeps_the_last_step_short(store: Store, save_subagent_transcript):
+    subagents.record(store, "chat", subagents.STARTED, {"agentId": "x" * 600})
+    save_subagent_transcript(store, "chat", "x" * 600)
+    (entry,) = subagents.listing(store, "chat")
+    assert entry["last_step"].startswith("tool: ") and len(entry["last_step"]) == 240
 
 
 def test_add_validates_chrome_profile_and_keeps_existing_account(

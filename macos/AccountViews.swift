@@ -468,9 +468,7 @@ func elapsedDescription(since start: Double, now: Double = Date().timeIntervalSi
 }
 
 struct SubagentList: View {
-    @EnvironmentObject var model: AppModel
     let agents: [SubagentRun]
-    @State private var copied = false
 
     var summary: String {
         let running = agents.filter(\.running).count
@@ -488,29 +486,7 @@ struct SubagentList: View {
                 Spacer(minLength: 0)
             }
             ForEach(agents) { SubagentRow(agent: $0) }
-            if agents.contains(where: { !$0.running }) {
-                ViewThatFits(in: .horizontal) {
-                    HStack(spacing: 12) { resumeHint; Spacer(minLength: 0); copyButton }
-                    VStack(alignment: .leading, spacing: 8) { resumeHint; copyButton }
-                }
-            }
         }
-    }
-
-    var resumeHint: some View {
-        Text("Stopped subagents keep their saved progress. Send the command in this chat to continue them.")
-            .font(.system(size: 10)).foregroundStyle(Palette.secondary).fixedSize(horizontal: false, vertical: true)
-    }
-
-    var copyButton: some View {
-        Button {
-            model.copyResumeSubagentsCommand()
-            copied = true
-        } label: {
-            Label(copied ? "Copied" : "Copy \(AppModel.resumeSubagentsCommand)", systemImage: copied ? "checkmark" : "doc.on.doc")
-        }.buttonStyle(MonoButton()).fixedSize()
-            .help("Copy \(AppModel.resumeSubagentsCommand) to paste into this chat in Devin")
-            .accessibilityLabel("Copy \(AppModel.resumeSubagentsCommand) command")
     }
 }
 

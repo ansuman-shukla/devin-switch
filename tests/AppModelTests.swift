@@ -521,9 +521,6 @@ func sampleSnapshot(used: Double = 25, selected: String = "work") -> Snapshot {
     @MainActor static func sessionSubagents(model: AppModel, bridge: MockBridge) async throws {
         NSApplication.shared.setActivationPolicy(.prohibited)
         try expect(elapsedDescription(since: 0, now: 59) == "under 1m" && elapsedDescription(since: 0, now: 300) == "5m" && elapsedDescription(since: 0, now: 3_900) == "1h 5m", "Elapsed time must read in minutes and hours")
-        let pasteboard = NSPasteboard(name: NSPasteboard.Name("local.devinswitch.tests.\(UUID().uuidString)"))
-        defer { pasteboard.releaseGlobally() }
-        model.pasteboard = pasteboard
         model.snapshot = sampleSnapshot()
         let now = Date().timeIntervalSince1970
         let state = """
@@ -532,73 +529,36 @@ func sampleSnapshot(used: Double = 25, selected: String = "work") -> Snapshot {
          {"id":"b","title":"Explore auth","profile":"subagent_explore","background":false,"started_at":\(now - 600),"status":"stopped","reason":"usage ran out","last_step":""}]}
         """
         let run = try JSONDecoder().decode(SessionRun.self, from: Data(state.utf8))
-        model.snapshot.runs = [run]
-        let view = NSHostingView(rootView: OpenSessionsPanel().environmentObject(model).foregroundStyle(Palette.text).preferredColorScheme(.dark))
-        view.sizingOptions = []
-        let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 780, height: 620), styleMask: [.titled], backing: .buffered, defer: false)
-        window.contentView = view
-        window.makeKeyAndOrderFront(nil)
-        defer { window.orderOut(nil) }
-        func observations() async throws -> [VNRecognizedTextObservation] {
-            try await Task.sleep(for: .milliseconds(80))
-            view.layoutSubtreeIfNeeded()
-            let renderer = ImageRenderer(content: OpenSessionsPanel().environmentObject(model)
-                .foregroundStyle(Palette.text).preferredColorScheme(.dark)
-                .frame(width: view.bounds.width, height: view.bounds.height))
+        func render<V: View>(_ content: V, width: CGFloat, name: String) throws -> String {
+            let renderer = ImageRenderer(content: content.environmentObject(model).frame(width: width)
+                .background(Palette.background).foregroundStyle(Palette.text).preferredColorScheme(.dark))
             renderer.scale = 3
-            guard let image = renderer.cgImage else { throw TestFailure(description: "Could not render subagent rows") }
+            guard let image = renderer.cgImage else { throw TestFailure(description: "Could not render \(name)") }
             if CommandLine.arguments.count > 2 {
-                let path = URL(fileURLWithPath: CommandLine.arguments[2]).appendingPathComponent("session-subagents-\(model.snapshot.runs[0].subagents?.count ?? 0).png")
+                let path = URL(fileURLWithPath: CommandLine.arguments[2]).appendingPathComponent("\(name).png")
                 try NSBitmapImageRep(cgImage: image).representation(using: .png, properties: [:])!.write(to: path)
             }
-            let request = VNRecognizeTextRequest()
-            request.recognitionLevel = .accurate
-            request.usesLanguageCorrection = false
-            try VNImageRequestHandler(cgImage: image).perform([request])
-            return request.results ?? []
+            return try recognizedText(in: image)
         }
-        func text(_ found: [VNRecognizedTextObservation]) -> String {
-            found.compactMap { $0.topCandidates(1).first?.string }.joined(separator: " ")
-        }
-        let found = try await observations()
-        let section = ImageRenderer(content: SubagentList(agents: run.subagents!).environmentObject(model)
-            .padding(20).frame(width: 720).background(Palette.background)
-            .foregroundStyle(Palette.text).preferredColorScheme(.dark))
-        section.scale = 3
-        guard let sectionImage = section.cgImage else { throw TestFailure(description: "Could not render the subagent section") }
-        var labels = try recognizedText(in: sectionImage)
-        for label in ["Subagents", "1 running", "1 stopped", "Sleep ticker", "Background", "Running", "5m", "Last step", "10:48:36", "Explore auth", "Stopped because usage ran out", "subagent_explore", "Copy /resume-subagents"] {
+        var labels = try render(SubagentList(agents: run.subagents!).padding(20), width: 720, name: "subagents-section")
+        for label in ["Subagents", "1 running", "1 stopped", "Sleep ticker", "Background", "Running", "5m", "Last step", "10:48:36", "Explore auth", "Stopped because usage ran out", "subagent_explore"] {
             try expect(labels.contains(label), "Subagent rows must show \(label); found: \(labels)")
         }
         try expect(labels.range(of: "Sleep ticker")!.lowerBound < labels.range(of: "Explore auth")!.lowerBound, "Rows must keep the bridge's order")
-        guard let copy = found.first(where: { $0.topCandidates(1).first?.string.contains("Copy") == true }) else {
-            throw TestFailure(description: "The copy button must be visible; found: \(labels)")
-        }
-        let box = copy.boundingBox
-        let point = NSPoint(x: box.midX * view.bounds.width, y: (view.isFlipped ? 1 - box.midY : box.midY) * view.bounds.height)
-        for type in [NSEvent.EventType.leftMouseDown, .leftMouseUp] {
-            let event = NSEvent.mouseEvent(with: type, location: view.convert(point, to: nil), modifierFlags: [], timestamp: ProcessInfo.processInfo.systemUptime, windowNumber: window.windowNumber, context: nil, eventNumber: 0, clickCount: 1, pressure: 1)!
-            window.sendEvent(event)
-        }
-        try await waitUntil { pasteboard.string(forType: .string) == "/resume-subagents" }
-        try expect(bridge.requests.isEmpty, "Copying the resume command must not call the CLI or send a prompt")
-        try await Task.sleep(for: .milliseconds(80))
-        view.layoutSubtreeIfNeeded()
-        guard let live = view.bitmapImageRepForCachingDisplay(in: view.bounds) else { throw TestFailure(description: "Could not capture the live panel") }
-        view.cacheDisplay(in: view.bounds, to: live)
-        labels = try recognizedText(in: live.cgImage!)
-        try expect(labels.contains("Copied"), "The copy button must confirm the copy; found: \(labels)")
+        try expect(!labels.contains("resume") && !labels.contains("Copy"), "Subagent rows only show status; resuming is up to the agent; found: \(labels)")
         var running = run
         running.subagents = run.subagents!.filter(\.running)
-        model.snapshot.runs = [running]
-        labels = text(try await observations())
-        try expect(labels.contains("Sleep ticker") && !labels.contains("Copy") && !labels.contains("stopped"), "Only stopped subagents offer the resume command; found: \(labels)")
+        labels = try render(SubagentList(agents: running.subagents!).padding(20), width: 720, name: "subagents-running")
+        try expect(labels.contains("1 running") && !labels.contains("stopped"), "The summary must only count what is listed; found: \(labels)")
+        model.snapshot.runs = [run]
+        labels = try render(OpenSessionsPanel(), width: 780, name: "subagents-panel")
+        try expect(labels.contains("Launched chat") && labels.contains("Sleep ticker"), "Open sessions must list a chat's subagents under it; found: \(labels)")
         var plain = run
         plain.subagents = nil
         model.snapshot.runs = [plain]
-        labels = text(try await observations())
-        try expect(labels.contains("project") && !labels.contains("Subagents"), "Chats without subagents must not show an empty section; found: \(labels)")
-        withExtendedLifetime(window) {}
+        labels = try render(OpenSessionsPanel(), width: 780, name: "subagents-none")
+        try expect(labels.contains("Launched chat") && !labels.contains("Subagents"), "Chats without subagents must not show an empty section; found: \(labels)")
+        try expect(bridge.requests.isEmpty, "Showing subagents must not call the CLI")
     }
 
     @MainActor static func workspaceControls(model: AppModel, defaults: UserDefaults) async throws {

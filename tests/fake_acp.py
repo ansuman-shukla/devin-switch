@@ -404,6 +404,28 @@ async def handle(message):
         settings["model"] = params["modelId"]
     elif method == "_cognition.ai/command/revise":
         result = {"command": params["command"] + " --revised"}
+    elif method.startswith("_cognition.ai/mcp/"):
+        # Like the native, user-scope servers live in this login's config directory.
+        path = Path(os.environ["XDG_CONFIG_HOME"]) / "devin/mcp_config.json"
+        config = json.loads(path.read_text())
+        if method == "_cognition.ai/mcp/connectServer":
+            # Stands in for an OAuth sign-in that waits for the user's browser.
+            while not Path(os.environ["FAKE_MCP_CONNECT_GATE"]).exists():
+                await asyncio.sleep(0.01)
+        elif method == "_cognition.ai/mcp/listServers":
+            result = {
+                "servers": [
+                    {"serverId": name, "sourcePath": str(path), "connectionStatus": "not_started"}
+                    for name in config["mcpServers"]
+                ]
+            }
+        else:
+            if method == "_cognition.ai/mcp/installServer":
+                config["mcpServers"][params["serverId"]] = params["config"]
+            elif method == "_cognition.ai/mcp/removeServer":
+                config["mcpServers"].pop(params["serverId"])
+            path.write_text(json.dumps(config))
+            emit({"method": "_cognition.ai/mcp/serversChanged", "params": {}})
     elif method == "session/list":
         result = {
             "sessions": [

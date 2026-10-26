@@ -224,7 +224,8 @@ class Backend:
             self.process = subprocess.Popen(
                 (str(self.bridge.native.binary), *self.bridge.flags, "acp"),
                 env=environment,
-                cwd=self.project,
+                # The native serves the session's cwd from any folder, even a deleted one.
+                cwd=self.project if self.project.is_dir() else Path.home(),
                 pass_fds=self.lease.fds,
                 stdin=subprocess.PIPE,
                 stdout=subprocess.PIPE,
@@ -950,8 +951,8 @@ class Bridge:
 
     async def open_once(self, method, params):
         cwd = params.get("cwd")
-        if not isinstance(cwd, str) or not Path(cwd).is_absolute() or not Path(cwd).is_dir():
-            raise RpcError("Choose an existing absolute project directory.", -32602)
+        if not isinstance(cwd, str) or not Path(cwd).is_absolute():
+            raise RpcError("Choose an absolute project directory.", -32602)
         project = Path(cwd).resolve()
         setup = copy.deepcopy(params)
         setup["cwd"] = str(project)
@@ -960,8 +961,6 @@ class Bridge:
             acp_state.session_key(session_id)
             if session_id in self.chats:
                 chat = self.chats[session_id]
-                if chat.setup["cwd"] != str(project):
-                    raise SwitchError("Resume this conversation from its original project.")
                 if chat.controls is not None:
                     return await self.replay(chat, method)
                 async with chat.access():
@@ -1298,9 +1297,7 @@ class Bridge:
                 "This GUI connection is closed. Reopen the chat if it appears in shared "
                 "history, or start a new one. No account was changed."
             )
-        await asyncio.to_thread(
-            acp_state.check_handoff, store, chat.session_id, chat.setup["cwd"], old.lease.run.id
-        )
+        await asyncio.to_thread(acp_state.check_handoff, store, chat.session_id, old.lease.run.id)
         if account_name:
             account = store.account(account_name)
         else:
@@ -1312,9 +1309,7 @@ class Bridge:
         if account.name in (source.name, old.account.name):
             raise SwitchError("This GUI chat already uses that account.")
         await asyncio.to_thread(acp_state.check_login, self.native, account)
-        await asyncio.to_thread(
-            acp_state.check_handoff, store, chat.session_id, chat.setup["cwd"], old.lease.run.id
-        )
+        await asyncio.to_thread(acp_state.check_handoff, store, chat.session_id, old.lease.run.id)
         settings, mode, model = copy.deepcopy(old.configs), old.mode, old.model
         with store.lock(timeout=5):
             acp_state.check_switchable(store, old.lease.run.id)
@@ -1453,7 +1448,7 @@ class Bridge:
                     if chat.blank and (manual or acp_state.saved_chat(store, chat.session_id)):
                         chat.blank = False
                     if not chat.blank:
-                        saved = acp_state.check_saved(store, chat.session_id, chat.setup["cwd"])
+                        saved = acp_state.check_saved(store, chat.session_id)
                         others = [run for run in sessions.runs(store) if run["id"] != run_id]
                         if blocker := sessions.resume_blocker(saved, others):
                             raise SwitchError(blocker)

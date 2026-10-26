@@ -102,6 +102,20 @@ def quota_exhausted(error: RpcError) -> bool:
     )
 
 
+def prompt_command(params: dict) -> tuple[list, list[str], str]:
+    blocks = params.get("prompt", [])
+    text = next(
+        (block.get("text", "") for block in blocks if block.get("type") == "text"), ""
+    ).strip()
+    words = text.split()
+    command = words[0] if words else ""
+    if command == "!ds" and words[1:2] == ["switch"]:
+        options = words[2:]
+        command = "/switch-continue" if "--continue" in options else "/switch"
+        words = [command, *(word for word in options if word != "--continue")]
+    return blocks, words, command
+
+
 def continue_params(session_id: str) -> dict:
     return {"sessionId": session_id, "prompt": [{"type": "text", "text": handoff.CONTINUE_PROMPT}]}
 
@@ -1039,12 +1053,7 @@ class Bridge:
             return backend.reopened()
 
     async def local_prompt(self, chat, params):
-        blocks = params.get("prompt", [])
-        text = next(
-            (block.get("text", "") for block in blocks if block.get("type") == "text"), ""
-        ).strip()
-        words = text.split()
-        command = words[0] if words else ""
+        blocks, words, command = prompt_command(params)
         done = {"stopReason": "end_turn"}
         if command.lstrip("/") in BLOCKED_COMMANDS and command.startswith("/"):
             await self.note(
@@ -1053,10 +1062,6 @@ class Bridge:
                 "Use /switch to change this chat's account.",
             )
             return done
-        if command == "!ds" and words[1:2] == ["switch"]:
-            options = words[2:]
-            command = "/switch-continue" if "--continue" in options else "/switch"
-            words = [command, *(word for word in options if word != "--continue")]
         if command not in LOCAL_NAMES:
             return None
         limit = 2 if command in {"/switch", "/switch-continue", "/auto-switch"} else 1

@@ -125,6 +125,13 @@ def update(session_id, change):
     emit({"method": "session/update", "params": {"sessionId": session_id, "update": change}})
 
 
+def process_cwd():
+    try:
+        return os.getcwd()
+    except FileNotFoundError:  # the folder was deleted after this process started in it
+        return None
+
+
 def whiteboard_chat(params):
     """Runs the chat-id command an MCP server would get, only when a test asks for it."""
     if (params.get("prompt") or [{}])[0].get("text") != "whiteboard-chat":
@@ -150,6 +157,7 @@ async def handle(message):
                         "gh_config_dir": os.environ.get("GH_CONFIG_DIR"),
                         "text": (params.get("prompt") or [{}])[0].get("text"),
                         "uri": params.get("uri"),
+                        "process_cwd": process_cwd(),
                         "chat_id": whiteboard_chat(params),
                     }
                 )
@@ -348,6 +356,11 @@ async def handle(message):
                 close_fds=False,
             )
         decision = {}
+        if text == "withdrawn":
+            # The native cancels a request it no longer needs (e.g. after Stop) with its own id.
+            emit({"id": 101, "method": "elicitation/create", "params": {"sessionId": loaded}})
+            await asyncio.sleep(0.2)
+            emit({"method": "$/cancel_request", "params": {"requestId": 101}})
         if text in {"permission", "question"}:
             future = asyncio.get_running_loop().create_future()
             replies[100] = future

@@ -416,6 +416,7 @@ def test_gui_delayed_decisions_reach_only_the_requesting_chat(acp_native, tmp_pa
         ("session/set_mode", {"modeId": "code"}),
         ("session/set_model", {"modelId": "other-model"}),
         ("_cognition.ai/command/revise", {"command": "printf test", "note": "Use safe flags"}),
+        ("_cognition.ai/subagent/cancel", {"agentId": "s1"}),
     ],
 )
 def test_gui_controls_respond_while_tool_approval_is_pending(acp_native, tmp_path, method, params):

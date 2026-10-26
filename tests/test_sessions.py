@@ -465,6 +465,30 @@ def test_distinct_saved_chats_can_resume_in_same_repository(signed_in, tmp_path,
                 pytest.fail("Duplicate launch must be rejected")
 
 
+def test_terminal_login_check_runs_without_the_store_lock(signed_in, tmp_path, monkeypatch):
+    """`devin auth status` can take seconds; Desktop chats waiting for the lock failed after 5 s."""
+    from devin_switch import sessions
+    from devin_switch.native import Native
+
+    monkeypatch.chdir(tmp_path)
+    authenticated = Native.authenticated
+    held = []
+
+    def check(self, account):
+        held.append(self.store.locked("lock"))
+        return authenticated(self, account)
+
+    monkeypatch.setattr(Native, "authenticated", check)
+    with sessions.managed(signed_in, "ansuman-1", ()) as (_, account, _):
+        assert account.name == "ansuman-1"
+    assert held == [False]
+    signed_in.store.credentials(signed_in.store.account("ansuman-2")).unlink()
+    with pytest.raises(SwitchError, match="No saved login for 'ansuman-2'"):
+        with sessions.managed(signed_in, "ansuman-2", ()):
+            pytest.fail("A launch without a login must be rejected")
+    assert not any(run["active"] for run in sessions.runs(signed_in.store))
+
+
 @pytest.mark.parametrize(
     "stamp,expected", [("original-start", True), ("reused-pid", False), (None, False)]
 )

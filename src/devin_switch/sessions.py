@@ -215,8 +215,10 @@ def managed(
             account = store.account(name) if name else store.selected()
             exclusive = kind == "login" or arguments[:1] == ("auth",)
             account_fd = stack.enter_context(store.account_lock(account, shared=not exclusive))
-            if kind != "login":
-                native.require_login(account)
+        if kind != "login":
+            # A network call that can take seconds: only the account lock is held for it.
+            native.require_login(account)
+        with store.lock(timeout=5):
             project = Path.cwd().resolve()
             session_id = None
             if kind == "chat":

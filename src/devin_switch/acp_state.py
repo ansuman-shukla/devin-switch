@@ -166,6 +166,16 @@ def request_handover(
     return asked, holders, orphans
 
 
+def held_elsewhere(store: Store, session_id: str, own: set[str]) -> bool:
+    return any(
+        run["active"]
+        and run["kind"] == "chat"
+        and run["session_id"] == session_id
+        and run["id"] not in own
+        for run in sessions.runs(store)
+    )
+
+
 def held(store: Store, session_id: str, holders: list[str]) -> bool:
     return any(
         run["active"] and run["id"] in holders and run["session_id"] == session_id
@@ -316,7 +326,9 @@ class Lease:
                 sessions.record_process(self.store, self.run.id, os.getpid(), role="wrapper")
                 write_json(self.path, asdict(self.run))
             if verify_login:
-                native.require_login(account)
+                # GUI chats only need the saved file: the network check took 1-10 s per chat
+                # (30 s offline) and a dead login still fails visibly at the first message.
+                native.require_login(account, network=False)
         except BaseException:
             self.close(ended=True)
             raise

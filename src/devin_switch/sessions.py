@@ -108,6 +108,35 @@ def runs(store: Store) -> list[dict]:
     return sorted(result, key=lambda run: run["started_at"])
 
 
+class ChatMissing(SwitchError):
+    pass
+
+
+class ChatHeld(SwitchError):
+    def __init__(self, message: str, pid: int | None = None):
+        super().__init__(message)
+        self.pid = pid
+
+
+def holder(chat: dict, running: list[dict]) -> dict | None:
+    return next(
+        (
+            run
+            for run in running
+            if run["active"] and run["kind"] == "chat" and run["session_id"] == chat["id"]
+        ),
+        None,
+    )
+
+
+def run_pid(store: Store, run_id: str) -> int | None:
+    try:
+        pid = json.loads((store.root / "runtime" / f"{run_id}.json").read_text())["pid"]
+    except (OSError, ValueError, KeyError, TypeError):
+        return None
+    return pid if type(pid) is int else None
+
+
 PRUNE_AGE = 7 * 24 * 3600
 PRUNE_INTERVAL = 24 * 3600
 
@@ -147,9 +176,8 @@ def prune(store: Store, *, now: float | None = None) -> int:
 
 
 def resume_blocker(chat: dict, running: list[dict]) -> str | None:
-    for run in running:
-        if run["active"] and run["kind"] == "chat" and run["session_id"] == chat["id"]:
-            return "This chat already has an open CLI launch. Close it before resuming again."
+    if holder(chat, running):
+        return "This chat already has an open CLI launch. Close it before resuming again."
     return None
 
 
@@ -172,11 +200,12 @@ def available(store: Store, session_id: str) -> dict:
     """A saved chat no other launch holds; GUI natives load it from any folder."""
     chat = next((chat for chat in history(store) if chat["id"] == session_id), None)
     if chat is None:
-        raise SwitchError(
+        raise ChatMissing(
             "This conversation is no longer in shared history. Refresh and choose another."
         )
-    if blocker := resume_blocker(chat, runs(store)):
-        raise SwitchError(blocker)
+    running = runs(store)
+    if blocker := resume_blocker(chat, running):
+        raise ChatHeld(blocker, run_pid(store, holder(chat, running)["id"]))
     return chat
 
 
@@ -253,8 +282,10 @@ def managed(
             account = store.account(name) if name else store.selected()
             exclusive = kind == "login" or arguments[:1] == ("auth",)
             account_fd = stack.enter_context(store.account_lock(account, shared=not exclusive))
-            if kind != "login":
-                native.require_login(account)
+        if kind != "login":
+            # A network call that can take seconds: only the account lock is held for it.
+            native.require_login(account)
+        with store.lock(timeout=5):
             project = Path.cwd().resolve()
             session_id = None
             if kind == "chat":

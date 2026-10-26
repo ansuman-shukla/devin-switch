@@ -272,13 +272,30 @@ class Enroller:
         self.browser = await playwright.chromium.connect_over_cdp(
             f"ws://127.0.0.1:{port}{path}", timeout=300_000
         )
-        main = self.browser.contexts[0]
-        for page in main.pages:
-            if page.url.startswith("https://mail.google.com/") and (
-                self.args.email.lower() in (await page.title()).lower()
-            ):
-                self.gmail = page
-                return
+        seen = []
+        for index, context in enumerate(self.browser.contexts):
+            for page in context.pages:
+                if page.url.startswith("https://mail.google.com/"):
+                    title = await page.title()
+                    seen.append(f"context {index}: {title[:80]!r}")
+                    if self.args.email.lower() in title.lower():
+                        self.gmail = page
+                        return
+        page = await self.browser.contexts[0].new_page()
+        await page.goto(f"https://mail.google.com/mail/?authuser={self.args.email}", timeout=60_000)
+        await page.wait_for_timeout(8000)
+        title = await page.title()
+        if page.url.startswith("https://mail.google.com/") and (
+            self.args.email.lower() in title.lower()
+        ):
+            self.gmail = page
+            return
+        seen.append(f"opened: {title[:80]!r} at {page.url.split('?')[0][:60]}")
+        print(
+            f"  contexts: {len(self.browser.contexts)}, "
+            f"pages: {sum(len(c.pages) for c in self.browser.contexts)}, "
+            f"gmail tabs: {seen or 'none'}"
+        )
         raise EnrollError(
             f"Open Gmail signed in as {self.args.email} in the Chrome profile where "
             "remote debugging is enabled, then retry."
@@ -410,14 +427,35 @@ async def run(args: argparse.Namespace, plan: list[Target]) -> int:
     async with async_playwright() as playwright:
         enroller = Enroller(args)
         await enroller.connect(playwright)
-        for target in plan:
-            if signed_in(target.alias):
-                print(f"{target.alias}: already signed in; {verify(target, args.plan)}")
-                continue
-            print(f"{target.alias} <- {target.email}", flush=True)
-            print(f"  ok: {await enroller.enroll(target)}", flush=True)
-            await asyncio.sleep(args.pause)
-    return 0
+        pending = list(plan)
+        for attempt in range(1, args.passes + 1):
+            failed = []
+            for target in pending:
+                try:
+                    if signed_in(target.alias):
+                        print(
+                            f"{target.alias}: already signed in; {verify(target, args.plan)}",
+                            flush=True,
+                        )
+                        continue
+                    print(f"{target.alias} <- {target.email}", flush=True)
+                    print(f"  ok: {await enroller.enroll(target)}", flush=True)
+                # Broad on purpose: a restart needs a new Chrome approval, so keep the connection.
+                except Exception as exc:  # noqa: BLE001
+                    if not enroller.browser.is_connected():
+                        raise
+                    print(f"  failed (pass {attempt}): {redact(str(exc))[:300]}", flush=True)
+                    failed.append(target)
+                await asyncio.sleep(args.pause)
+            if not failed:
+                print("ALL DONE", flush=True)
+                return 0
+            pending = failed
+            names = ", ".join(t.alias for t in failed)
+            print(f"pass {attempt} left {len(failed)}: {names}; next pass in {args.pass_wait}s")
+            await asyncio.sleep(args.pass_wait)
+    print("GAVE UP on: " + ", ".join(t.alias for t in pending), flush=True)
+    return 1
 
 
 def parser() -> argparse.ArgumentParser:
@@ -433,6 +471,8 @@ def parser() -> argparse.ArgumentParser:
     result.add_argument("--plan", default="Teams", help="Organization plan to select and verify")
     result.add_argument("--pause", type=int, default=45, help="Seconds between accounts")
     result.add_argument("--rate-limit-retries", type=int, default=8)
+    result.add_argument("--passes", type=int, default=1, help="Passes over failed accounts")
+    result.add_argument("--pass-wait", type=int, default=600, help="Seconds between passes")
     result.add_argument("--ds", default="ds", help="Path to the ds command")
     result.add_argument("--dry-run", action="store_true", help="Print the mapping and exit")
     return result

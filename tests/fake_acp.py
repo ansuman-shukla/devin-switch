@@ -435,8 +435,13 @@ async def handle(message):
         elif method == "_cognition.ai/mcp/listServers":
             result = {
                 "servers": [
-                    {"serverId": name, "sourcePath": str(path), "connectionStatus": "not_started"}
-                    for name in config["mcpServers"]
+                    {
+                        "serverId": name,
+                        "sourcePath": str(path),
+                        "connectionStatus": "not_started",
+                        "disabled": bool(server.get("disabled")),
+                    }
+                    for name, server in config["mcpServers"].items()
                 ]
             }
         else:
@@ -444,6 +449,9 @@ async def handle(message):
                 config["mcpServers"][params["serverId"]] = params["config"]
             elif method == "_cognition.ai/mcp/removeServer":
                 config["mcpServers"].pop(params["serverId"])
+            elif method == "_cognition.ai/mcp/toggleServer":
+                server = config["mcpServers"][params["serverId"]]
+                server["disabled"] = not server.get("disabled")
             path.write_text(json.dumps(config))
             emit({"method": "_cognition.ai/mcp/serversChanged", "params": {}})
     elif method == "session/list":

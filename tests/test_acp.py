@@ -1301,6 +1301,56 @@ def test_gui_startup_and_listing_skip_the_login_check(acp_native, tmp_path, monk
     asyncio.run(scenario())
 
 
+def test_gui_customize_mcp_changes_reach_open_chats_once(acp_native, tmp_path, monkeypatch):
+    """Each chat native runs its own MCP servers; the built-in agent has one per window."""
+    gate = tmp_path / "connect-gate"
+    gate.touch()
+    monkeypatch.setenv("FAKE_MCP_CONNECT_GATE", str(gate))
+
+    async def scenario():
+        async with in_process(acp_native) as (bridge, messages):
+            created = await bridge.dispatch("session/new", {"cwd": str(tmp_path), "mcpServers": []})
+            chat = bridge.chats[created["sessionId"]].backend
+            server = {"command": "docs-mcp", "args": []}
+            await bridge.dispatch(
+                "_cognition.ai/mcp/installServer", {"serverId": "docs", "config": server}
+            )
+            listed = await bridge.dispatch("_cognition.ai/mcp/listServers", {})
+            source = listed["servers"][0]["sourcePath"]
+            changed = len([m for m in messages if m.get("method", "").endswith("serversChanged")])
+            for _ in range(2):
+                await bridge.dispatch(
+                    "_cognition.ai/mcp/toggleServer", {"serverId": "docs", "sourcePath": source}
+                )
+            await bridge.dispatch(
+                "_cognition.ai/mcp/removeServer", {"serverId": "docs", "sourcePath": source}
+            )
+
+            def followed():
+                return [
+                    call["method"].rsplit("/", 1)[1]
+                    for call in logged(acp_native)
+                    if call["pid"] == chat.process.pid and "/mcp/" in call["method"]
+                ]
+
+            async with asyncio.timeout(5):
+                while len(followed()) < 4:
+                    await asyncio.sleep(0.02)
+            # Install connects, disable disconnects, enable connects, remove disconnects.
+            assert followed() == [
+                "connectServer",
+                "disconnectServer",
+                "connectServer",
+                "disconnectServer",
+            ]
+            await asyncio.sleep(0.2)
+            notices = [m for m in messages if m.get("method", "").endswith("serversChanged")]
+            # Only the listing native's notices reach Desktop: one per Customize change.
+            assert len(notices) - changed == 3
+
+    asyncio.run(scenario())
+
+
 def test_gui_reload_mid_turn_replays_without_interrupting_the_turn(acp_native, tmp_path):
     """Switching Desktop surfaces reloads the open chat; a native load would end the turn."""
 

@@ -550,6 +550,7 @@ class Bridge:
         self.lister = None
         self.listing = asyncio.Lock()
         self.spare = None
+        self.spare_folder = Path.cwd().resolve()
         self.filling = False
 
     def spawn(self, coroutine):
@@ -904,12 +905,16 @@ class Bridge:
                 await lister.close()
 
     async def refill(self):
-        """Start a logged-in agent for the default login, so the next chat skips startup."""
+        """Start a logged-in agent for the default login, so the next chat skips startup.
+
+        It runs in the latest chat's folder (first the window's): the native reads a project's
+        own MCP servers from its process folder, so it only serves chats in that folder.
+        """
         if self.filling or self.spare is not None:
             return
         self.filling = True
         try:
-            backend = Backend(self, self.default_account(), Path.home(), spare=True)
+            backend = Backend(self, self.default_account(), self.spare_folder, spare=True)
             await backend.start()
             self.spare = backend
         except (SwitchError, OSError, RpcError):
@@ -932,8 +937,11 @@ class Bridge:
         ):
             await self.drop_spare()
             spare = None
-        if spare is None or spare.account.name != account.name:
-            if spare is not None and spare.account.name != self.default_account().name:
+        self.spare_folder = project
+        if spare is None or spare.account.name != account.name or spare.project != project:
+            if spare is not None and (
+                spare.account.name != self.default_account().name or spare.project != project
+            ):
                 await self.drop_spare()
             self.spawn(self.refill())
             backend = Backend(self, account, project, session_id)

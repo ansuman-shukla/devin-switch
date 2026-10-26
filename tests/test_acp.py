@@ -771,6 +771,8 @@ def test_gui_chats_open_on_a_warm_logged_in_agent(acp_native, tmp_path):
             created = await bridge.dispatch("session/new", {"cwd": str(tmp_path), "mcpServers": []})
             session_id = created["sessionId"]
             assert bridge.chats[session_id].backend is spare
+            # The first spare starts in the window's folder (the bridge's), not the home folder.
+            assert native_folder(acp_native, spare) == tmp_path.resolve()
             run = next(run for run in sessions.runs(store) if run["id"] == spare.lease.run.id)
             assert (run["kind"], run["project"], run["session_id"]) == (
                 "chat",
@@ -804,8 +806,14 @@ def test_gui_chats_open_on_a_warm_logged_in_agent(acp_native, tmp_path):
     asyncio.run(scenario())
 
 
-def test_gui_warm_agent_loads_a_saved_chat_from_another_folder(acp_native, tmp_path):
-    """Like the native, which keeps the saved project and serves any cwd."""
+def native_folder(native, backend):
+    """The folder a native process runs in (it reads project MCP servers from there)."""
+    calls = [call for call in logged(native) if call["pid"] == backend.process.pid]
+    return Path(calls[-1]["process_cwd"]).resolve()
+
+
+def test_gui_warm_agent_follows_the_chat_folder(acp_native, tmp_path):
+    """The native reads a project's own MCP servers from its process folder, not the chat's."""
 
     async def scenario():
         async with in_process(acp_native) as (bridge, _):
@@ -813,16 +821,20 @@ def test_gui_warm_agent_loads_a_saved_chat_from_another_folder(acp_native, tmp_p
             session_id = created["sessionId"]
             await bridge.dispatch("session/close", {"sessionId": session_id})
             spare = await warm(bridge)
-            other = tmp_path / "other"
+            other = (tmp_path / "other").resolve()
             other.mkdir()
             await bridge.dispatch(
                 "session/load", {"sessionId": session_id, "cwd": str(other), "mcpServers": []}
             )
-            assert bridge.chats[session_id].backend is spare
-            assert bridge.chats[session_id].setup["cwd"] == str(other.resolve())
-            (load,) = [call for call in logged(acp_native) if call["method"] == "session/load"]
-            assert load["sessionId"] == session_id
-            assert spare.lease.run.project == str(other.resolve())
+            chat = bridge.chats[session_id]
+            # A spare in another folder would miss this project's MCP servers: start fresh here.
+            assert chat.backend is not spare and spare.process.poll() is not None
+            assert native_folder(acp_native, chat.backend) == other
+            assert chat.backend.lease.run.project == str(other)
+            moved = await warm(bridge)
+            assert native_folder(acp_native, moved) == other
+            nearby = await bridge.dispatch("session/new", {"cwd": str(other), "mcpServers": []})
+            assert bridge.chats[nearby["sessionId"]].backend is moved
 
     asyncio.run(scenario())
 

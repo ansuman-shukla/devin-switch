@@ -130,7 +130,8 @@ def overview(store: Store) -> dict:
     return {"runs": running, "sessions": chats, "history_error": error}
 
 
-def resumable(store: Store, session_id: str) -> dict:
+def available(store: Store, session_id: str) -> dict:
+    """A saved chat no other launch holds; GUI natives load it from any folder."""
     chat = next((chat for chat in history(store) if chat["id"] == session_id), None)
     if chat is None:
         raise SwitchError(
@@ -138,6 +139,11 @@ def resumable(store: Store, session_id: str) -> dict:
         )
     if blocker := resume_blocker(chat, runs(store)):
         raise SwitchError(blocker)
+    return chat
+
+
+def resumable(store: Store, session_id: str) -> dict:
+    chat = available(store, session_id)
     if not Path(chat["project"]).is_dir():
         raise SwitchError("This conversation's project folder no longer exists.")
     return chat

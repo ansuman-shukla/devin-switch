@@ -149,6 +149,7 @@ async def handle(message):
                         "args": sys.argv[1:],
                         "gh_config_dir": os.environ.get("GH_CONFIG_DIR"),
                         "text": (params.get("prompt") or [{}])[0].get("text"),
+                        "uri": params.get("uri"),
                         "chat_id": whiteboard_chat(params),
                     }
                 )

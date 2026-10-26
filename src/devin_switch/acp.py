@@ -20,7 +20,7 @@ IDLE_TIMEOUT = 15 * 60
 IDLE_RECHECK = 30
 HANDOVER_TIMEOUT = 10
 ORPHAN_TIMEOUT = 30
-LISTER_IDLE = 60
+LISTER_IDLE = 15 * 60
 SPARE_IDLE = 30 * 60
 LOCAL_COMMANDS = [
     {
@@ -133,6 +133,22 @@ def is_local_command(command: str) -> bool:
 
 def continue_params(session_id: str) -> dict:
     return {"sessionId": session_id, "prompt": [{"type": "text", "text": handoff.CONTINUE_PROMPT}]}
+
+
+def error_details(error: Exception) -> tuple[int, dict | None]:
+    """The code and data Desktop classifies an error by (native errors keep theirs)."""
+    if isinstance(error, sessions.ChatMissing):
+        return -32016, {
+            "cognition.ai/errorKind": "session_not_found",
+            "cognition.ai/retryable": False,
+        }
+    if isinstance(error, sessions.ChatHeld):
+        data = {"cognition.ai/errorKind": "session_locked", "cognition.ai/retryable": True}
+        if error.pid is not None:
+            data["cognition.ai/lockHolderPid"] = error.pid
+        return -32015, data
+    data = getattr(error, "data", None)
+    return getattr(error, "code", -32603), data if isinstance(data, dict) else None
 
 
 def failure_detail(error: Exception) -> str:
@@ -652,16 +668,11 @@ class Bridge:
                     if isinstance(exc, SwitchError)
                     else "GUI bridge operation failed safely. Reopen the saved chat and retry."
                 )
-                await self.emit(
-                    {
-                        "jsonrpc": "2.0",
-                        "id": identifier,
-                        "error": {
-                            "code": getattr(exc, "code", -32603),
-                            "message": text,
-                        },
-                    }
-                )
+                code, data = error_details(exc)
+                error = {"code": code, "message": text}
+                if data:
+                    error["data"] = data
+                await self.emit({"jsonrpc": "2.0", "id": identifier, "error": error})
 
     async def dispatch(self, method, params, *, notification=False):
         if (
@@ -675,6 +686,9 @@ class Bridge:
                 raise RpcError("ACP is already initialized.", -32600)
             self.initialization = copy.deepcopy(params)
             self.initialization["protocolVersion"] = 1
+            # Desktop offers this only to its bundled agents; it adds the chat to diagnostics.
+            client = self.initialization.setdefault("clientCapabilities", {})
+            client.setdefault("_meta", {}).setdefault("cognition.ai/diagnosticsSessionExport", True)
             probe = Backend(self, self.default_account(), Path.cwd(), chat=False)
             result = await probe.start()
             self.lister = probe
@@ -1021,8 +1035,9 @@ class Bridge:
             if time.monotonic() >= deadline:
                 await asyncio.to_thread(acp_state.cancel_handover, store, asked)
                 if await asyncio.to_thread(acp_state.held, store, session_id, holders):
-                    raise SwitchError(BUSY_ELSEWHERE)
-                raise SwitchError(STILL_CLOSING)
+                    raise sessions.ChatHeld(BUSY_ELSEWHERE, sessions.run_pid(store, holders[0]))
+                pid = sessions.run_pid(store, orphans[0]) if orphans else None
+                raise sessions.ChatHeld(STILL_CLOSING, pid)
             await asyncio.sleep(0.2)
 
     async def open_session(self, method, params):

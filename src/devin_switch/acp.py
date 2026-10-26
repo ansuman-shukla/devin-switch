@@ -60,6 +60,15 @@ LIVE_CONTROLS = {
     "_cognition.ai/subagent/cancel",
 }
 OPENING = {"session/new", "session/load"}
+# Editor state Desktop sends once (didOpen right after initialize): replay it to later natives.
+# The value says whether the state is kept per document/repository uri or only the latest.
+EDITOR_STATE = {
+    "_cognition.ai/document/didOpen": True,
+    "_cognition.ai/document/didFocus": False,
+    "_cognition.ai/workspace/didChangeRevision": True,
+}
+DOCUMENT_CLOSED = "_cognition.ai/document/didClose"
+EDITOR_CONTEXT = ("_cognition.ai/document/", "_cognition.ai/workspace/", "_cognition.ai/terminal/")
 BACKGROUND_UPDATES = {
     "available_commands_update",
     "config_option_update",
@@ -219,6 +228,7 @@ class Backend:
         self.relay = None
         self.loop = None
         self.last_activity = time.monotonic()
+        self.editor_ready = False
         bridge.backends.add(self)
 
     async def start(self):
@@ -280,6 +290,11 @@ class Backend:
                 raise SwitchError(
                     "This native CLI lacks compatible ACP session loading. Update Devin CLI."
                 )
+            # Written without awaiting, so no newer editor context can be sent before the replay.
+            for method, params in self.bridge.editor_state.values():
+                self.write({"method": method, "params": params})
+            self.editor_ready = True
+            await self.writer.drain()
             if self.chat and (issued := relay.login(self.bridge.native.store, self.account)):
                 await self.authenticate(issued)
             return result
@@ -313,14 +328,27 @@ class Backend:
             closing, self.relay = self.relay, None
             closing.close()
 
+    def write(self, message):
+        self.writer.write((json.dumps({"jsonrpc": "2.0", **message}) + "\n").encode())
+
     async def send(self, message):
         if not self.process or self.process.poll() is not None or self.writer.is_closing():
             raise SwitchError(
                 "The GUI agent has stopped. Reopen this saved conversation to reconnect."
             )
         self.last_activity = time.monotonic()
-        self.writer.write((json.dumps({"jsonrpc": "2.0", **message}) + "\n").encode())
+        self.write(message)
         await self.writer.drain()
+
+    async def notify_editor(self, method, params):
+        """Best effort and not activity, so editor context never keeps an idle chat open."""
+        if not self.editor_ready or self.stopping or self.writer.is_closing():
+            return
+        if self.process.poll() is not None:
+            return
+        self.write({"method": method, "params": params})
+        with suppress(OSError):
+            await self.writer.drain()
 
     async def request(self, method, params, timeout=None):
         self.sequence += 1
@@ -510,6 +538,7 @@ class Bridge:
         self.ready = False
         self.chats = {}
         self.backends = set()
+        self.editor_state = {}
         self.client_requests = {}
         self.sequence = 0
         self.tasks = set()
@@ -683,6 +712,13 @@ class Bridge:
             return await self.open_session(method, params)
         if method.startswith("_") and "sessionId" not in params and not notification:
             return await self.ask_lister(method, params)
+        if method.startswith(EDITOR_CONTEXT) and "sessionId" not in params and notification:
+            # Desktop's editor and terminal context belongs to the window, so every native gets it.
+            self.remember_editor(method, params)
+            await asyncio.gather(
+                *(backend.notify_editor(method, params) for backend in list(self.backends))
+            )
+            return {}
         session_id = params.get("sessionId")
         if session_id not in self.chats:
             raise RpcError("Load the exact saved conversation before using it.", -32602)
@@ -825,6 +861,16 @@ class Bridge:
             category = "mode" if method == "session/set_mode" else "model"
             backend.remember_selection(category, params[f"{category}Id"])
         return result
+
+    def remember_editor(self, method, params):
+        uri = params.get("uri")
+        if method == DOCUMENT_CLOSED:
+            self.editor_state.pop(("_cognition.ai/document/didOpen", uri), None)
+        elif method in EDITOR_STATE:
+            key = (method, uri if EDITOR_STATE[method] else None)
+            # Re-inserting keeps the replay in the order Desktop last sent each piece.
+            self.editor_state.pop(key, None)
+            self.editor_state[key] = (method, params)
 
     async def list_sessions(self, params):
         """Let the native list shared history: Desktop needs its filters, paging and _meta."""

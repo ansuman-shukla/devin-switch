@@ -178,7 +178,11 @@ def test_installed_bridge_keeps_blank_chat_on_switch_and_releases_it_idle(
             )
             capabilities = initialized["agentCapabilities"]["sessionCapabilities"]
             assert "additionalDirectories" in capabilities
+            # Editor context replayed to the new native and broadcast to the open one.
+            document = {"uri": (tmp_path / "a.py").as_uri()}
+            await bridge.dispatch("_cognition.ai/document/didOpen", document, notification=True)
             created = await bridge.dispatch("session/new", {"cwd": str(tmp_path), "mcpServers": []})
+            await bridge.dispatch("_cognition.ai/document/didFocus", document, notification=True)
             session_id = created["sessionId"]
             chat = bridge.chats[session_id]
             original = chat.backend

@@ -1099,6 +1099,51 @@ def replayed_texts(messages, kind):
     return [update["content"]["text"] for update in replayed(messages, kind)]
 
 
+DOCUMENT = "_cognition.ai/document/"
+
+
+def context_calls(native, pid):
+    return [
+        (call["method"].removeprefix("_cognition.ai/"), call["uri"])
+        for call in logged(native)
+        if call["pid"] == pid
+        and call["method"].startswith(("_cognition.ai/doc", "_cognition.ai/w"))
+    ]
+
+
+def test_gui_editor_and_terminal_context_reach_every_open_chat(acp_native, tmp_path):
+    """Desktop sends editor and terminal context without a sessionId, like the built-in agent."""
+
+    async def scenario():
+        async with in_process(acp_native) as (bridge, _):
+            chats = [
+                (await bridge.dispatch("session/new", {"cwd": str(tmp_path), "mcpServers": []}))[
+                    "sessionId"
+                ]
+                for _ in range(2)
+            ]
+            backends = [bridge.chats[chat].backend for chat in chats]
+            idle = [backend.last_activity for backend in backends]
+            for method, params in [
+                (DOCUMENT + "didFocus", {"uri": "file:///a.py", "cursorLine": 3}),
+                ("_cognition.ai/terminal/commandStarted", {"commandLine": "ls", "terminalId": "t"}),
+            ]:
+                assert await bridge.dispatch(method, params, notification=True) == {}
+            await asyncio.sleep(0.3)
+            for backend in backends:
+                seen = [
+                    call["method"]
+                    for call in logged(acp_native)
+                    if call["pid"] == backend.process.pid
+                ]
+                assert DOCUMENT + "didFocus" in seen
+                assert "_cognition.ai/terminal/commandStarted" in seen
+            # Editor context is not chat activity: it must not keep an idle chat open.
+            assert [backend.last_activity for backend in backends] == idle
+
+    asyncio.run(scenario())
+
+
 @pytest.mark.parametrize("native_supports", [True, False])
 def test_gui_advertises_extra_folders_only_when_the_native_does(
     acp_native, monkeypatch, native_supports
@@ -1122,6 +1167,44 @@ def test_gui_advertises_extra_folders_only_when_the_native_does(
         if native_supports:
             expected["additionalDirectories"] = {}
         assert result["agentCapabilities"]["sessionCapabilities"] == expected
+
+    asyncio.run(scenario())
+
+
+def test_gui_new_chat_native_gets_the_current_editor_state(acp_native, tmp_path):
+    async def scenario():
+        async with in_process(acp_native) as (bridge, _):
+            for method, uri in [
+                ("didFocus", "file:///a.py"),
+                ("didOpen", "file:///a.py"),
+                ("didOpen", "file:///b.py"),
+                ("didFocus", "file:///a.py"),
+                ("didClose", "file:///a.py"),
+                ("didChangeDirty", "file:///b.py"),
+                ("didFocus", "file:///b.py"),
+            ]:
+                await bridge.dispatch(DOCUMENT + method, {"uri": uri}, notification=True)
+            await bridge.dispatch(
+                "_cognition.ai/workspace/didChangeRevision",
+                {"uri": "file:///repo", "branch": "main"},
+                notification=True,
+            )
+            await bridge.dispatch(
+                "_cognition.ai/workspace/didChangeFiles", {"created": ["x"]}, notification=True
+            )
+            await bridge.drop_spare()
+            session_id = (
+                await bridge.dispatch("session/new", {"cwd": str(tmp_path), "mcpServers": []})
+            )["sessionId"]
+            pid = bridge.chats[session_id].backend.process.pid
+            assert context_calls(acp_native, pid) == [
+                ("document/didOpen", "file:///b.py"),
+                ("document/didFocus", "file:///b.py"),
+                ("workspace/didChangeRevision", "file:///repo"),
+            ]
+            first = [call["method"] for call in logged(acp_native) if call["pid"] == pid]
+            assert first.index("initialize") < first.index(DOCUMENT + "didOpen")
+            assert first.index(DOCUMENT + "didOpen") < first.index("session/new")
 
     asyncio.run(scenario())
 

@@ -60,6 +60,13 @@ LIVE_CONTROLS = {
     "_cognition.ai/subagent/cancel",
 }
 OPENING = {"session/new", "session/load"}
+# Project MCP config the native reads from its process folder (not the session cwd).
+PROJECT_MCP_FILES = (
+    ".mcp.json",
+    ".devin/mcp_config.json",
+    ".devin/mcp_config.local.json",
+    ".cursor/mcp.json",
+)
 # Editor state Desktop sends once (didOpen right after initialize): replay it to later natives.
 # The value says whether the state is kept per document/repository uri or only the latest.
 EDITOR_STATE = {
@@ -128,6 +135,20 @@ def prompt_command(params: dict) -> tuple[list, list[str], str]:
 def is_local_command(command: str) -> bool:
     return command in LOCAL_NAMES or (
         command.startswith("/") and command.lstrip("/") in BLOCKED_COMMANDS
+    )
+
+
+def has_project_mcp(folder: Path) -> bool:
+    # In the home folder these are the user-level files every native loads anyway.
+    if folder.resolve() == Path.home().resolve():
+        return False
+    return any((folder / name).is_file() for name in PROJECT_MCP_FILES)
+
+
+def spare_fits(spare_folder: Path, project: Path) -> bool:
+    """A native started in spare_folder gives a chat in project the right MCP servers."""
+    return spare_folder == project or not (
+        has_project_mcp(spare_folder) or has_project_mcp(project)
     )
 
 
@@ -566,6 +587,7 @@ class Bridge:
         self.lister = None
         self.listing = asyncio.Lock()
         self.spare = None
+        self.spare_folder = Path.home()
         self.filling = False
 
     def spawn(self, coroutine):
@@ -918,12 +940,16 @@ class Bridge:
                 await lister.close()
 
     async def refill(self):
-        """Start a logged-in agent for the default login, so the next chat skips startup."""
+        """Start a logged-in agent for the default login, so the next chat skips startup.
+
+        It runs in the latest chat's folder (first the window's): the native reads a project's
+        own MCP servers from its process folder, so it only serves chats in that folder.
+        """
         if self.filling or self.spare is not None:
             return
         self.filling = True
         try:
-            backend = Backend(self, self.default_account(), Path.home(), spare=True)
+            backend = Backend(self, self.default_account(), self.spare_folder, spare=True)
             await backend.start()
             self.spare = backend
         except (SwitchError, OSError, RpcError):
@@ -946,8 +972,15 @@ class Bridge:
         ):
             await self.drop_spare()
             spare = None
-        if spare is None or spare.account.name != account.name:
-            if spare is not None and spare.account.name != self.default_account().name:
+        # The native reads project MCP servers from its process folder: a project with MCP config
+        # needs a native started there, ordinary folders share one started in the home folder.
+        self.spare_folder = project if has_project_mcp(project) else Path.home()
+        usable = spare is not None and spare_fits(spare.project, project)
+        if not usable or spare.account.name != account.name:
+            if spare is not None and (
+                spare.account.name != self.default_account().name
+                or not spare_fits(spare.project, self.spare_folder)
+            ):
                 await self.drop_spare()
             self.spawn(self.refill())
             backend = Backend(self, account, project, session_id)

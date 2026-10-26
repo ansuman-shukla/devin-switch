@@ -125,6 +125,13 @@ def update(session_id, change):
     emit({"method": "session/update", "params": {"sessionId": session_id, "update": change}})
 
 
+def process_cwd():
+    try:
+        return os.getcwd()
+    except FileNotFoundError:  # the folder was deleted after this process started in it
+        return None
+
+
 def whiteboard_chat(params):
     """Runs the chat-id command an MCP server would get, only when a test asks for it."""
     if (params.get("prompt") or [{}])[0].get("text") != "whiteboard-chat":
@@ -150,6 +157,7 @@ async def handle(message):
                         "gh_config_dir": os.environ.get("GH_CONFIG_DIR"),
                         "text": (params.get("prompt") or [{}])[0].get("text"),
                         "uri": params.get("uri"),
+                        "process_cwd": process_cwd(),
                         "chat_id": whiteboard_chat(params),
                     }
                 )

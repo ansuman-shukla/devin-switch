@@ -168,7 +168,7 @@ def test_installed_bridge_keeps_blank_chat_on_switch_and_releases_it_idle(
 
         bridge = Bridge(native, emit)
         try:
-            await bridge.dispatch(
+            initialized = await bridge.dispatch(
                 "initialize",
                 {
                     "protocolVersion": 1,
@@ -176,6 +176,8 @@ def test_installed_bridge_keeps_blank_chat_on_switch_and_releases_it_idle(
                     "clientInfo": {"name": "windsurf", "version": "0.3.0"},
                 },
             )
+            capabilities = initialized["agentCapabilities"]["sessionCapabilities"]
+            assert "additionalDirectories" in capabilities
             created = await bridge.dispatch("session/new", {"cwd": str(tmp_path), "mcpServers": []})
             session_id = created["sessionId"]
             chat = bridge.chats[session_id]

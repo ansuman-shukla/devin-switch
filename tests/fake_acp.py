@@ -160,7 +160,17 @@ async def handle(message):
             "protocolVersion": 1,
             "agentCapabilities": {
                 "loadSession": not bool(os.environ.get("FAKE_NO_LOAD")),
-                "sessionCapabilities": {"list": {}, "fork": {}},
+                "sessionCapabilities": {
+                    "list": {},
+                    "fork": {},
+                    "delete": {},
+                    "close": {"_meta": {"cognition.ai/force": True}},
+                    **(
+                        {}
+                        if os.environ.get("FAKE_NO_EXTRA_DIRS")
+                        else {"additionalDirectories": {}}
+                    ),
+                },
             },
             "authMethods": [{"id": "api-key", "name": "API key"}],
             "agentInfo": {"name": "fake", "version": "1"},

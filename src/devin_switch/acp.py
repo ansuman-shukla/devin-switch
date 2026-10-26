@@ -653,10 +653,17 @@ class Bridge:
                 "title": "Devin Switch",
                 "version": "0.3.0",
             }
+            native_sessions = result["agentCapabilities"].get("sessionCapabilities", {})
+            # Desktop then sends a chat's extra workspace folders, which load/new forward as-is.
             result["agentCapabilities"]["sessionCapabilities"] = {
                 "list": {},
                 "resume": {},
                 "close": {},
+                **{
+                    key: native_sessions[key]
+                    for key in ("additionalDirectories",)
+                    if key in native_sessions
+                },
             }
             self.ready = True
             self.spawn(self.refill())

@@ -282,7 +282,14 @@ def queue(native: Native, session_id: str | None, account_name: str | None, *, c
 
 class Lease:
     def __init__(
-        self, native: Native, account: Account, project: Path, session_id: str | None, *, chat: bool
+        self,
+        native: Native,
+        account: Account,
+        project: Path,
+        session_id: str | None,
+        *,
+        chat: bool,
+        verify_login: bool = True,
     ):
         self.store = native.store
         self.stack = ExitStack()
@@ -308,7 +315,8 @@ class Lease:
                 self.path = self.store.root / "runs" / f"{self.run.id}.json"
                 sessions.record_process(self.store, self.run.id, os.getpid(), role="wrapper")
                 write_json(self.path, asdict(self.run))
-            native.require_login(account)
+            if verify_login:
+                native.require_login(account)
         except BaseException:
             self.close(ended=True)
             raise

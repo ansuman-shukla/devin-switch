@@ -1276,6 +1276,31 @@ def test_gui_prompt_after_cancel_starts_a_new_turn(acp_native, tmp_path):
     asyncio.run(scenario())
 
 
+def test_gui_startup_and_listing_skip_the_login_check(acp_native, tmp_path, monkeypatch):
+    """A window reload waits for initialize; the login check can take 10 s on a slow network."""
+    checked = []
+
+    def require_login(self, account):
+        checked.append(account.name)
+        raise SwitchError(f"No saved login for {account.name!r}. Run: ds login {account.name}")
+
+    monkeypatch.setattr(Native, "require_login", require_login)
+
+    async def scenario():
+        async with in_process(acp_native) as (bridge, _):
+            listing = await bridge.dispatch("session/list", {"cwd": str(tmp_path)})
+            assert "sessions" in listing
+            async with asyncio.timeout(10):
+                while bridge.filling:
+                    await asyncio.sleep(0.02)
+            assert bridge.spare is None
+            with pytest.raises(SwitchError, match="No saved login"):
+                await bridge.dispatch("session/new", {"cwd": str(tmp_path), "mcpServers": []})
+        assert checked and set(checked) == {"ansuman-1"}
+
+    asyncio.run(scenario())
+
+
 def test_gui_reload_mid_turn_replays_without_interrupting_the_turn(acp_native, tmp_path):
     """Switching Desktop surfaces reloads the open chat; a native load would end the turn."""
 

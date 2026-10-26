@@ -241,6 +241,8 @@ class Backend:
                 self.session_id,
                 # A warm spare is not a chat until it is attached to one.
                 chat=self.chat and not self.spare,
+                # The listing native needs no login, and Desktop's window waits for initialize.
+                verify_login=self.chat,
             )
         )
         try:

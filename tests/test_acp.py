@@ -1301,6 +1301,53 @@ def test_gui_startup_and_listing_skip_the_login_check(acp_native, tmp_path, monk
     asyncio.run(scenario())
 
 
+def cancelled_cards(messages):
+    return [
+        message["params"]["requestId"]
+        for message in messages
+        if message.get("method") == "$/cancel_request"
+    ]
+
+
+def test_gui_native_withdrawn_request_clears_the_desktop_card(acp_native, tmp_path):
+    async def scenario():
+        async with in_process(acp_native) as (bridge, messages):
+            created = await bridge.dispatch("session/new", {"cwd": str(tmp_path), "mcpServers": []})
+            await bridge.dispatch(
+                "session/prompt", prompt_params(created["sessionId"], "withdrawn")
+            )
+            (card,) = [m for m in messages if m.get("method") == "elicitation/create"]
+            assert card["id"].startswith("ds-client-")
+            # Desktop only knows its own id for the card; the native's 101 would be ignored.
+            assert cancelled_cards(messages) == [card["id"]]
+            assert bridge.client_requests == {}
+
+    asyncio.run(scenario())
+
+
+def test_gui_native_exit_clears_its_open_desktop_cards(acp_native, tmp_path):
+    async def scenario():
+        async with in_process(acp_native) as (bridge, messages):
+            created = await bridge.dispatch("session/new", {"cwd": str(tmp_path), "mcpServers": []})
+            backend = bridge.chats[created["sessionId"]].backend
+            turn = asyncio.create_task(
+                bridge.dispatch("session/prompt", prompt_params(created["sessionId"], "permission"))
+            )
+            async with asyncio.timeout(5):
+                while not bridge.client_requests:
+                    await asyncio.sleep(0.02)
+            (card,) = bridge.client_requests
+            backend.process.kill()
+            with pytest.raises(SwitchError):
+                await turn
+            async with asyncio.timeout(5):
+                while card not in cancelled_cards(messages):
+                    await asyncio.sleep(0.02)
+            assert bridge.client_requests == {}
+
+    asyncio.run(scenario())
+
+
 def test_gui_reload_mid_turn_replays_without_interrupting_the_turn(acp_native, tmp_path):
     """Switching Desktop surfaces reloads the open chat; a native load would end the turn."""
 

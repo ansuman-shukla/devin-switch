@@ -348,6 +348,11 @@ async def handle(message):
                 close_fds=False,
             )
         decision = {}
+        if text == "withdrawn":
+            # The native cancels a request it no longer needs (e.g. after Stop) with its own id.
+            emit({"id": 101, "method": "elicitation/create", "params": {"sessionId": loaded}})
+            await asyncio.sleep(0.2)
+            emit({"method": "$/cancel_request", "params": {"requestId": 101}})
         if text in {"permission", "question"}:
             future = asyncio.get_running_loop().create_future()
             replies[100] = future

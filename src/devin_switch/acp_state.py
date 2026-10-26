@@ -166,6 +166,16 @@ def request_handover(
     return asked, holders, orphans
 
 
+def held_elsewhere(store: Store, session_id: str, own: set[str]) -> bool:
+    return any(
+        run["active"]
+        and run["kind"] == "chat"
+        and run["session_id"] == session_id
+        and run["id"] not in own
+        for run in sessions.runs(store)
+    )
+
+
 def held(store: Store, session_id: str, holders: list[str]) -> bool:
     return any(
         run["active"] and run["id"] in holders and run["session_id"] == session_id

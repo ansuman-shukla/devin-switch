@@ -534,6 +534,55 @@ def test_gui_other_window_takes_over_an_idle_chat_and_hands_it_back(acp_native, 
     asyncio.run(scenario())
 
 
+def test_gui_sidebar_action_does_not_take_a_chat_back(acp_native, tmp_path):
+    """A rename in window 1 must not pull the chat out of window 2, which now has it open."""
+
+    async def scenario():
+        async with connect(acp_native) as first, connect(acp_native) as second:
+            session_id = await first.new(tmp_path)
+            await first.prompt(session_id, "hello")
+            setup = {"sessionId": session_id, "cwd": str(tmp_path), "mcpServers": []}
+            assert "result" in await second.request("session/load", setup)
+            taken = [
+                run["id"]
+                for run in acp_state.live(acp_native.store)
+                if run["session_id"] == session_id
+            ]
+            renamed = await first.request(
+                "_cognition.ai/session/rename", {"sessionId": session_id, "title": "New"}
+            )
+            # Like a native without the chat loaded; Desktop handles "Session not found" quietly.
+            assert renamed["error"]["code"] == -32602
+            assert renamed["error"]["message"].startswith("Session not found")
+            live = [
+                run["id"]
+                for run in acp_state.live(acp_native.store)
+                if run["session_id"] == session_id
+            ]
+            assert live == taken
+            closed = await first.request("session/close", {"sessionId": "never-opened-here"})
+            assert closed == {"jsonrpc": "2.0", "id": closed["id"], "result": {}}
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize(
+    "method", ["_cognition.ai/session/rename", "_cognition.ai/queuedMessages/update"]
+)
+def test_gui_sidebar_requests_answer_during_a_turn(acp_native, tmp_path, method):
+    async def scenario():
+        async with connect(acp_native) as client:
+            session_id = await client.new(tmp_path)
+            turn = asyncio.create_task(client.prompt(session_id, "busy"))
+            await wait_for_text(client, "live progress")
+            answer = await asyncio.wait_for(client.request(method, {"sessionId": session_id}), 5)
+            assert "result" in answer and not turn.done()
+            await client.send({"method": "session/cancel", "params": {"sessionId": session_id}})
+            await turn
+
+    asyncio.run(scenario())
+
+
 def test_gui_other_window_leaves_a_busy_chat_alone(acp_native, tmp_path, monkeypatch):
     monkeypatch.setattr(acp, "HANDOVER_TIMEOUT", 1)
 
@@ -1744,6 +1793,25 @@ def test_gui_idle_preserves_mode_and_model_controls(
             )
             reply = json.loads(messages[-1]["params"]["update"]["content"]["text"])
             assert reply["settings"][key] == value
+
+    asyncio.run(scenario())
+
+
+def test_gui_sidebar_action_reconnects_an_idle_released_chat(acp_native, tmp_path):
+    """Only a chat another window holds refuses; one released for idleness reconnects."""
+
+    async def scenario():
+        async with in_process(acp_native) as (bridge, _):
+            result = await bridge.dispatch("session/new", {"cwd": str(tmp_path), "mcpServers": []})
+            chat = bridge.chats[result["sessionId"]]
+            chat.backend.last_activity -= acp.IDLE_TIMEOUT + 1
+            assert await bridge.release_idle(chat)
+            await bridge.dispatch(
+                "_cognition.ai/session/rename", {"sessionId": chat.session_id, "title": "New"}
+            )
+            assert not chat.suspended
+            renames = [c for c in logged(acp_native) if c["method"].endswith("session/rename")]
+            assert [call["pid"] for call in renames] == [chat.backend.process.pid]
 
     asyncio.run(scenario())
 

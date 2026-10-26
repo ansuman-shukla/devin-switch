@@ -60,6 +60,20 @@ LIVE_CONTROLS = {
     "_cognition.ai/subagent/cancel",
 }
 OPENING = {"session/new", "session/load"}
+# Sidebar and side-panel requests the native serves beside a running turn; like LIVE_CONTROLS
+# they skip the prompt gate, and they never reconnect a chat another window has taken.
+SIDE_REQUESTS = {
+    "_cognition.ai/session/rename",
+    "_cognition.ai/session/share",
+    "_cognition.ai/session/markRead",
+    "_cognition.ai/revert/listSteps",
+    "_cognition.ai/revert/preview",
+    "_cognition.ai/sidechain/request",
+    "_cognition.ai/sidechain/cancel",
+    "_cognition.ai/terminal/killBackgroundShell",
+    "_cognition.ai/queuedMessages/update",
+    "_cognition.ai/diagnostics/sessionExport",
+}
 # Editor state Desktop sends once (didOpen right after initialize): replay it to later natives.
 # The value says whether the state is kept per document/repository uri or only the latest.
 EDITOR_STATE = {
@@ -723,8 +737,16 @@ class Bridge:
             return {}
         session_id = params.get("sessionId")
         if session_id not in self.chats:
+            if method == "session/close":
+                return {}
             raise RpcError("Load the exact saved conversation before using it.", -32602)
         chat = self.chats[session_id]
+        if method in SIDE_REQUESTS and chat.suspended:
+            store = self.native.store
+            own = {backend.lease.run.id for backend in self.backends if backend.lease}
+            if await asyncio.to_thread(acp_state.held_elsewhere, store, session_id, own):
+                # The native answers this for a chat it hasn't loaded; Desktop ignores it quietly.
+                raise RpcError("Session not found: this chat is open in another window.", -32602)
         if notification:
             if method == "session/cancel":
                 chat.canceled = True
@@ -745,7 +767,8 @@ class Bridge:
             and not chat.canceled
             and not is_local_command(prompt_command(params)[2])
         )
-        if (method in LIVE_CONTROLS or steering) and chat.controls is not None:
+        live = method in LIVE_CONTROLS or method in SIDE_REQUESTS or steering
+        if live and chat.controls is not None:
             if steering:
                 chat.backend.record_prompt(params)
             task = self.spawn(self.forward_request(chat.backend, method, params))

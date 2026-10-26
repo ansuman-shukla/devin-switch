@@ -178,6 +178,9 @@ def test_installed_bridge_keeps_blank_chat_on_switch_and_releases_it_idle(
             )
             capabilities = initialized["agentCapabilities"]["sessionCapabilities"]
             assert "additionalDirectories" in capabilities
+            # Desktop offers transcript export only to bundled agents; the bridge asks for it.
+            meta = initialized["agentCapabilities"]["_meta"]
+            assert meta.get("cognition.ai/diagnosticsSessionExport") is True
             # Editor context replayed to the new native and broadcast to the open one.
             document = {"uri": (tmp_path / "a.py").as_uri()}
             await bridge.dispatch("_cognition.ai/document/didOpen", document, notification=True)

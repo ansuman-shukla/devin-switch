@@ -675,6 +675,9 @@ class Bridge:
                 raise RpcError("ACP is already initialized.", -32600)
             self.initialization = copy.deepcopy(params)
             self.initialization["protocolVersion"] = 1
+            # Desktop offers this only to its bundled agents; it adds the chat to diagnostics.
+            client = self.initialization.setdefault("clientCapabilities", {})
+            client.setdefault("_meta", {}).setdefault("cognition.ai/diagnosticsSessionExport", True)
             probe = Backend(self, self.default_account(), Path.cwd(), chat=False)
             result = await probe.start()
             self.lister = probe

@@ -534,6 +534,18 @@ def test_gui_other_window_takes_over_an_idle_chat_and_hands_it_back(acp_native, 
     asyncio.run(scenario())
 
 
+async def wire_error(bridge, messages, method, params):
+    """The error object Desktop receives for a request, as the bridge writes it."""
+    identifier = f"probe-{len(messages)}"
+    await bridge.handle({"jsonrpc": "2.0", "id": identifier, "method": method, "params": params})
+    (response,) = [message for message in messages if message.get("id") == identifier]
+    return response["error"]
+
+
+def holder_pid(store, run_id):
+    return json.loads((store.root / "runtime" / f"{run_id}.json").read_text())["pid"]
+
+
 def test_gui_other_window_leaves_a_busy_chat_alone(acp_native, tmp_path, monkeypatch):
     monkeypatch.setattr(acp, "HANDOVER_TIMEOUT", 1)
 
@@ -545,12 +557,17 @@ def test_gui_other_window_leaves_a_busy_chat_alone(acp_native, tmp_path, monkeyp
             )
             pending = asyncio.create_task(first.prompt(session_id, "permission"))
             request = await asyncio.wait_for(first.requests.get(), 5)
-            async with in_process(acp_native) as (second, _):
-                with pytest.raises(SwitchError, match="busy in another Devin window"):
-                    await second.dispatch(
-                        "session/load",
-                        {"sessionId": session_id, "cwd": str(tmp_path), "mcpServers": []},
-                    )
+            async with in_process(acp_native) as (second, messages):
+                load = {"sessionId": session_id, "cwd": str(tmp_path), "mcpServers": []}
+                error = await wire_error(second, messages, "session/load", load)
+                # Desktop shows its "open in another process (PID …)" state for session_locked.
+                assert error["code"] == -32015
+                assert "busy in another Devin window" in error["message"]
+                assert error["data"] == {
+                    "cognition.ai/errorKind": "session_locked",
+                    "cognition.ai/retryable": True,
+                    "cognition.ai/lockHolderPid": holder_pid(acp_native.store, owner["id"]),
+                }
                 assert session_id not in second.chats
             assert acp_state.lifecycle(acp_native.store, owner["id"]) == "open"
             response = {"outcome": {"outcome": "selected", "optionId": "reject"}}
@@ -604,15 +621,16 @@ def test_gui_reopen_waits_for_an_agent_orphaned_by_an_acp_reload(
         run, native = orphan_native(store, session_id, tmp_path)
         try:
             assert acp_state.orphaned(store, run.id)
-            async with in_process(acp_native) as (bridge, _):
+            async with in_process(acp_native) as (bridge, messages):
                 load = {"sessionId": session_id, "cwd": str(tmp_path), "mcpServers": []}
                 if exits:
                     asyncio.get_running_loop().call_later(0.5, native.kill)
                     await bridge.dispatch("session/load", load)
                     assert session_id in bridge.chats
                 else:
-                    with pytest.raises(SwitchError, match="still shutting down"):
-                        await bridge.dispatch("session/load", load)
+                    error = await wire_error(bridge, messages, "session/load", load)
+                    assert error["code"] == -32015 and "still shutting down" in error["message"]
+                    assert error["data"]["cognition.ai/lockHolderPid"] == native.pid
                     assert native.poll() is None  # never force-killed
         finally:
             native.kill()
@@ -629,12 +647,15 @@ def test_gui_terminal_launch_of_the_same_chat_still_blocks_gui_load(acp_native, 
                 run for run in acp_state.live(acp_native.store) if run["session_id"] == session_id
             )
             acp_state.lifecycle_path(acp_native.store, owner["id"]).unlink()
-            async with in_process(acp_native) as (second, _):
-                with pytest.raises(SwitchError, match="already has an open CLI launch"):
-                    await second.dispatch(
-                        "session/load",
-                        {"sessionId": session_id, "cwd": str(tmp_path), "mcpServers": []},
-                    )
+            async with in_process(acp_native) as (second, messages):
+                load = {"sessionId": session_id, "cwd": str(tmp_path), "mcpServers": []}
+                error = await wire_error(second, messages, "session/load", load)
+                assert error["code"] == -32015
+                assert "already has an open CLI launch" in error["message"]
+                assert error["data"]["cognition.ai/errorKind"] == "session_locked"
+                assert error["data"]["cognition.ai/lockHolderPid"] == holder_pid(
+                    acp_native.store, owner["id"]
+                )
             assert [run["id"] for run in acp_state.live(acp_native.store)] == [owner["id"]]
 
     asyncio.run(scenario())
@@ -676,6 +697,11 @@ def test_gui_session_list_is_the_natives_own_listing_from_one_reused_agent(
             assert first["sessions"][0]["_meta"] == {"fake/row": True}
             lists = [call for call in logged(acp_native) if call["method"] == "session/list"]
             assert len({call["pid"] for call in lists}) == 1
+            # Desktop polls session/list every 60 s; a late poll must still find the same native.
+            lister = bridge.lister
+            lister.last_activity -= 3 * 60
+            await bridge.close_lister()
+            assert bridge.lister is lister
             bridge.lister.last_activity -= acp.LISTER_IDLE
             await bridge.close_lister()
             assert bridge.lister is None
@@ -870,13 +896,16 @@ def test_gui_warm_agent_follows_the_chat_folder(acp_native, tmp_path):
 
 def test_gui_warm_agent_still_refuses_a_chat_missing_from_history(acp_native, tmp_path):
     async def scenario():
-        async with in_process(acp_native) as (bridge, _):
+        async with in_process(acp_native) as (bridge, messages):
             spare = await warm(bridge)
-            with pytest.raises(SwitchError, match="no longer in shared history"):
-                await bridge.dispatch(
-                    "session/load",
-                    {"sessionId": "never-saved", "cwd": str(tmp_path), "mcpServers": []},
-                )
+            params = {"sessionId": "never-saved", "cwd": str(tmp_path), "mcpServers": []}
+            error = await wire_error(bridge, messages, "session/load", params)
+            # Desktop drops a deleted chat quietly only when it sees session_not_found.
+            assert error["code"] == -32016 and "no longer in shared history" in error["message"]
+            assert error["data"] == {
+                "cognition.ai/errorKind": "session_not_found",
+                "cognition.ai/retryable": False,
+            }
             assert spare.process.poll() is not None
             assert not any(call["method"] == "session/load" for call in logged(acp_native))
 
@@ -1321,7 +1350,7 @@ def test_gui_startup_and_listing_skip_the_login_check(acp_native, tmp_path, monk
     """A window reload waits for initialize; the login check can take 10 s on a slow network."""
     checked = []
 
-    def require_login(self, account):
+    def require_login(self, account, **options):
         checked.append(account.name)
         raise SwitchError(f"No saved login for {account.name!r}. Run: ds login {account.name}")
 
@@ -1338,6 +1367,38 @@ def test_gui_startup_and_listing_skip_the_login_check(acp_native, tmp_path, monk
             with pytest.raises(SwitchError, match="No saved login"):
                 await bridge.dispatch("session/new", {"cwd": str(tmp_path), "mcpServers": []})
         assert checked and set(checked) == {"ansuman-1"}
+
+    asyncio.run(scenario())
+
+
+def test_gui_chats_check_the_saved_login_without_the_network(acp_native, tmp_path, monkeypatch):
+    """`devin auth status` took 1-10 s per chat (30 s offline); the built-in agent never runs it."""
+    capture = Native.capture
+    checked = []
+
+    def offline(self, account, arguments, **options):
+        if arguments == ("auth", "status"):
+            checked.append(account.name)
+            raise SwitchError("network unreachable")
+        return capture(self, account, arguments, **options)
+
+    monkeypatch.setattr(Native, "capture", offline)
+
+    async def scenario():
+        async with in_process(acp_native) as (bridge, _):
+            created = await bridge.dispatch("session/new", {"cwd": str(tmp_path), "mcpServers": []})
+            assert created["sessionId"] in bridge.chats
+            acp_native.store.credentials(acp_native.store.account("ansuman-2")).unlink()
+            acp_state.bind(
+                acp_native.store, created["sessionId"], acp_native.store.account("ansuman-2")
+            )
+            await bridge.dispatch("session/close", {"sessionId": created["sessionId"]})
+            with pytest.raises(SwitchError, match="No saved login for 'ansuman-2'"):
+                await bridge.dispatch(
+                    "session/load",
+                    {"sessionId": created["sessionId"], "cwd": str(tmp_path), "mcpServers": []},
+                )
+        assert checked == []
 
     asyncio.run(scenario())
 
@@ -2354,6 +2415,27 @@ def test_gui_quota_error_without_auto_switch_is_returned_unchanged(
             assert acp_native.store.selected().name == "ansuman-1"
             assert prompts(acp_native) == [("ansuman-1", "work")]
             assert "out of usage" not in json.dumps(messages)
+
+    asyncio.run(scenario())
+
+
+def test_gui_native_error_details_reach_desktop(acp_native, tmp_path, monkeypatch):
+    """Desktop's error classifier reads errorKind, retryable and retryAfterSeconds from data."""
+    monkeypatch.setenv("FAKE_QUOTA_ACCOUNTS", "ansuman-1")
+    monkeypatch.setenv("FAKE_QUOTA_STYLE", "rate")
+
+    async def scenario():
+        async with in_process(acp_native) as (bridge, messages):
+            created = await bridge.dispatch("session/new", {"cwd": str(tmp_path), "mcpServers": []})
+            params = prompt_params(created["sessionId"], "work")
+            error = await wire_error(bridge, messages, "session/prompt", params)
+            assert error["code"] == -32011
+            assert error["message"].startswith("Native ACP rejected the request")
+            assert error["data"] == {
+                "cognition.ai/errorKind": "resource_exhausted",
+                "cognition.ai/retryable": True,
+                "cognition.ai/retryAfterSeconds": 30,
+            }
 
     asyncio.run(scenario())
 

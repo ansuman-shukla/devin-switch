@@ -20,7 +20,7 @@ IDLE_TIMEOUT = 15 * 60
 IDLE_RECHECK = 30
 HANDOVER_TIMEOUT = 10
 ORPHAN_TIMEOUT = 30
-LISTER_IDLE = 60
+LISTER_IDLE = 15 * 60
 SPARE_IDLE = 30 * 60
 LOCAL_COMMANDS = [
     {
@@ -686,6 +686,9 @@ class Bridge:
                 raise RpcError("ACP is already initialized.", -32600)
             self.initialization = copy.deepcopy(params)
             self.initialization["protocolVersion"] = 1
+            # Desktop offers this only to its bundled agents; it adds the chat to diagnostics.
+            client = self.initialization.setdefault("clientCapabilities", {})
+            client.setdefault("_meta", {}).setdefault("cognition.ai/diagnosticsSessionExport", True)
             probe = Backend(self, self.default_account(), Path.cwd(), chat=False)
             result = await probe.start()
             self.lister = probe

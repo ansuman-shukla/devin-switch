@@ -697,6 +697,11 @@ def test_gui_session_list_is_the_natives_own_listing_from_one_reused_agent(
             assert first["sessions"][0]["_meta"] == {"fake/row": True}
             lists = [call for call in logged(acp_native) if call["method"] == "session/list"]
             assert len({call["pid"] for call in lists}) == 1
+            # Desktop polls session/list every 60 s; a late poll must still find the same native.
+            lister = bridge.lister
+            lister.last_activity -= 3 * 60
+            await bridge.close_lister()
+            assert bridge.lister is lister
             bridge.lister.last_activity -= acp.LISTER_IDLE
             await bridge.close_lister()
             assert bridge.lister is None

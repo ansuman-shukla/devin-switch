@@ -20,7 +20,7 @@ IDLE_TIMEOUT = 15 * 60
 IDLE_RECHECK = 30
 HANDOVER_TIMEOUT = 10
 ORPHAN_TIMEOUT = 30
-LISTER_IDLE = 60
+LISTER_IDLE = 15 * 60
 SPARE_IDLE = 30 * 60
 LOCAL_COMMANDS = [
     {
@@ -46,6 +46,7 @@ LOCAL_COMMANDS = [
 ]
 LOCAL_NAMES = {"/" + command["name"] for command in LOCAL_COMMANDS}
 AGENT_STOPPED = "_cognition.ai/agent_stopped"
+CANCEL_REQUEST = "$/cancel_request"
 RESOURCE_EXHAUSTED = -32011
 RESOURCE_NOT_FOUND = -32002
 AUTO_SWITCH_LIMIT = 3
@@ -60,6 +61,38 @@ LIVE_CONTROLS = {
     "_cognition.ai/subagent/cancel",
 }
 OPENING = {"session/new", "session/load"}
+# Project MCP config the native reads from its process folder (not the session cwd).
+PROJECT_MCP_FILES = (
+    ".mcp.json",
+    ".devin/mcp_config.json",
+    ".devin/mcp_config.local.json",
+    ".cursor/mcp.json",
+)
+# Customize MCP changes go to the listing native; each chat native runs its own MCP servers, so
+# they repeat the change (None: follow the server's new enabled state after a toggle).
+MCP_FOLLOW = {
+    "_cognition.ai/mcp/installServer": "connectServer",
+    "_cognition.ai/mcp/connectServer": "connectServer",
+    "_cognition.ai/mcp/disconnectServer": "disconnectServer",
+    "_cognition.ai/mcp/removeServer": "disconnectServer",
+    "_cognition.ai/mcp/toggleServer": None,
+}
+# Window-wide notices every native sends; only the listing native's reach Desktop.
+WINDOW_NOTICES = {"_cognition.ai/mcp/serversChanged", "_cognition.ai/output"}
+# Sidebar and side-panel requests the native serves beside a running turn; like LIVE_CONTROLS
+# they skip the prompt gate, and they never reconnect a chat another window has taken.
+SIDE_REQUESTS = {
+    "_cognition.ai/session/rename",
+    "_cognition.ai/session/share",
+    "_cognition.ai/session/markRead",
+    "_cognition.ai/revert/listSteps",
+    "_cognition.ai/revert/preview",
+    "_cognition.ai/sidechain/request",
+    "_cognition.ai/sidechain/cancel",
+    "_cognition.ai/terminal/killBackgroundShell",
+    "_cognition.ai/queuedMessages/update",
+    "_cognition.ai/diagnostics/sessionExport",
+}
 # Editor state Desktop sends once (didOpen right after initialize): replay it to later natives.
 # The value says whether the state is kept per document/repository uri or only the latest.
 EDITOR_STATE = {
@@ -131,8 +164,42 @@ def is_local_command(command: str) -> bool:
     )
 
 
+def has_project_mcp(folder: Path) -> bool:
+    # In the home folder these are the user-level files every native loads anyway.
+    if folder.resolve() == Path.home().resolve():
+        return False
+    return any((folder / name).is_file() for name in PROJECT_MCP_FILES)
+
+
+def spare_fits(spare_folder: Path, project: Path) -> bool:
+    """A native started in spare_folder gives a chat in project the right MCP servers."""
+    return spare_folder == project or not (
+        has_project_mcp(spare_folder) or has_project_mcp(project)
+    )
+
+
+def cancel_request(identifier) -> dict:
+    return {"jsonrpc": "2.0", "method": CANCEL_REQUEST, "params": {"requestId": identifier}}
+
+
 def continue_params(session_id: str) -> dict:
     return {"sessionId": session_id, "prompt": [{"type": "text", "text": handoff.CONTINUE_PROMPT}]}
+
+
+def error_details(error: Exception) -> tuple[int, dict | None]:
+    """The code and data Desktop classifies an error by (native errors keep theirs)."""
+    if isinstance(error, sessions.ChatMissing):
+        return -32016, {
+            "cognition.ai/errorKind": "session_not_found",
+            "cognition.ai/retryable": False,
+        }
+    if isinstance(error, sessions.ChatHeld):
+        data = {"cognition.ai/errorKind": "session_locked", "cognition.ai/retryable": True}
+        if error.pid is not None:
+            data["cognition.ai/lockHolderPid"] = error.pid
+        return -32015, data
+    data = getattr(error, "data", None)
+    return getattr(error, "code", -32603), data if isinstance(data, dict) else None
 
 
 def failure_detail(error: Exception) -> str:
@@ -486,7 +553,7 @@ class Backend:
             with suppress(asyncio.CancelledError):
                 await self.pump
         self.lease.close(ended=True)
-        self.bridge.drop_client_requests(self)
+        await self.bridge.drop_client_requests(self)
         self.close_pipes()
         await asyncio.to_thread(self.close_relay)
 
@@ -550,6 +617,7 @@ class Bridge:
         self.lister = None
         self.listing = asyncio.Lock()
         self.spare = None
+        self.spare_folder = Path.home()
         self.filling = False
 
     def spawn(self, coroutine):
@@ -577,10 +645,13 @@ class Bridge:
             }
         )
 
-    def drop_client_requests(self, backend):
+    async def drop_client_requests(self, backend):
+        """A native that exited can't receive answers: clear its cards in Desktop too."""
         for identifier, (owner, _) in list(self.client_requests.items()):
             if owner is backend:
                 self.client_requests.pop(identifier)
+                with suppress(OSError):
+                    await self.emit(cancel_request(identifier))
 
     async def from_backend(self, backend, message):
         if "id" in message:
@@ -590,6 +661,20 @@ class Bridge:
             await self.emit({**message, "id": identifier})
             return
         params = message.get("params")
+        if message.get("method") == CANCEL_REQUEST:
+            # The native cancels with its own id; Desktop knows the card by the bridge's id.
+            original = params.get("requestId") if isinstance(params, dict) else None
+            for identifier, owner in list(self.client_requests.items()):
+                if owner == (backend, original):
+                    self.client_requests.pop(identifier)
+                    await self.emit(cancel_request(identifier))
+            return
+        if (
+            message.get("method") in WINDOW_NOTICES
+            and backend.chat
+            and not (isinstance(params, dict) and params.get("sessionId"))
+        ):
+            return
         if (
             message.get("method") == AGENT_STOPPED
             and isinstance(params, dict)
@@ -652,16 +737,11 @@ class Bridge:
                     if isinstance(exc, SwitchError)
                     else "GUI bridge operation failed safely. Reopen the saved chat and retry."
                 )
-                await self.emit(
-                    {
-                        "jsonrpc": "2.0",
-                        "id": identifier,
-                        "error": {
-                            "code": getattr(exc, "code", -32603),
-                            "message": text,
-                        },
-                    }
-                )
+                code, data = error_details(exc)
+                error = {"code": code, "message": text}
+                if data:
+                    error["data"] = data
+                await self.emit({"jsonrpc": "2.0", "id": identifier, "error": error})
 
     async def dispatch(self, method, params, *, notification=False):
         if (
@@ -675,6 +755,9 @@ class Bridge:
                 raise RpcError("ACP is already initialized.", -32600)
             self.initialization = copy.deepcopy(params)
             self.initialization["protocolVersion"] = 1
+            # Desktop offers this only to its bundled agents; it adds the chat to diagnostics.
+            client = self.initialization.setdefault("clientCapabilities", {})
+            client.setdefault("_meta", {}).setdefault("cognition.ai/diagnosticsSessionExport", True)
             probe = Backend(self, self.default_account(), Path.cwd(), chat=False)
             result = await probe.start()
             self.lister = probe
@@ -713,7 +796,12 @@ class Bridge:
         if method in {"session/new", "session/load", "session/resume"}:
             return await self.open_session(method, params)
         if method.startswith("_") and "sessionId" not in params and not notification:
-            return await self.ask_lister(method, params)
+            result = await self.ask_lister(method, params)
+            if method in MCP_FOLLOW:
+                # Decided now: a later toggle must not change what this one repeats.
+                action = MCP_FOLLOW[method] or await self.toggled_action(params)
+                self.spawn(self.follow_mcp(action, params))
+            return result
         if method.startswith(EDITOR_CONTEXT) and "sessionId" not in params and notification:
             # Desktop's editor and terminal context belongs to the window, so every native gets it.
             self.remember_editor(method, params)
@@ -723,8 +811,16 @@ class Bridge:
             return {}
         session_id = params.get("sessionId")
         if session_id not in self.chats:
+            if method == "session/close":
+                return {}
             raise RpcError("Load the exact saved conversation before using it.", -32602)
         chat = self.chats[session_id]
+        if method in SIDE_REQUESTS and chat.suspended:
+            store = self.native.store
+            own = {backend.lease.run.id for backend in self.backends if backend.lease}
+            if await asyncio.to_thread(acp_state.held_elsewhere, store, session_id, own):
+                # The native answers this for a chat it hasn't loaded; Desktop ignores it quietly.
+                raise RpcError("Session not found: this chat is open in another window.", -32602)
         if notification:
             if method == "session/cancel":
                 chat.canceled = True
@@ -745,7 +841,8 @@ class Bridge:
             and not chat.canceled
             and not is_local_command(prompt_command(params)[2])
         )
-        if (method in LIVE_CONTROLS or steering) and chat.controls is not None:
+        live = method in LIVE_CONTROLS or method in SIDE_REQUESTS or steering
+        if live and chat.controls is not None:
             if steering:
                 chat.backend.record_prompt(params)
             task = self.spawn(self.forward_request(chat.backend, method, params))
@@ -874,6 +971,42 @@ class Bridge:
             self.editor_state.pop(key, None)
             self.editor_state[key] = (method, params)
 
+    async def toggled_action(self, params):
+        scope = {key: params[key] for key in ("workspaceDirs",) if key in params}
+        try:
+            listed = await self.ask_lister("_cognition.ai/mcp/listServers", scope)
+        except (SwitchError, OSError):
+            return "disconnectServer"
+        state = next(
+            (
+                item
+                for item in listed.get("servers", [])
+                if item.get("serverId") == params.get("serverId")
+                and item.get("sourcePath") == params.get("sourcePath")
+            ),
+            None,
+        )
+        return "connectServer" if state and not state.get("disabled") else "disconnectServer"
+
+    async def follow_mcp(self, action, params):
+        """Repeat a Customize MCP change in the chat natives, best effort."""
+        scope = {key: params[key] for key in ("workspaceDirs",) if key in params}
+        follow = {"serverId": params.get("serverId"), **scope}
+        if action == "disconnectServer" and "sourcePath" in params:
+            follow["sourcePath"] = params["sourcePath"]
+        targets = [
+            backend
+            for backend in list(self.backends)
+            if backend.chat and backend.editor_ready and not backend.stopping
+        ]
+        await asyncio.gather(
+            *(
+                backend.request(f"_cognition.ai/mcp/{action}", follow, LIFECYCLE_TIMEOUT)
+                for backend in targets
+            ),
+            return_exceptions=True,
+        )
+
     async def list_sessions(self, params):
         """Let the native list shared history: Desktop needs its filters, paging and _meta."""
         return await self.ask_lister("session/list", params, LIFECYCLE_TIMEOUT)
@@ -904,12 +1037,16 @@ class Bridge:
                 await lister.close()
 
     async def refill(self):
-        """Start a logged-in agent for the default login, so the next chat skips startup."""
+        """Start a logged-in agent for the default login, so the next chat skips startup.
+
+        It runs in the latest chat's folder (first the window's): the native reads a project's
+        own MCP servers from its process folder, so it only serves chats in that folder.
+        """
         if self.filling or self.spare is not None:
             return
         self.filling = True
         try:
-            backend = Backend(self, self.default_account(), Path.home(), spare=True)
+            backend = Backend(self, self.default_account(), self.spare_folder, spare=True)
             await backend.start()
             self.spare = backend
         except (SwitchError, OSError, RpcError):
@@ -932,8 +1069,15 @@ class Bridge:
         ):
             await self.drop_spare()
             spare = None
-        if spare is None or spare.account.name != account.name:
-            if spare is not None and spare.account.name != self.default_account().name:
+        # The native reads project MCP servers from its process folder: a project with MCP config
+        # needs a native started there, ordinary folders share one started in the home folder.
+        self.spare_folder = project if has_project_mcp(project) else Path.home()
+        usable = spare is not None and spare_fits(spare.project, project)
+        if not usable or spare.account.name != account.name:
+            if spare is not None and (
+                spare.account.name != self.default_account().name
+                or not spare_fits(spare.project, self.spare_folder)
+            ):
                 await self.drop_spare()
             self.spawn(self.refill())
             backend = Backend(self, account, project, session_id)
@@ -1021,8 +1165,9 @@ class Bridge:
             if time.monotonic() >= deadline:
                 await asyncio.to_thread(acp_state.cancel_handover, store, asked)
                 if await asyncio.to_thread(acp_state.held, store, session_id, holders):
-                    raise SwitchError(BUSY_ELSEWHERE)
-                raise SwitchError(STILL_CLOSING)
+                    raise sessions.ChatHeld(BUSY_ELSEWHERE, sessions.run_pid(store, holders[0]))
+                pid = sessions.run_pid(store, orphans[0]) if orphans else None
+                raise sessions.ChatHeld(STILL_CLOSING, pid)
             await asyncio.sleep(0.2)
 
     async def open_session(self, method, params):

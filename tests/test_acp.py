@@ -534,6 +534,67 @@ def test_gui_other_window_takes_over_an_idle_chat_and_hands_it_back(acp_native, 
     asyncio.run(scenario())
 
 
+def test_gui_sidebar_action_does_not_take_a_chat_back(acp_native, tmp_path):
+    """A rename in window 1 must not pull the chat out of window 2, which now has it open."""
+
+    async def scenario():
+        async with connect(acp_native) as first, connect(acp_native) as second:
+            session_id = await first.new(tmp_path)
+            await first.prompt(session_id, "hello")
+            setup = {"sessionId": session_id, "cwd": str(tmp_path), "mcpServers": []}
+            assert "result" in await second.request("session/load", setup)
+            taken = [
+                run["id"]
+                for run in acp_state.live(acp_native.store)
+                if run["session_id"] == session_id
+            ]
+            renamed = await first.request(
+                "_cognition.ai/session/rename", {"sessionId": session_id, "title": "New"}
+            )
+            # Like a native without the chat loaded; Desktop handles "Session not found" quietly.
+            assert renamed["error"]["code"] == -32602
+            assert renamed["error"]["message"].startswith("Session not found")
+            live = [
+                run["id"]
+                for run in acp_state.live(acp_native.store)
+                if run["session_id"] == session_id
+            ]
+            assert live == taken
+            closed = await first.request("session/close", {"sessionId": "never-opened-here"})
+            assert closed == {"jsonrpc": "2.0", "id": closed["id"], "result": {}}
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize(
+    "method", ["_cognition.ai/session/rename", "_cognition.ai/queuedMessages/update"]
+)
+def test_gui_sidebar_requests_answer_during_a_turn(acp_native, tmp_path, method):
+    async def scenario():
+        async with connect(acp_native) as client:
+            session_id = await client.new(tmp_path)
+            turn = asyncio.create_task(client.prompt(session_id, "busy"))
+            await wait_for_text(client, "live progress")
+            answer = await asyncio.wait_for(client.request(method, {"sessionId": session_id}), 5)
+            assert "result" in answer and not turn.done()
+            await client.send({"method": "session/cancel", "params": {"sessionId": session_id}})
+            await turn
+
+    asyncio.run(scenario())
+
+
+async def wire_error(bridge, messages, method, params):
+    """The error object Desktop receives for a request, as the bridge writes it."""
+    identifier = f"probe-{len(messages)}"
+    await bridge.handle({"jsonrpc": "2.0", "id": identifier, "method": method, "params": params})
+    (response,) = [message for message in messages if message.get("id") == identifier]
+    return response["error"]
+
+
+def holder_pid(store, run_id):
+    return json.loads((store.root / "runtime" / f"{run_id}.json").read_text())["pid"]
+
+
 def test_gui_other_window_leaves_a_busy_chat_alone(acp_native, tmp_path, monkeypatch):
     monkeypatch.setattr(acp, "HANDOVER_TIMEOUT", 1)
 
@@ -545,12 +606,17 @@ def test_gui_other_window_leaves_a_busy_chat_alone(acp_native, tmp_path, monkeyp
             )
             pending = asyncio.create_task(first.prompt(session_id, "permission"))
             request = await asyncio.wait_for(first.requests.get(), 5)
-            async with in_process(acp_native) as (second, _):
-                with pytest.raises(SwitchError, match="busy in another Devin window"):
-                    await second.dispatch(
-                        "session/load",
-                        {"sessionId": session_id, "cwd": str(tmp_path), "mcpServers": []},
-                    )
+            async with in_process(acp_native) as (second, messages):
+                load = {"sessionId": session_id, "cwd": str(tmp_path), "mcpServers": []}
+                error = await wire_error(second, messages, "session/load", load)
+                # Desktop shows its "open in another process (PID …)" state for session_locked.
+                assert error["code"] == -32015
+                assert "busy in another Devin window" in error["message"]
+                assert error["data"] == {
+                    "cognition.ai/errorKind": "session_locked",
+                    "cognition.ai/retryable": True,
+                    "cognition.ai/lockHolderPid": holder_pid(acp_native.store, owner["id"]),
+                }
                 assert session_id not in second.chats
             assert acp_state.lifecycle(acp_native.store, owner["id"]) == "open"
             response = {"outcome": {"outcome": "selected", "optionId": "reject"}}
@@ -604,15 +670,16 @@ def test_gui_reopen_waits_for_an_agent_orphaned_by_an_acp_reload(
         run, native = orphan_native(store, session_id, tmp_path)
         try:
             assert acp_state.orphaned(store, run.id)
-            async with in_process(acp_native) as (bridge, _):
+            async with in_process(acp_native) as (bridge, messages):
                 load = {"sessionId": session_id, "cwd": str(tmp_path), "mcpServers": []}
                 if exits:
                     asyncio.get_running_loop().call_later(0.5, native.kill)
                     await bridge.dispatch("session/load", load)
                     assert session_id in bridge.chats
                 else:
-                    with pytest.raises(SwitchError, match="still shutting down"):
-                        await bridge.dispatch("session/load", load)
+                    error = await wire_error(bridge, messages, "session/load", load)
+                    assert error["code"] == -32015 and "still shutting down" in error["message"]
+                    assert error["data"]["cognition.ai/lockHolderPid"] == native.pid
                     assert native.poll() is None  # never force-killed
         finally:
             native.kill()
@@ -629,12 +696,15 @@ def test_gui_terminal_launch_of_the_same_chat_still_blocks_gui_load(acp_native, 
                 run for run in acp_state.live(acp_native.store) if run["session_id"] == session_id
             )
             acp_state.lifecycle_path(acp_native.store, owner["id"]).unlink()
-            async with in_process(acp_native) as (second, _):
-                with pytest.raises(SwitchError, match="already has an open CLI launch"):
-                    await second.dispatch(
-                        "session/load",
-                        {"sessionId": session_id, "cwd": str(tmp_path), "mcpServers": []},
-                    )
+            async with in_process(acp_native) as (second, messages):
+                load = {"sessionId": session_id, "cwd": str(tmp_path), "mcpServers": []}
+                error = await wire_error(second, messages, "session/load", load)
+                assert error["code"] == -32015
+                assert "already has an open CLI launch" in error["message"]
+                assert error["data"]["cognition.ai/errorKind"] == "session_locked"
+                assert error["data"]["cognition.ai/lockHolderPid"] == holder_pid(
+                    acp_native.store, owner["id"]
+                )
             assert [run["id"] for run in acp_state.live(acp_native.store)] == [owner["id"]]
 
     asyncio.run(scenario())
@@ -676,6 +746,11 @@ def test_gui_session_list_is_the_natives_own_listing_from_one_reused_agent(
             assert first["sessions"][0]["_meta"] == {"fake/row": True}
             lists = [call for call in logged(acp_native) if call["method"] == "session/list"]
             assert len({call["pid"] for call in lists}) == 1
+            # Desktop polls session/list every 60 s; a late poll must still find the same native.
+            lister = bridge.lister
+            lister.last_activity -= 3 * 60
+            await bridge.close_lister()
+            assert bridge.lister is lister
             bridge.lister.last_activity -= acp.LISTER_IDLE
             await bridge.close_lister()
             assert bridge.lister is None
@@ -771,6 +846,8 @@ def test_gui_chats_open_on_a_warm_logged_in_agent(acp_native, tmp_path):
             created = await bridge.dispatch("session/new", {"cwd": str(tmp_path), "mcpServers": []})
             session_id = created["sessionId"]
             assert bridge.chats[session_id].backend is spare
+            # Without project MCP config any folder can use it, so it stays in the home folder.
+            assert native_folder(acp_native, spare) == Path.home().resolve()
             run = next(run for run in sessions.runs(store) if run["id"] == spare.lease.run.id)
             assert (run["kind"], run["project"], run["session_id"]) == (
                 "chat",
@@ -804,8 +881,42 @@ def test_gui_chats_open_on_a_warm_logged_in_agent(acp_native, tmp_path):
     asyncio.run(scenario())
 
 
-def test_gui_warm_agent_loads_a_saved_chat_from_another_folder(acp_native, tmp_path):
-    """Like the native, which keeps the saved project and serves any cwd."""
+def native_folder(native, backend):
+    """The folder a native process runs in (it reads project MCP servers from there)."""
+    calls = [call for call in logged(native) if call["pid"] == backend.process.pid]
+    return Path(calls[-1]["process_cwd"]).resolve()
+
+
+@pytest.mark.parametrize("config", [".mcp.json", ".devin/mcp_config.json", ".cursor/mcp.json"])
+def test_gui_warm_agent_serves_folders_without_project_mcp(acp_native, tmp_path, config):
+    """Chats in ordinary folders keep the warm spare; it never runs in a project with MCP config."""
+
+    async def scenario():
+        async with in_process(acp_native) as (bridge, _):
+            spare = await warm(bridge)
+            plain = (tmp_path / "plain").resolve()
+            plain.mkdir()
+            created = await bridge.dispatch("session/new", {"cwd": str(plain), "mcpServers": []})
+            assert bridge.chats[created["sessionId"]].backend is spare
+            project = (tmp_path / "project").resolve()
+            (project / config).parent.mkdir(parents=True)
+            (project / config).write_text('{"mcpServers": {}}')
+            replacement = await warm(bridge)
+            created = await bridge.dispatch("session/new", {"cwd": str(project), "mcpServers": []})
+            chat = bridge.chats[created["sessionId"]].backend
+            assert chat is not replacement and native_folder(acp_native, chat) == project
+            # Back in an ordinary folder: a spare from the MCP project would add its servers.
+            moved = await warm(bridge)
+            assert native_folder(acp_native, moved) == project
+            created = await bridge.dispatch("session/new", {"cwd": str(plain), "mcpServers": []})
+            assert bridge.chats[created["sessionId"]].backend is not moved
+            assert native_folder(acp_native, await warm(bridge)) == Path.home().resolve()
+
+    asyncio.run(scenario())
+
+
+def test_gui_warm_agent_follows_the_chat_folder(acp_native, tmp_path):
+    """The native reads a project's own MCP servers from its process folder, not the chat's."""
 
     async def scenario():
         async with in_process(acp_native) as (bridge, _):
@@ -813,29 +924,37 @@ def test_gui_warm_agent_loads_a_saved_chat_from_another_folder(acp_native, tmp_p
             session_id = created["sessionId"]
             await bridge.dispatch("session/close", {"sessionId": session_id})
             spare = await warm(bridge)
-            other = tmp_path / "other"
+            other = (tmp_path / "other").resolve()
             other.mkdir()
+            (other / ".mcp.json").write_text('{"mcpServers": {}}')
             await bridge.dispatch(
                 "session/load", {"sessionId": session_id, "cwd": str(other), "mcpServers": []}
             )
-            assert bridge.chats[session_id].backend is spare
-            assert bridge.chats[session_id].setup["cwd"] == str(other.resolve())
-            (load,) = [call for call in logged(acp_native) if call["method"] == "session/load"]
-            assert load["sessionId"] == session_id
-            assert spare.lease.run.project == str(other.resolve())
+            chat = bridge.chats[session_id]
+            # A spare in another folder would miss this project's MCP servers: start fresh here.
+            assert chat.backend is not spare and spare.process.poll() is not None
+            assert native_folder(acp_native, chat.backend) == other
+            assert chat.backend.lease.run.project == str(other)
+            moved = await warm(bridge)
+            assert native_folder(acp_native, moved) == other
+            nearby = await bridge.dispatch("session/new", {"cwd": str(other), "mcpServers": []})
+            assert bridge.chats[nearby["sessionId"]].backend is moved
 
     asyncio.run(scenario())
 
 
 def test_gui_warm_agent_still_refuses_a_chat_missing_from_history(acp_native, tmp_path):
     async def scenario():
-        async with in_process(acp_native) as (bridge, _):
+        async with in_process(acp_native) as (bridge, messages):
             spare = await warm(bridge)
-            with pytest.raises(SwitchError, match="no longer in shared history"):
-                await bridge.dispatch(
-                    "session/load",
-                    {"sessionId": "never-saved", "cwd": str(tmp_path), "mcpServers": []},
-                )
+            params = {"sessionId": "never-saved", "cwd": str(tmp_path), "mcpServers": []}
+            error = await wire_error(bridge, messages, "session/load", params)
+            # Desktop drops a deleted chat quietly only when it sees session_not_found.
+            assert error["code"] == -32016 and "no longer in shared history" in error["message"]
+            assert error["data"] == {
+                "cognition.ai/errorKind": "session_not_found",
+                "cognition.ai/retryable": False,
+            }
             assert spare.process.poll() is not None
             assert not any(call["method"] == "session/load" for call in logged(acp_native))
 
@@ -1280,7 +1399,7 @@ def test_gui_startup_and_listing_skip_the_login_check(acp_native, tmp_path, monk
     """A window reload waits for initialize; the login check can take 10 s on a slow network."""
     checked = []
 
-    def require_login(self, account):
+    def require_login(self, account, **options):
         checked.append(account.name)
         raise SwitchError(f"No saved login for {account.name!r}. Run: ds login {account.name}")
 
@@ -1297,6 +1416,135 @@ def test_gui_startup_and_listing_skip_the_login_check(acp_native, tmp_path, monk
             with pytest.raises(SwitchError, match="No saved login"):
                 await bridge.dispatch("session/new", {"cwd": str(tmp_path), "mcpServers": []})
         assert checked and set(checked) == {"ansuman-1"}
+
+    asyncio.run(scenario())
+
+
+def test_gui_customize_mcp_changes_reach_open_chats_once(acp_native, tmp_path, monkeypatch):
+    """Each chat native runs its own MCP servers; the built-in agent has one per window."""
+    gate = tmp_path / "connect-gate"
+    gate.touch()
+    monkeypatch.setenv("FAKE_MCP_CONNECT_GATE", str(gate))
+
+    async def scenario():
+        async with in_process(acp_native) as (bridge, messages):
+            created = await bridge.dispatch("session/new", {"cwd": str(tmp_path), "mcpServers": []})
+            chat = bridge.chats[created["sessionId"]].backend
+            server = {"command": "docs-mcp", "args": []}
+            await bridge.dispatch(
+                "_cognition.ai/mcp/installServer", {"serverId": "docs", "config": server}
+            )
+            listed = await bridge.dispatch("_cognition.ai/mcp/listServers", {})
+            source = listed["servers"][0]["sourcePath"]
+            changed = len([m for m in messages if m.get("method", "").endswith("serversChanged")])
+            for _ in range(2):
+                await bridge.dispatch(
+                    "_cognition.ai/mcp/toggleServer", {"serverId": "docs", "sourcePath": source}
+                )
+            await bridge.dispatch(
+                "_cognition.ai/mcp/removeServer", {"serverId": "docs", "sourcePath": source}
+            )
+
+            def followed():
+                return [
+                    call["method"].rsplit("/", 1)[1]
+                    for call in logged(acp_native)
+                    if call["pid"] == chat.process.pid and "/mcp/" in call["method"]
+                ]
+
+            async with asyncio.timeout(5):
+                while len(followed()) < 4:
+                    await asyncio.sleep(0.02)
+            # Install connects, disable disconnects, enable connects, remove disconnects.
+            assert followed() == [
+                "connectServer",
+                "disconnectServer",
+                "connectServer",
+                "disconnectServer",
+            ]
+            await asyncio.sleep(0.2)
+            notices = [m for m in messages if m.get("method", "").endswith("serversChanged")]
+            # Only the listing native's notices reach Desktop: one per Customize change.
+            assert len(notices) - changed == 3
+
+    asyncio.run(scenario())
+
+
+def cancelled_cards(messages):
+    return [
+        message["params"]["requestId"]
+        for message in messages
+        if message.get("method") == "$/cancel_request"
+    ]
+
+
+def test_gui_native_withdrawn_request_clears_the_desktop_card(acp_native, tmp_path):
+    async def scenario():
+        async with in_process(acp_native) as (bridge, messages):
+            created = await bridge.dispatch("session/new", {"cwd": str(tmp_path), "mcpServers": []})
+            await bridge.dispatch(
+                "session/prompt", prompt_params(created["sessionId"], "withdrawn")
+            )
+            (card,) = [m for m in messages if m.get("method") == "elicitation/create"]
+            assert card["id"].startswith("ds-client-")
+            # Desktop only knows its own id for the card; the native's 101 would be ignored.
+            assert cancelled_cards(messages) == [card["id"]]
+            assert bridge.client_requests == {}
+
+    asyncio.run(scenario())
+
+
+def test_gui_native_exit_clears_its_open_desktop_cards(acp_native, tmp_path):
+    async def scenario():
+        async with in_process(acp_native) as (bridge, messages):
+            created = await bridge.dispatch("session/new", {"cwd": str(tmp_path), "mcpServers": []})
+            backend = bridge.chats[created["sessionId"]].backend
+            turn = asyncio.create_task(
+                bridge.dispatch("session/prompt", prompt_params(created["sessionId"], "permission"))
+            )
+            async with asyncio.timeout(5):
+                while not bridge.client_requests:
+                    await asyncio.sleep(0.02)
+            (card,) = bridge.client_requests
+            backend.process.kill()
+            with pytest.raises(SwitchError):
+                await turn
+            async with asyncio.timeout(5):
+                while card not in cancelled_cards(messages):
+                    await asyncio.sleep(0.02)
+            assert bridge.client_requests == {}
+
+    asyncio.run(scenario())
+
+
+def test_gui_chats_check_the_saved_login_without_the_network(acp_native, tmp_path, monkeypatch):
+    """`devin auth status` took 1-10 s per chat (30 s offline); the built-in agent never runs it."""
+    capture = Native.capture
+    checked = []
+
+    def offline(self, account, arguments, **options):
+        if arguments == ("auth", "status"):
+            checked.append(account.name)
+            raise SwitchError("network unreachable")
+        return capture(self, account, arguments, **options)
+
+    monkeypatch.setattr(Native, "capture", offline)
+
+    async def scenario():
+        async with in_process(acp_native) as (bridge, _):
+            created = await bridge.dispatch("session/new", {"cwd": str(tmp_path), "mcpServers": []})
+            assert created["sessionId"] in bridge.chats
+            acp_native.store.credentials(acp_native.store.account("ansuman-2")).unlink()
+            acp_state.bind(
+                acp_native.store, created["sessionId"], acp_native.store.account("ansuman-2")
+            )
+            await bridge.dispatch("session/close", {"sessionId": created["sessionId"]})
+            with pytest.raises(SwitchError, match="No saved login for 'ansuman-2'"):
+                await bridge.dispatch(
+                    "session/load",
+                    {"sessionId": created["sessionId"], "cwd": str(tmp_path), "mcpServers": []},
+                )
+        assert checked == []
 
     asyncio.run(scenario())
 
@@ -1744,6 +1992,25 @@ def test_gui_idle_preserves_mode_and_model_controls(
             )
             reply = json.loads(messages[-1]["params"]["update"]["content"]["text"])
             assert reply["settings"][key] == value
+
+    asyncio.run(scenario())
+
+
+def test_gui_sidebar_action_reconnects_an_idle_released_chat(acp_native, tmp_path):
+    """Only a chat another window holds refuses; one released for idleness reconnects."""
+
+    async def scenario():
+        async with in_process(acp_native) as (bridge, _):
+            result = await bridge.dispatch("session/new", {"cwd": str(tmp_path), "mcpServers": []})
+            chat = bridge.chats[result["sessionId"]]
+            chat.backend.last_activity -= acp.IDLE_TIMEOUT + 1
+            assert await bridge.release_idle(chat)
+            await bridge.dispatch(
+                "_cognition.ai/session/rename", {"sessionId": chat.session_id, "title": "New"}
+            )
+            assert not chat.suspended
+            renames = [c for c in logged(acp_native) if c["method"].endswith("session/rename")]
+            assert [call["pid"] for call in renames] == [chat.backend.process.pid]
 
     asyncio.run(scenario())
 
@@ -2313,6 +2580,27 @@ def test_gui_quota_error_without_auto_switch_is_returned_unchanged(
             assert acp_native.store.selected().name == "ansuman-1"
             assert prompts(acp_native) == [("ansuman-1", "work")]
             assert "out of usage" not in json.dumps(messages)
+
+    asyncio.run(scenario())
+
+
+def test_gui_native_error_details_reach_desktop(acp_native, tmp_path, monkeypatch):
+    """Desktop's error classifier reads errorKind, retryable and retryAfterSeconds from data."""
+    monkeypatch.setenv("FAKE_QUOTA_ACCOUNTS", "ansuman-1")
+    monkeypatch.setenv("FAKE_QUOTA_STYLE", "rate")
+
+    async def scenario():
+        async with in_process(acp_native) as (bridge, messages):
+            created = await bridge.dispatch("session/new", {"cwd": str(tmp_path), "mcpServers": []})
+            params = prompt_params(created["sessionId"], "work")
+            error = await wire_error(bridge, messages, "session/prompt", params)
+            assert error["code"] == -32011
+            assert error["message"].startswith("Native ACP rejected the request")
+            assert error["data"] == {
+                "cognition.ai/errorKind": "resource_exhausted",
+                "cognition.ai/retryable": True,
+                "cognition.ai/retryAfterSeconds": 30,
+            }
 
     asyncio.run(scenario())
 

@@ -153,13 +153,20 @@ class Native:
             )
         return result.stdout
 
-    def authenticated(self, account: Account) -> bool:
+    def saved_login(self, account: Account) -> bool:
+        """A saved credentials file, checked locally without asking Devin's server."""
         credentials = self.store.credentials(account)
         if credentials.is_symlink():
             raise SwitchError(f"Credentials must be a separate regular file for {account.name!r}.")
         if not credentials.is_file() or credentials.stat().st_size == 0:
             return False
         credentials.chmod(0o600)
+        return True
+
+    def authenticated(self, account: Account) -> bool:
+        if not self.saved_login(account):
+            return False
+        credentials = self.store.credentials(account)
         details = credentials.stat()
         key = (str(credentials), details.st_ino, details.st_mtime_ns, details.st_size)
         if verified_logins.get(key, 0) > time.monotonic():
@@ -170,8 +177,8 @@ class Native:
         verified_logins[key] = time.monotonic() + LOGIN_CHECK_TTL
         return True
 
-    def require_login(self, account: Account) -> None:
-        if not self.authenticated(account):
+    def require_login(self, account: Account, *, network: bool = True) -> None:
+        if not (self.authenticated(account) if network else self.saved_login(account)):
             raise SwitchError(f"No saved login for {account.name!r}. Run: ds login {account.name}")
 
     def interactive(self, account: Account, arguments: tuple[str, ...]) -> int:

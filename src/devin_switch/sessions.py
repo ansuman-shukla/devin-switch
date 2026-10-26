@@ -137,6 +137,44 @@ def run_pid(store: Store, run_id: str) -> int | None:
     return pid if type(pid) is int else None
 
 
+PRUNE_AGE = 7 * 24 * 3600
+PRUNE_INTERVAL = 24 * 3600
+
+
+def prune(store: Store, *, now: float | None = None) -> int:
+    """Delete the bookkeeping of launches that finished over a week ago, at most once a day.
+
+    Every chat open scans all launch records, and they were never removed. Only inactive runs
+    go, with their PID stamp, lock and lifecycle files; chats, history and the chats' saved
+    logins (`acp/sessions`) are never touched.
+    """
+    now = time.time() if now is None else now
+    marker = store.root / "runs-pruned.json"
+    try:
+        if now - json.loads(marker.read_text()) < PRUNE_INTERVAL:
+            return 0
+    except (OSError, ValueError, TypeError):
+        pass
+    write_json(marker, now)
+    removed = 0
+    for run in runs(store):
+        finished = run["ended_at"] or run["started_at"]
+        controller = f"acp-controller-{run['id']}.lock"
+        if run["active"] or now - finished < PRUNE_AGE or store.locked(controller):
+            continue
+        for path in (
+            store.root / "runs" / f"{run['id']}.json",
+            store.root / "runtime" / f"{run['id']}.json",
+            store.root / f"run-{run['id']}.lock",
+            store.root / controller,
+            store.root / "acp" / "lifecycle" / f"{run['id']}.json",
+            store.root / "acp" / "requests" / f"{run['id']}.json",
+        ):
+            path.unlink(missing_ok=True)
+        removed += 1
+    return removed
+
+
 def resume_blocker(chat: dict, running: list[dict]) -> str | None:
     if holder(chat, running):
         return "This chat already has an open CLI launch. Close it before resuming again."

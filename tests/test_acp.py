@@ -1420,6 +1420,27 @@ def test_gui_startup_and_listing_skip_the_login_check(acp_native, tmp_path, monk
     asyncio.run(scenario())
 
 
+def test_gui_bridge_start_clears_old_launch_records_in_the_background(acp_native, tmp_path):
+    import uuid
+    from dataclasses import asdict
+
+    store = acp_native.store
+    old = sessions.Run(uuid.uuid4().hex, "ansuman-1", str(tmp_path), "chat", 1.0, None, 2.0)
+    (store.root / "runs").mkdir(exist_ok=True)
+    record = store.root / "runs" / f"{old.id}.json"
+    record.write_text(json.dumps(asdict(old)))
+
+    async def scenario():
+        async with in_process(acp_native) as (bridge, _):
+            async with asyncio.timeout(5):
+                while record.exists():
+                    await asyncio.sleep(0.02)
+            created = await bridge.dispatch("session/new", {"cwd": str(tmp_path), "mcpServers": []})
+            assert created["sessionId"] in bridge.chats
+
+    asyncio.run(scenario())
+
+
 def test_gui_customize_mcp_changes_reach_open_chats_once(acp_native, tmp_path, monkeypatch):
     """Each chat native runs its own MCP servers; the built-in agent has one per window."""
     gate = tmp_path / "connect-gate"

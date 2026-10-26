@@ -4,6 +4,7 @@ import select
 import sqlite3
 import subprocess
 import sys
+import time
 from contextlib import ExitStack
 from pathlib import Path
 
@@ -450,6 +451,55 @@ def test_cli_liveness_ignores_inherited_background_leases(signed_in, tmp_path, c
         process.wait(timeout=5)
         for stream in (process.stdin, process.stdout, process.stderr):
             stream.close()
+
+
+def test_prune_removes_only_old_finished_launch_records(store, tmp_path):
+    """Every chat open scans all launch records; old finished ones are only bookkeeping."""
+    import uuid
+    from dataclasses import asdict
+
+    from devin_switch import sessions
+
+    now = time.time()
+    day = 24 * 3600
+    root = store.root
+    (root / "runs").mkdir(parents=True, exist_ok=True)
+
+    def launch(started, ended, pid=999999):
+        run = sessions.Run(
+            uuid.uuid4().hex, "ansuman-1", str(tmp_path), "chat", started, "c", ended
+        )
+        (root / "runs" / f"{run.id}.json").write_text(json.dumps(asdict(run)))
+        sessions.record_process(store, run.id, pid, role="native")
+        for name in (f"run-{run.id}.lock", f"acp-controller-{run.id}.lock"):
+            (root / name).touch()
+        (root / "acp/lifecycle").mkdir(parents=True, exist_ok=True)
+        (root / "acp/lifecycle" / f"{run.id}.json").write_text('"open"')
+        return run.id
+
+    old = launch(now - 9 * day, now - 8 * day)
+    crashed = launch(now - 9 * day, None)  # killed before it could record its end
+    recent = launch(now - 2 * day, now - day)
+    binding = root / "acp/sessions/c.json"
+    binding.parent.mkdir(parents=True)
+    binding.write_text('{"session_id": "c", "account": "ansuman-1"}')
+    with store.lock(f"run-{launch(now - 9 * day, None, os.getpid())}.lock"):
+        live = [run["id"] for run in sessions.runs(store) if run["active"]]
+        assert len(live) == 1
+        assert sessions.prune(store, now=now) == 2
+        remaining = {path.stem for path in (root / "runs").glob("*.json")}
+        assert remaining == {recent, *live} and old not in remaining and crashed not in remaining
+    for run_id in (old, crashed):
+        assert not (root / "runtime" / f"{run_id}.json").exists()
+        assert not (root / f"run-{run_id}.lock").exists()
+        assert not (root / f"acp-controller-{run_id}.lock").exists()
+        assert not (root / "acp/lifecycle" / f"{run_id}.json").exists()
+    assert (root / f"run-{recent}.lock").exists() and binding.exists()
+    # At most once a day, so it never repeats the scan on every window start.
+    launch(now - 9 * day, now - 8 * day)
+    assert sessions.prune(store, now=now + 3600) == 0
+    # A day later: the new old launch and the one that was running before, now finished.
+    assert sessions.prune(store, now=now + day + 1) == 2
 
 
 def test_distinct_saved_chats_can_resume_in_same_repository(signed_in, tmp_path, monkeypatch):

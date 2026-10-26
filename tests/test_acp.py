@@ -1022,6 +1022,73 @@ def replayed_texts(messages, kind):
     return [update["content"]["text"] for update in replayed(messages, kind)]
 
 
+def test_gui_mid_turn_prompt_reaches_the_native_during_the_turn(acp_native, tmp_path):
+    """The native advertises midTurnPrompts, so Desktop sends steering while a turn runs."""
+
+    async def scenario():
+        async with connect(acp_native) as client:
+            session_id = await client.new(tmp_path)
+            turn = asyncio.create_task(client.prompt(session_id, "busy"))
+            await wait_for_text(client, "live progress")
+            steer = await asyncio.wait_for(client.prompt(session_id, "steer now"), 5)
+            assert steer["result"]["stopReason"] == "end_turn"
+            assert not turn.done()
+            prompts = [call["text"] for call in logged(acp_native) if call["text"]]
+            assert prompts == ["busy", "steer now"]
+
+            start = len(client.messages)
+            params = {"sessionId": session_id, "cwd": str(tmp_path), "mcpServers": []}
+            await asyncio.wait_for(client.request("session/load", params), 5)
+            replay = client.messages[start:]
+            assert replayed_texts(replay, "user_message_chunk") == ["busy", "steer now"]
+
+            await client.send({"method": "session/cancel", "params": {"sessionId": session_id}})
+            assert (await turn)["result"]["stopReason"] == "cancelled"
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("text", ["/switch-status", "!ds switch", "/login"])
+def test_gui_mid_turn_local_command_waits_for_the_turn(acp_native, tmp_path, text):
+    async def scenario():
+        async with connect(acp_native) as client:
+            session_id = await client.new(tmp_path)
+            turn = asyncio.create_task(client.prompt(session_id, "busy"))
+            await wait_for_text(client, "live progress")
+            local = asyncio.create_task(client.prompt(session_id, text))
+            await asyncio.sleep(0.5)
+            assert not local.done()
+            await client.send({"method": "session/cancel", "params": {"sessionId": session_id}})
+            await turn
+            await asyncio.wait_for(local, 10)
+            assert text not in [call["text"] for call in logged(acp_native)]
+
+    asyncio.run(scenario())
+
+
+def test_gui_prompt_after_cancel_starts_a_new_turn(acp_native, tmp_path):
+    async def scenario():
+        async with connect(acp_native, auto_respond=False) as client:
+            session_id = await client.new(tmp_path)
+            turn = asyncio.create_task(client.prompt(session_id, "permission"))
+            request = await asyncio.wait_for(client.requests.get(), 5)
+            await client.send({"method": "session/cancel", "params": {"sessionId": session_id}})
+            follow_up = asyncio.create_task(client.prompt(session_id, "after cancel"))
+            await asyncio.sleep(0.5)
+            assert "after cancel" not in [call["text"] for call in logged(acp_native)]
+            await client.send(
+                {
+                    "id": request["id"],
+                    "result": {"outcome": {"outcome": "selected", "optionId": "reject"}},
+                }
+            )
+            await turn
+            assert "result" in await asyncio.wait_for(follow_up, 10)
+            assert "after cancel" in [call["text"] for call in logged(acp_native)]
+
+    asyncio.run(scenario())
+
+
 def test_gui_reload_mid_turn_replays_without_interrupting_the_turn(acp_native, tmp_path):
     """Switching Desktop surfaces reloads the open chat; a native load would end the turn."""
 

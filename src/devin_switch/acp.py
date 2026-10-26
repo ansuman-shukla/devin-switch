@@ -116,6 +116,12 @@ def prompt_command(params: dict) -> tuple[list, list[str], str]:
     return blocks, words, command
 
 
+def is_local_command(command: str) -> bool:
+    return command in LOCAL_NAMES or (
+        command.startswith("/") and command.lstrip("/") in BLOCKED_COMMANDS
+    )
+
+
 def continue_params(session_id: str) -> dict:
     return {"sessionId": session_id, "prompt": [{"type": "text", "text": handoff.CONTINUE_PROMPT}]}
 
@@ -687,7 +693,15 @@ class Bridge:
             else:
                 await chat.backend.send({"method": method, "params": params})
             return {}
-        if method in LIVE_CONTROLS and chat.controls is not None:
+        # The native advertises midTurnPrompts: steering joins the running turn, not a new one.
+        steering = (
+            method == "session/prompt"
+            and not chat.canceled
+            and not is_local_command(prompt_command(params)[2])
+        )
+        if (method in LIVE_CONTROLS or steering) and chat.controls is not None:
+            if steering:
+                chat.backend.record_prompt(params)
             task = self.spawn(self.forward_request(chat.backend, method, params))
             chat.controls.add(task)
             task.add_done_callback(chat.controls.discard)

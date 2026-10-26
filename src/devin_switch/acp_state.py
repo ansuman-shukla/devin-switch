@@ -326,7 +326,9 @@ class Lease:
                 sessions.record_process(self.store, self.run.id, os.getpid(), role="wrapper")
                 write_json(self.path, asdict(self.run))
             if verify_login:
-                native.require_login(account)
+                # GUI chats only need the saved file: the network check took 1-10 s per chat
+                # (30 s offline) and a dead login still fails visibly at the first message.
+                native.require_login(account, network=False)
         except BaseException:
             self.close(ended=True)
             raise

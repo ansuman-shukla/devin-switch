@@ -1021,6 +1021,33 @@ def replayed_texts(messages, kind):
     return [update["content"]["text"] for update in replayed(messages, kind)]
 
 
+@pytest.mark.parametrize("native_supports", [True, False])
+def test_gui_advertises_extra_folders_only_when_the_native_does(
+    acp_native, monkeypatch, native_supports
+):
+    """Desktop drops additionalDirectories from session/new unless the agent advertises them."""
+    if not native_supports:
+        monkeypatch.setenv("FAKE_NO_EXTRA_DIRS", "1")
+
+    async def scenario():
+        async def emit(message):
+            pass
+
+        bridge = acp.Bridge(acp_native, emit)
+        try:
+            result = await bridge.dispatch(
+                "initialize", {"protocolVersion": 1, "clientCapabilities": {}}
+            )
+        finally:
+            await bridge.close()
+        expected = {"list": {}, "resume": {}, "close": {}}
+        if native_supports:
+            expected["additionalDirectories"] = {}
+        assert result["agentCapabilities"]["sessionCapabilities"] == expected
+
+    asyncio.run(scenario())
+
+
 def test_gui_reload_mid_turn_replays_without_interrupting_the_turn(acp_native, tmp_path):
     """Switching Desktop surfaces reloads the open chat; a native load would end the turn."""
 

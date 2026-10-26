@@ -46,6 +46,7 @@ LOCAL_COMMANDS = [
 ]
 LOCAL_NAMES = {"/" + command["name"] for command in LOCAL_COMMANDS}
 AGENT_STOPPED = "_cognition.ai/agent_stopped"
+CANCEL_REQUEST = "$/cancel_request"
 RESOURCE_EXHAUSTED = -32011
 RESOURCE_NOT_FOUND = -32002
 AUTO_SWITCH_LIMIT = 3
@@ -150,6 +151,10 @@ def spare_fits(spare_folder: Path, project: Path) -> bool:
     return spare_folder == project or not (
         has_project_mcp(spare_folder) or has_project_mcp(project)
     )
+
+
+def cancel_request(identifier) -> dict:
+    return {"jsonrpc": "2.0", "method": CANCEL_REQUEST, "params": {"requestId": identifier}}
 
 
 def continue_params(session_id: str) -> dict:
@@ -523,7 +528,7 @@ class Backend:
             with suppress(asyncio.CancelledError):
                 await self.pump
         self.lease.close(ended=True)
-        self.bridge.drop_client_requests(self)
+        await self.bridge.drop_client_requests(self)
         self.close_pipes()
         await asyncio.to_thread(self.close_relay)
 
@@ -615,10 +620,13 @@ class Bridge:
             }
         )
 
-    def drop_client_requests(self, backend):
+    async def drop_client_requests(self, backend):
+        """A native that exited can't receive answers: clear its cards in Desktop too."""
         for identifier, (owner, _) in list(self.client_requests.items()):
             if owner is backend:
                 self.client_requests.pop(identifier)
+                with suppress(OSError):
+                    await self.emit(cancel_request(identifier))
 
     async def from_backend(self, backend, message):
         if "id" in message:
@@ -628,6 +636,14 @@ class Bridge:
             await self.emit({**message, "id": identifier})
             return
         params = message.get("params")
+        if message.get("method") == CANCEL_REQUEST:
+            # The native cancels with its own id; Desktop knows the card by the bridge's id.
+            original = params.get("requestId") if isinstance(params, dict) else None
+            for identifier, owner in list(self.client_requests.items()):
+                if owner == (backend, original):
+                    self.client_requests.pop(identifier)
+                    await self.emit(cancel_request(identifier))
+            return
         if (
             message.get("method") == AGENT_STOPPED
             and isinstance(params, dict)

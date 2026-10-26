@@ -68,6 +68,17 @@ PROJECT_MCP_FILES = (
     ".devin/mcp_config.local.json",
     ".cursor/mcp.json",
 )
+# Customize MCP changes go to the listing native; each chat native runs its own MCP servers, so
+# they repeat the change (None: follow the server's new enabled state after a toggle).
+MCP_FOLLOW = {
+    "_cognition.ai/mcp/installServer": "connectServer",
+    "_cognition.ai/mcp/connectServer": "connectServer",
+    "_cognition.ai/mcp/disconnectServer": "disconnectServer",
+    "_cognition.ai/mcp/removeServer": "disconnectServer",
+    "_cognition.ai/mcp/toggleServer": None,
+}
+# Window-wide notices every native sends; only the listing native's reach Desktop.
+WINDOW_NOTICES = {"_cognition.ai/mcp/serversChanged", "_cognition.ai/output"}
 # Editor state Desktop sends once (didOpen right after initialize): replay it to later natives.
 # The value says whether the state is kept per document/repository uri or only the latest.
 EDITOR_STATE = {
@@ -645,6 +656,12 @@ class Bridge:
                     await self.emit(cancel_request(identifier))
             return
         if (
+            message.get("method") in WINDOW_NOTICES
+            and backend.chat
+            and not (isinstance(params, dict) and params.get("sessionId"))
+        ):
+            return
+        if (
             message.get("method") == AGENT_STOPPED
             and isinstance(params, dict)
             and params.get("sessionId") == backend.session_id
@@ -765,7 +782,12 @@ class Bridge:
         if method in {"session/new", "session/load", "session/resume"}:
             return await self.open_session(method, params)
         if method.startswith("_") and "sessionId" not in params and not notification:
-            return await self.ask_lister(method, params)
+            result = await self.ask_lister(method, params)
+            if method in MCP_FOLLOW:
+                # Decided now: a later toggle must not change what this one repeats.
+                action = MCP_FOLLOW[method] or await self.toggled_action(params)
+                self.spawn(self.follow_mcp(action, params))
+            return result
         if method.startswith(EDITOR_CONTEXT) and "sessionId" not in params and notification:
             # Desktop's editor and terminal context belongs to the window, so every native gets it.
             self.remember_editor(method, params)
@@ -925,6 +947,42 @@ class Bridge:
             # Re-inserting keeps the replay in the order Desktop last sent each piece.
             self.editor_state.pop(key, None)
             self.editor_state[key] = (method, params)
+
+    async def toggled_action(self, params):
+        scope = {key: params[key] for key in ("workspaceDirs",) if key in params}
+        try:
+            listed = await self.ask_lister("_cognition.ai/mcp/listServers", scope)
+        except (SwitchError, OSError):
+            return "disconnectServer"
+        state = next(
+            (
+                item
+                for item in listed.get("servers", [])
+                if item.get("serverId") == params.get("serverId")
+                and item.get("sourcePath") == params.get("sourcePath")
+            ),
+            None,
+        )
+        return "connectServer" if state and not state.get("disabled") else "disconnectServer"
+
+    async def follow_mcp(self, action, params):
+        """Repeat a Customize MCP change in the chat natives, best effort."""
+        scope = {key: params[key] for key in ("workspaceDirs",) if key in params}
+        follow = {"serverId": params.get("serverId"), **scope}
+        if action == "disconnectServer" and "sourcePath" in params:
+            follow["sourcePath"] = params["sourcePath"]
+        targets = [
+            backend
+            for backend in list(self.backends)
+            if backend.chat and backend.editor_ready and not backend.stopping
+        ]
+        await asyncio.gather(
+            *(
+                backend.request(f"_cognition.ai/mcp/{action}", follow, LIFECYCLE_TIMEOUT)
+                for backend in targets
+            ),
+            return_exceptions=True,
+        )
 
     async def list_sessions(self, params):
         """Let the native list shared history: Desktop needs its filters, paging and _meta."""

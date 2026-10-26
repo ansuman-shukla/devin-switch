@@ -1309,7 +1309,7 @@ def test_gui_startup_and_listing_skip_the_login_check(acp_native, tmp_path, monk
     """A window reload waits for initialize; the login check can take 10 s on a slow network."""
     checked = []
 
-    def require_login(self, account):
+    def require_login(self, account, **options):
         checked.append(account.name)
         raise SwitchError(f"No saved login for {account.name!r}. Run: ds login {account.name}")
 
@@ -1326,6 +1326,38 @@ def test_gui_startup_and_listing_skip_the_login_check(acp_native, tmp_path, monk
             with pytest.raises(SwitchError, match="No saved login"):
                 await bridge.dispatch("session/new", {"cwd": str(tmp_path), "mcpServers": []})
         assert checked and set(checked) == {"ansuman-1"}
+
+    asyncio.run(scenario())
+
+
+def test_gui_chats_check_the_saved_login_without_the_network(acp_native, tmp_path, monkeypatch):
+    """`devin auth status` took 1-10 s per chat (30 s offline); the built-in agent never runs it."""
+    capture = Native.capture
+    checked = []
+
+    def offline(self, account, arguments, **options):
+        if arguments == ("auth", "status"):
+            checked.append(account.name)
+            raise SwitchError("network unreachable")
+        return capture(self, account, arguments, **options)
+
+    monkeypatch.setattr(Native, "capture", offline)
+
+    async def scenario():
+        async with in_process(acp_native) as (bridge, _):
+            created = await bridge.dispatch("session/new", {"cwd": str(tmp_path), "mcpServers": []})
+            assert created["sessionId"] in bridge.chats
+            acp_native.store.credentials(acp_native.store.account("ansuman-2")).unlink()
+            acp_state.bind(
+                acp_native.store, created["sessionId"], acp_native.store.account("ansuman-2")
+            )
+            await bridge.dispatch("session/close", {"sessionId": created["sessionId"]})
+            with pytest.raises(SwitchError, match="No saved login for 'ansuman-2'"):
+                await bridge.dispatch(
+                    "session/load",
+                    {"sessionId": created["sessionId"], "cwd": str(tmp_path), "mcpServers": []},
+                )
+        assert checked == []
 
     asyncio.run(scenario())
 

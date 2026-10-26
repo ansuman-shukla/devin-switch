@@ -804,7 +804,9 @@ def test_gui_chats_open_on_a_warm_logged_in_agent(acp_native, tmp_path):
     asyncio.run(scenario())
 
 
-def test_gui_warm_agent_rechecks_a_saved_chat_before_loading_it(acp_native, tmp_path):
+def test_gui_warm_agent_loads_a_saved_chat_from_another_folder(acp_native, tmp_path):
+    """Like the native, which keeps the saved project and serves any cwd."""
+
     async def scenario():
         async with in_process(acp_native) as (bridge, _):
             created = await bridge.dispatch("session/new", {"cwd": str(tmp_path), "mcpServers": []})
@@ -813,13 +815,88 @@ def test_gui_warm_agent_rechecks_a_saved_chat_before_loading_it(acp_native, tmp_
             spare = await warm(bridge)
             other = tmp_path / "other"
             other.mkdir()
-            with pytest.raises(SwitchError, match="original project"):
+            await bridge.dispatch(
+                "session/load", {"sessionId": session_id, "cwd": str(other), "mcpServers": []}
+            )
+            assert bridge.chats[session_id].backend is spare
+            assert bridge.chats[session_id].setup["cwd"] == str(other.resolve())
+            (load,) = [call for call in logged(acp_native) if call["method"] == "session/load"]
+            assert load["sessionId"] == session_id
+            assert spare.lease.run.project == str(other.resolve())
+
+    asyncio.run(scenario())
+
+
+def test_gui_warm_agent_still_refuses_a_chat_missing_from_history(acp_native, tmp_path):
+    async def scenario():
+        async with in_process(acp_native) as (bridge, _):
+            spare = await warm(bridge)
+            with pytest.raises(SwitchError, match="no longer in shared history"):
                 await bridge.dispatch(
-                    "session/load", {"sessionId": session_id, "cwd": str(other), "mcpServers": []}
+                    "session/load",
+                    {"sessionId": "never-saved", "cwd": str(tmp_path), "mcpServers": []},
                 )
             assert spare.process.poll() is not None
-            assert session_id not in bridge.chats
             assert not any(call["method"] == "session/load" for call in logged(acp_native))
+
+    asyncio.run(scenario())
+
+
+def test_gui_opens_chats_whose_project_folder_is_gone(acp_native, tmp_path):
+    async def scenario():
+        gone = tmp_path / "deleted-worktree"
+        gone.mkdir()
+        async with in_process(acp_native) as (bridge, _):
+            store = acp_native.store
+            params = {"cwd": str(gone), "mcpServers": []}
+            session_id = (await bridge.dispatch("session/new", params))["sessionId"]
+            cold = (await bridge.dispatch("session/new", params))["sessionId"]
+            for chat in (session_id, cold):
+                await bridge.dispatch("session/close", {"sessionId": chat})
+            gone.rmdir()
+            # Another login's chat starts its own agent instead of the warm spare.
+            acp_state.bind(store, cold, store.account("ansuman-2"))
+            for chat in (session_id, cold):
+                await bridge.dispatch("session/load", {**params, "sessionId": chat})
+                assert bridge.chats[chat].backend.process.poll() is None
+            assert bridge.chats[cold].backend.account.name == "ansuman-2"
+            assert acp_state.check_saved(store, session_id)["id"] == session_id
+            acp_state.check_handoff(
+                store, session_id, bridge.chats[session_id].backend.lease.run.id
+            )
+            created = await bridge.dispatch(
+                "session/new",
+                {**params, "_meta": {"cognition.ai/worktreeFor": str(tmp_path)}},
+            )
+            assert bridge.chats[created["sessionId"]].setup["cwd"] == str(gone)
+
+    asyncio.run(scenario())
+
+
+def test_gui_reopens_an_open_chat_from_another_folder(acp_native, tmp_path):
+    async def scenario():
+        async with in_process(acp_native) as (bridge, _):
+            session_id = (
+                await bridge.dispatch("session/new", {"cwd": str(tmp_path), "mcpServers": []})
+            )["sessionId"]
+            backend = bridge.chats[session_id].backend
+            other = tmp_path / "other"
+            other.mkdir()
+            await bridge.dispatch(
+                "session/load", {"sessionId": session_id, "cwd": str(other), "mcpServers": []}
+            )
+            assert bridge.chats[session_id].backend is backend
+            assert bridge.chats[session_id].setup["cwd"] == str(other.resolve())
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("cwd", ["relative/project", None])
+def test_gui_still_requires_an_absolute_project_path(acp_native, cwd):
+    async def scenario():
+        async with in_process(acp_native) as (bridge, _):
+            with pytest.raises(SwitchError, match="absolute project"):
+                await bridge.dispatch("session/new", {"cwd": cwd, "mcpServers": []})
 
     asyncio.run(scenario())
 

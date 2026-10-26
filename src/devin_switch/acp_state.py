@@ -47,7 +47,7 @@ def saved_chat(store: Store, session_id: str) -> dict | None:
     return next((chat for chat in sessions.history(store) if chat["id"] == session_id), None)
 
 
-def check_handoff(store: Store, session_id: str, project: str, run_id: str) -> None:
+def check_handoff(store: Store, session_id: str, run_id: str) -> None:
     with store.lock(timeout=5):
         saved = saved_chat(store, session_id)
         if saved is None:
@@ -57,8 +57,6 @@ def check_handoff(store: Store, session_id: str, project: str, run_id: str) -> N
                 "first, then retry /switch. To choose an account before starting a chat, "
                 "run ds use ALIAS in Terminal and open a new GUI chat."
             )
-        if saved["project"] != project or not Path(project).is_dir():
-            raise SwitchError("Switch canceled: the saved project does not match this chat.")
         others = [run for run in sessions.runs(store) if run["id"] != run_id]
         if blocker := sessions.resume_blocker(saved, others):
             raise SwitchError(blocker)
@@ -92,9 +90,9 @@ def set_lifecycle(store: Store, run_id: str, state: str) -> None:
     write_json(path, state)
 
 
-def check_saved(store: Store, session_id: str, project: str) -> dict:
+def check_saved(store: Store, session_id: str) -> dict:
     saved = saved_chat(store, session_id)
-    if saved is None or saved["project"] != project or not Path(project).is_dir():
+    if saved is None:
         raise SwitchError(
             "Close canceled: this chat is not available in shared history. "
             "Its connection is unchanged. Send a normal message first and retry."
@@ -114,7 +112,7 @@ def queue_close(store: Store, run_id: str) -> str:
             raise SwitchError("A GUI switch is pending. Cancel it before closing this connection.")
         if lifecycle(store, run_id) != "open":
             raise SwitchError("This GUI connection is already closing.")
-        check_saved(store, run["session_id"], run["project"])
+        check_saved(store, run["session_id"])
         set_lifecycle(store, run_id, "close_requested")
     return (
         "Close requested for this GUI connection when idle. Saved history is kept; "
@@ -301,9 +299,7 @@ class Lease:
             with self.store.lock(timeout=5):
                 self.store.account(account.name)
                 if session_id:
-                    saved = sessions.resumable(self.store, session_id)
-                    if saved["project"] != str(project):
-                        raise SwitchError("Resume this conversation from its original project.")
+                    sessions.available(self.store, session_id)
                 account_fd = self.stack.enter_context(self.store.account_lock(account, shared=True))
                 run_fd = self.stack.enter_context(self.store.lock(f"run-{self.run.id}.lock"))
                 self.stack.enter_context(self.store.lock(f"acp-controller-{self.run.id}.lock"))
@@ -325,9 +321,7 @@ class Lease:
         session_key(session_id)
         with self.store.lock(timeout=5):
             if saved:
-                chat = sessions.resumable(self.store, session_id)
-                if project is not None and chat["project"] != str(project):
-                    raise SwitchError("Resume this conversation from its original project.")
+                sessions.available(self.store, session_id)
             others = [run for run in sessions.runs(self.store) if run["id"] != self.run.id]
             if blocker := sessions.resume_blocker({"id": session_id}, others):
                 raise SwitchError(blocker)

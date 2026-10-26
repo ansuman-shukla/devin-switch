@@ -698,6 +698,7 @@ class Bridge:
             }
             self.ready = True
             self.spawn(self.refill())
+            self.spawn(self.prune_runs())
             return result
         if not self.ready:
             raise RpcError("Initialize the GUI bridge first.", -32600)
@@ -916,6 +917,11 @@ class Bridge:
             pass
         finally:
             self.filling = False
+
+    async def prune_runs(self):
+        """Old launch records slow every chat open; clear them in the background."""
+        with suppress(OSError, SwitchError):
+            await asyncio.to_thread(sessions.prune, self.native.store)
 
     async def drop_spare(self):
         spare, self.spare = self.spare, None

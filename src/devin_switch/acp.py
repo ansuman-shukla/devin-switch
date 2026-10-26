@@ -57,6 +57,7 @@ LIVE_CONTROLS = {
     "session/set_mode",
     "session/set_model",
     "_cognition.ai/command/revise",
+    "_cognition.ai/subagent/cancel",
 }
 OPENING = {"session/new", "session/load"}
 # Editor state Desktop sends once (didOpen right after initialize): replay it to later natives.
@@ -107,6 +108,26 @@ def quota_exhausted(error: RpcError) -> bool:
         error.code == RESOURCE_EXHAUSTED
         and data.get("cognition.ai/errorKind") == "resource_exhausted"
         and data.get("cognition.ai/retryAfterSeconds") is None
+    )
+
+
+def prompt_command(params: dict) -> tuple[list, list[str], str]:
+    blocks = params.get("prompt", [])
+    text = next(
+        (block.get("text", "") for block in blocks if block.get("type") == "text"), ""
+    ).strip()
+    words = text.split()
+    command = words[0] if words else ""
+    if command == "!ds" and words[1:2] == ["switch"]:
+        options = words[2:]
+        command = "/switch-continue" if "--continue" in options else "/switch"
+        words = [command, *(word for word in options if word != "--continue")]
+    return blocks, words, command
+
+
+def is_local_command(command: str) -> bool:
+    return command in LOCAL_NAMES or (
+        command.startswith("/") and command.lstrip("/") in BLOCKED_COMMANDS
     )
 
 
@@ -234,7 +255,8 @@ class Backend:
             self.process = subprocess.Popen(
                 (str(self.bridge.native.binary), *self.bridge.flags, "acp"),
                 env=environment,
-                cwd=self.project,
+                # The native serves the session's cwd from any folder, even a deleted one.
+                cwd=self.project if self.project.is_dir() else Path.home(),
                 pass_fds=self.lease.fds,
                 stdin=subprocess.PIPE,
                 stdout=subprocess.PIPE,
@@ -660,10 +682,17 @@ class Bridge:
                 "title": "Devin Switch",
                 "version": "0.3.0",
             }
+            native_sessions = result["agentCapabilities"].get("sessionCapabilities", {})
+            # Desktop then sends a chat's extra workspace folders, which load/new forward as-is.
             result["agentCapabilities"]["sessionCapabilities"] = {
                 "list": {},
                 "resume": {},
                 "close": {},
+                **{
+                    key: native_sessions[key]
+                    for key in ("additionalDirectories",)
+                    if key in native_sessions
+                },
             }
             self.ready = True
             self.spawn(self.refill())
@@ -708,7 +737,15 @@ class Bridge:
             else:
                 await chat.backend.send({"method": method, "params": params})
             return {}
-        if method in LIVE_CONTROLS and chat.controls is not None:
+        # The native advertises midTurnPrompts: steering joins the running turn, not a new one.
+        steering = (
+            method == "session/prompt"
+            and not chat.canceled
+            and not is_local_command(prompt_command(params)[2])
+        )
+        if (method in LIVE_CONTROLS or steering) and chat.controls is not None:
+            if steering:
+                chat.backend.record_prompt(params)
             task = self.spawn(self.forward_request(chat.backend, method, params))
             chat.controls.add(task)
             task.add_done_callback(chat.controls.discard)
@@ -996,8 +1033,8 @@ class Bridge:
 
     async def open_once(self, method, params):
         cwd = params.get("cwd")
-        if not isinstance(cwd, str) or not Path(cwd).is_absolute() or not Path(cwd).is_dir():
-            raise RpcError("Choose an existing absolute project directory.", -32602)
+        if not isinstance(cwd, str) or not Path(cwd).is_absolute():
+            raise RpcError("Choose an absolute project directory.", -32602)
         project = Path(cwd).resolve()
         setup = copy.deepcopy(params)
         setup["cwd"] = str(project)
@@ -1006,8 +1043,6 @@ class Bridge:
             acp_state.session_key(session_id)
             if session_id in self.chats:
                 chat = self.chats[session_id]
-                if chat.setup["cwd"] != str(project):
-                    raise SwitchError("Resume this conversation from its original project.")
                 if chat.controls is not None:
                     return await self.replay(chat, method)
                 async with chat.access():
@@ -1084,12 +1119,7 @@ class Bridge:
             return backend.reopened()
 
     async def local_prompt(self, chat, params):
-        blocks = params.get("prompt", [])
-        text = next(
-            (block.get("text", "") for block in blocks if block.get("type") == "text"), ""
-        ).strip()
-        words = text.split()
-        command = words[0] if words else ""
+        blocks, words, command = prompt_command(params)
         done = {"stopReason": "end_turn"}
         if command.lstrip("/") in BLOCKED_COMMANDS and command.startswith("/"):
             await self.note(
@@ -1098,10 +1128,6 @@ class Bridge:
                 "Use /switch to change this chat's account.",
             )
             return done
-        if command == "!ds" and words[1:2] == ["switch"]:
-            options = words[2:]
-            command = "/switch-continue" if "--continue" in options else "/switch"
-            words = [command, *(word for word in options if word != "--continue")]
         if command not in LOCAL_NAMES:
             return None
         limit = 2 if command in {"/switch", "/switch-continue", "/auto-switch"} else 1
@@ -1344,9 +1370,7 @@ class Bridge:
                 "This GUI connection is closed. Reopen the chat if it appears in shared "
                 "history, or start a new one. No account was changed."
             )
-        await asyncio.to_thread(
-            acp_state.check_handoff, store, chat.session_id, chat.setup["cwd"], old.lease.run.id
-        )
+        await asyncio.to_thread(acp_state.check_handoff, store, chat.session_id, old.lease.run.id)
         if account_name:
             account = store.account(account_name)
         else:
@@ -1358,9 +1382,7 @@ class Bridge:
         if account.name in (source.name, old.account.name):
             raise SwitchError("This GUI chat already uses that account.")
         await asyncio.to_thread(acp_state.check_login, self.native, account)
-        await asyncio.to_thread(
-            acp_state.check_handoff, store, chat.session_id, chat.setup["cwd"], old.lease.run.id
-        )
+        await asyncio.to_thread(acp_state.check_handoff, store, chat.session_id, old.lease.run.id)
         settings, mode, model = copy.deepcopy(old.configs), old.mode, old.model
         with store.lock(timeout=5):
             acp_state.check_switchable(store, old.lease.run.id)
@@ -1499,7 +1521,7 @@ class Bridge:
                     if chat.blank and (manual or acp_state.saved_chat(store, chat.session_id)):
                         chat.blank = False
                     if not chat.blank:
-                        saved = acp_state.check_saved(store, chat.session_id, chat.setup["cwd"])
+                        saved = acp_state.check_saved(store, chat.session_id)
                         others = [run for run in sessions.runs(store) if run["id"] != run_id]
                         if blocker := sessions.resume_blocker(saved, others):
                             raise SwitchError(blocker)

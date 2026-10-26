@@ -416,6 +416,7 @@ def test_gui_delayed_decisions_reach_only_the_requesting_chat(acp_native, tmp_pa
         ("session/set_mode", {"modeId": "code"}),
         ("session/set_model", {"modelId": "other-model"}),
         ("_cognition.ai/command/revise", {"command": "printf test", "note": "Use safe flags"}),
+        ("_cognition.ai/subagent/cancel", {"agentId": "s1"}),
     ],
 )
 def test_gui_controls_respond_while_tool_approval_is_pending(acp_native, tmp_path, method, params):
@@ -803,7 +804,9 @@ def test_gui_chats_open_on_a_warm_logged_in_agent(acp_native, tmp_path):
     asyncio.run(scenario())
 
 
-def test_gui_warm_agent_rechecks_a_saved_chat_before_loading_it(acp_native, tmp_path):
+def test_gui_warm_agent_loads_a_saved_chat_from_another_folder(acp_native, tmp_path):
+    """Like the native, which keeps the saved project and serves any cwd."""
+
     async def scenario():
         async with in_process(acp_native) as (bridge, _):
             created = await bridge.dispatch("session/new", {"cwd": str(tmp_path), "mcpServers": []})
@@ -812,13 +815,88 @@ def test_gui_warm_agent_rechecks_a_saved_chat_before_loading_it(acp_native, tmp_
             spare = await warm(bridge)
             other = tmp_path / "other"
             other.mkdir()
-            with pytest.raises(SwitchError, match="original project"):
+            await bridge.dispatch(
+                "session/load", {"sessionId": session_id, "cwd": str(other), "mcpServers": []}
+            )
+            assert bridge.chats[session_id].backend is spare
+            assert bridge.chats[session_id].setup["cwd"] == str(other.resolve())
+            (load,) = [call for call in logged(acp_native) if call["method"] == "session/load"]
+            assert load["sessionId"] == session_id
+            assert spare.lease.run.project == str(other.resolve())
+
+    asyncio.run(scenario())
+
+
+def test_gui_warm_agent_still_refuses_a_chat_missing_from_history(acp_native, tmp_path):
+    async def scenario():
+        async with in_process(acp_native) as (bridge, _):
+            spare = await warm(bridge)
+            with pytest.raises(SwitchError, match="no longer in shared history"):
                 await bridge.dispatch(
-                    "session/load", {"sessionId": session_id, "cwd": str(other), "mcpServers": []}
+                    "session/load",
+                    {"sessionId": "never-saved", "cwd": str(tmp_path), "mcpServers": []},
                 )
             assert spare.process.poll() is not None
-            assert session_id not in bridge.chats
             assert not any(call["method"] == "session/load" for call in logged(acp_native))
+
+    asyncio.run(scenario())
+
+
+def test_gui_opens_chats_whose_project_folder_is_gone(acp_native, tmp_path):
+    async def scenario():
+        gone = tmp_path / "deleted-worktree"
+        gone.mkdir()
+        async with in_process(acp_native) as (bridge, _):
+            store = acp_native.store
+            params = {"cwd": str(gone), "mcpServers": []}
+            session_id = (await bridge.dispatch("session/new", params))["sessionId"]
+            cold = (await bridge.dispatch("session/new", params))["sessionId"]
+            for chat in (session_id, cold):
+                await bridge.dispatch("session/close", {"sessionId": chat})
+            gone.rmdir()
+            # Another login's chat starts its own agent instead of the warm spare.
+            acp_state.bind(store, cold, store.account("ansuman-2"))
+            for chat in (session_id, cold):
+                await bridge.dispatch("session/load", {**params, "sessionId": chat})
+                assert bridge.chats[chat].backend.process.poll() is None
+            assert bridge.chats[cold].backend.account.name == "ansuman-2"
+            assert acp_state.check_saved(store, session_id)["id"] == session_id
+            acp_state.check_handoff(
+                store, session_id, bridge.chats[session_id].backend.lease.run.id
+            )
+            created = await bridge.dispatch(
+                "session/new",
+                {**params, "_meta": {"cognition.ai/worktreeFor": str(tmp_path)}},
+            )
+            assert bridge.chats[created["sessionId"]].setup["cwd"] == str(gone)
+
+    asyncio.run(scenario())
+
+
+def test_gui_reopens_an_open_chat_from_another_folder(acp_native, tmp_path):
+    async def scenario():
+        async with in_process(acp_native) as (bridge, _):
+            session_id = (
+                await bridge.dispatch("session/new", {"cwd": str(tmp_path), "mcpServers": []})
+            )["sessionId"]
+            backend = bridge.chats[session_id].backend
+            other = tmp_path / "other"
+            other.mkdir()
+            await bridge.dispatch(
+                "session/load", {"sessionId": session_id, "cwd": str(other), "mcpServers": []}
+            )
+            assert bridge.chats[session_id].backend is backend
+            assert bridge.chats[session_id].setup["cwd"] == str(other.resolve())
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("cwd", ["relative/project", None])
+def test_gui_still_requires_an_absolute_project_path(acp_native, cwd):
+    async def scenario():
+        async with in_process(acp_native) as (bridge, _):
+            with pytest.raises(SwitchError, match="absolute project"):
+                await bridge.dispatch("session/new", {"cwd": cwd, "mcpServers": []})
 
     asyncio.run(scenario())
 
@@ -1066,6 +1144,33 @@ def test_gui_editor_and_terminal_context_reach_every_open_chat(acp_native, tmp_p
     asyncio.run(scenario())
 
 
+@pytest.mark.parametrize("native_supports", [True, False])
+def test_gui_advertises_extra_folders_only_when_the_native_does(
+    acp_native, monkeypatch, native_supports
+):
+    """Desktop drops additionalDirectories from session/new unless the agent advertises them."""
+    if not native_supports:
+        monkeypatch.setenv("FAKE_NO_EXTRA_DIRS", "1")
+
+    async def scenario():
+        async def emit(message):
+            pass
+
+        bridge = acp.Bridge(acp_native, emit)
+        try:
+            result = await bridge.dispatch(
+                "initialize", {"protocolVersion": 1, "clientCapabilities": {}}
+            )
+        finally:
+            await bridge.close()
+        expected = {"list": {}, "resume": {}, "close": {}}
+        if native_supports:
+            expected["additionalDirectories"] = {}
+        assert result["agentCapabilities"]["sessionCapabilities"] == expected
+
+    asyncio.run(scenario())
+
+
 def test_gui_new_chat_native_gets_the_current_editor_state(acp_native, tmp_path):
     async def scenario():
         async with in_process(acp_native) as (bridge, _):
@@ -1100,6 +1205,73 @@ def test_gui_new_chat_native_gets_the_current_editor_state(acp_native, tmp_path)
             first = [call["method"] for call in logged(acp_native) if call["pid"] == pid]
             assert first.index("initialize") < first.index(DOCUMENT + "didOpen")
             assert first.index(DOCUMENT + "didOpen") < first.index("session/new")
+
+    asyncio.run(scenario())
+
+
+def test_gui_mid_turn_prompt_reaches_the_native_during_the_turn(acp_native, tmp_path):
+    """The native advertises midTurnPrompts, so Desktop sends steering while a turn runs."""
+
+    async def scenario():
+        async with connect(acp_native) as client:
+            session_id = await client.new(tmp_path)
+            turn = asyncio.create_task(client.prompt(session_id, "busy"))
+            await wait_for_text(client, "live progress")
+            steer = await asyncio.wait_for(client.prompt(session_id, "steer now"), 5)
+            assert steer["result"]["stopReason"] == "end_turn"
+            assert not turn.done()
+            prompts = [call["text"] for call in logged(acp_native) if call["text"]]
+            assert prompts == ["busy", "steer now"]
+
+            start = len(client.messages)
+            params = {"sessionId": session_id, "cwd": str(tmp_path), "mcpServers": []}
+            await asyncio.wait_for(client.request("session/load", params), 5)
+            replay = client.messages[start:]
+            assert replayed_texts(replay, "user_message_chunk") == ["busy", "steer now"]
+
+            await client.send({"method": "session/cancel", "params": {"sessionId": session_id}})
+            assert (await turn)["result"]["stopReason"] == "cancelled"
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("text", ["/switch-status", "!ds switch", "/login"])
+def test_gui_mid_turn_local_command_waits_for_the_turn(acp_native, tmp_path, text):
+    async def scenario():
+        async with connect(acp_native) as client:
+            session_id = await client.new(tmp_path)
+            turn = asyncio.create_task(client.prompt(session_id, "busy"))
+            await wait_for_text(client, "live progress")
+            local = asyncio.create_task(client.prompt(session_id, text))
+            await asyncio.sleep(0.5)
+            assert not local.done()
+            await client.send({"method": "session/cancel", "params": {"sessionId": session_id}})
+            await turn
+            await asyncio.wait_for(local, 10)
+            assert text not in [call["text"] for call in logged(acp_native)]
+
+    asyncio.run(scenario())
+
+
+def test_gui_prompt_after_cancel_starts_a_new_turn(acp_native, tmp_path):
+    async def scenario():
+        async with connect(acp_native, auto_respond=False) as client:
+            session_id = await client.new(tmp_path)
+            turn = asyncio.create_task(client.prompt(session_id, "permission"))
+            request = await asyncio.wait_for(client.requests.get(), 5)
+            await client.send({"method": "session/cancel", "params": {"sessionId": session_id}})
+            follow_up = asyncio.create_task(client.prompt(session_id, "after cancel"))
+            await asyncio.sleep(0.5)
+            assert "after cancel" not in [call["text"] for call in logged(acp_native)]
+            await client.send(
+                {
+                    "id": request["id"],
+                    "result": {"outcome": {"outcome": "selected", "optionId": "reject"}},
+                }
+            )
+            await turn
+            assert "result" in await asyncio.wait_for(follow_up, 10)
+            assert "after cancel" in [call["text"] for call in logged(acp_native)]
 
     asyncio.run(scenario())
 

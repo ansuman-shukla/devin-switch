@@ -24,7 +24,6 @@ It never purchases anything and stops at the first unexpected page.
 import argparse
 import asyncio
 import fcntl
-import json
 import os
 import pty
 import re
@@ -129,11 +128,14 @@ def redact(text: str) -> str:
     return LONG_VALUE.sub("<redacted>", text)
 
 
-def chrome_profiles() -> dict:
+def has_profile(directory: str) -> bool:
+    from devin_switch import browser
+    from devin_switch.store import SwitchError
+
     try:
-        return json.loads((CHROME_DATA / "Local State").read_text())["profile"]["info_cache"]
-    except (FileNotFoundError, KeyError, json.JSONDecodeError):
-        return {}
+        return browser.has_profile(directory)
+    except SwitchError:  # Chrome has not written a readable profile index yet.
+        return False
 
 
 def store():
@@ -153,7 +155,7 @@ def ensure_accounts(plan: list[Target], ds: str) -> None:
                 f"not {target.profile!r}. Choose another --first-alias."
             )
     for target in plan:
-        if target.profile not in chrome_profiles():
+        if not has_profile(target.profile):
             subprocess.run(
                 (
                     "/usr/bin/open",
@@ -167,7 +169,7 @@ def ensure_accounts(plan: list[Target], ds: str) -> None:
             )
             time.sleep(2)
     deadline = time.time() + 90
-    while missing := [t.profile for t in plan if t.profile not in chrome_profiles()]:
+    while missing := [t.profile for t in plan if not has_profile(t.profile)]:
         if time.time() > deadline:
             raise EnrollError(f"Chrome did not register profiles: {', '.join(missing)}")
         time.sleep(3)
@@ -267,7 +269,11 @@ class Enroller:
         self.used_codes: set[str] = set()
 
     async def connect(self, playwright) -> None:
-        port, path = (CHROME_DATA / "DevToolsActivePort").read_text().split()
+        from devin_switch import chrome_access
+
+        port, path = chrome_access.read_text(
+            CHROME_DATA, "DevToolsActivePort", "Connect the enroll script to Chrome to read Gmail"
+        ).split()
         print("Connecting to Chrome. Approve the remote debugging prompt if it appears.")
         self.browser = await playwright.chromium.connect_over_cdp(
             f"ws://127.0.0.1:{port}{path}", timeout=300_000

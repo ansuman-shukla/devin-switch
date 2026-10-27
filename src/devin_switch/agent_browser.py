@@ -21,7 +21,7 @@ import time
 import urllib.request
 from pathlib import Path
 
-from devin_switch import browser, handoff
+from devin_switch import browser, chrome_access, handoff
 from devin_switch.executable import command_prefix
 from devin_switch.native import user_config_home
 from devin_switch.store import (
@@ -59,8 +59,8 @@ INSTRUCTIONS = (
     "idling the browser closes by itself and the next tool call reopens it with fresh pages."
 )
 COPY_HINT = (
-    "Profiles copied earlier keep working; copy another with `ds browser refresh PROFILE` from "
-    "an app that has Full Disk Access."
+    "Profiles copied earlier keep working; naming another profile, or refresh, asks the user "
+    "with a popup."
 )
 NEEDS_PROFILE = (
     "No browser profile is selected and no default is set. Call browser_profile with the "
@@ -158,9 +158,8 @@ def profiles(store: Store) -> tuple[tuple[browser.ChromeProfile, ...], bool]:
         return copied(store), True
 
 
-def resolve(store: Store, query: str) -> browser.ChromeProfile:
+def match(items: tuple[browser.ChromeProfile, ...], query: str) -> browser.ChromeProfile | None:
     wanted = query.strip().casefold()
-    items, blocked = profiles(store)
     for key in (
         lambda item: item.directory.casefold(),
         lambda item: slug(item.directory),
@@ -173,11 +172,18 @@ def resolve(store: Store, query: str) -> browser.ChromeProfile:
         if matches:
             choices = ", ".join(label(item) for item in matches)
             raise SwitchError(f"{query!r} matches several Chrome profiles: {choices}. Pick one.")
-    if blocked:
-        raise browser.ChromeBlocked(
-            f"{query!r} is not a copied Chrome profile. {browser.BLOCKED} {COPY_HINT}"
-        )
-    raise SwitchError(f"No Chrome profile matches {query!r}. List them with: ds browser status")
+    return None
+
+
+def resolve(store: Store, query: str) -> browser.ChromeProfile:
+    """A profile by directory, slug, email or name; asks with a popup only for an uncopied one."""
+    items, blocked = profiles(store)
+    found = match(items, query)
+    if found is None and blocked:
+        found = match(browser.profiles(reason=f"Find the Chrome profile {query.strip()!r}"), query)
+    if found is None:
+        raise SwitchError(f"No Chrome profile matches {query!r}. List them with: ds browser status")
+    return found
 
 
 def settings(store: Store) -> dict:
@@ -204,32 +210,25 @@ def default_profile(store: Store) -> browser.ChromeProfile | None:
 
 
 def clone(store: Store, profile: browser.ChromeProfile) -> None:
-    source = browser.CHROME_DATA / profile.directory
-    try:
-        os.listdir(source)
-    except (FileNotFoundError, NotADirectoryError) as exc:
-        raise SwitchError(f"Chrome's folder for {profile.directory!r} is missing.") from exc
-    except PermissionError as exc:
-        raise browser.ChromeBlocked(
-            f"Cannot copy logins from {label(profile)}. {browser.BLOCKED}"
-        ) from exc
+    if not (browser.CHROME_DATA / profile.directory).is_dir():
+        raise SwitchError(f"Chrome's folder for {profile.directory!r} is missing.")
     folder = private_folder(store, profile.directory)
     staging = folder / "user-data.partial"
     shutil.rmtree(staging, ignore_errors=True)
     private_directory(staging)
     private_directory(staging / "Default")
-    for name in CLONED:
-        item, target = source / name, staging / "Default" / name
-        if item.is_dir():
-            try:
-                shutil.copytree(item, target, symlinks=True)
-            except shutil.Error:
-                pass  # Chrome may rewrite storage while it is copied; keep what was readable.
-        elif item.is_file():
-            shutil.copy2(item, target)
-    data = folder / "user-data"
-    shutil.rmtree(data, ignore_errors=True)
-    staging.rename(data)
+    try:
+        chrome_access.copy(
+            browser.CHROME_DATA,
+            [f"{profile.directory}/{name}" for name in CLONED],
+            staging / "Default",
+            f"Copy the logins of {label(profile)} into the agent browser",
+        )
+        data = folder / "user-data"
+        shutil.rmtree(data, ignore_errors=True)
+        staging.rename(data)
+    finally:
+        shutil.rmtree(staging, ignore_errors=True)
     write_json(
         folder / "source.json",
         {

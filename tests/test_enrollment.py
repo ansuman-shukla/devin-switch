@@ -54,7 +54,7 @@ def test_rename_rejects_collisions_and_invalid_paths(store: Store) -> None:
 def test_import_action_respects_active_cli_lock(
     store: Store, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    monkeypatch.setattr(browser, "profiles", lambda: ())
+    monkeypatch.setattr(browser, "profiles", lambda **_: ())
     with store.lock(), pytest.raises(SwitchError, match="Another ds"):
         desktop.action(store, {"action": "import"})
     assert "Added 0" in desktop.action(store, {"action": "import"})["message"]

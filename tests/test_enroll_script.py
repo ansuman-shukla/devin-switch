@@ -244,3 +244,43 @@ def test_connect_fails_when_gmail_opens_for_another_account(chrome_port, monkeyp
     monkeypatch.setattr(FakeBrowser, "landing", ("https://mail.google.com/", "other@gmail.com"))
     with pytest.raises(enroll.EnrollError):
         connect(FakeBrowser())
+
+
+def test_blocked_chrome_port_is_read_through_the_popup(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, chrome_helper, protect
+) -> None:
+    from devin_switch import chrome_access
+
+    (tmp_path / "DevToolsActivePort").write_text("9222\n/devtools/browser/x\n")
+    monkeypatch.setattr(enroll, "CHROME_DATA", tmp_path)
+    monkeypatch.setattr(chrome_access, "HELPER_DATA", tmp_path)
+    chrome_helper.protection = protect(tmp_path)
+    seen = []
+
+    async def go() -> None:
+        def cdp(url: str, timeout: int):
+            seen.append(url)
+            return _ready(FakeBrowser())
+
+        await enroll.Enroller(plan_args()).connect(
+            types.SimpleNamespace(chromium=types.SimpleNamespace(connect_over_cdp=cdp))
+        )
+
+    asyncio.run(go())
+    assert seen == ["ws://127.0.0.1:9222/devtools/browser/x"]
+    assert [request["items"] for request in chrome_helper.requests] == [["DevToolsActivePort"]]
+
+
+def test_profile_check_sees_new_folders_when_blocked_and_waits_for_an_index(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, chrome_helper, protect
+) -> None:
+    from devin_switch import browser
+
+    monkeypatch.setattr(browser, "CHROME_DATA", tmp_path)
+    (tmp_path / "Plus 1").mkdir()
+    assert not enroll.has_profile("Plus 1")
+    (tmp_path / "Local State").write_text('{"profile": {"info_cache": {}}}')
+    assert not enroll.has_profile("Plus 1")
+    protect(tmp_path)
+    assert enroll.has_profile("Plus 1") and not enroll.has_profile("Plus 2")
+    assert chrome_helper.requests == []

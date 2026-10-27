@@ -89,3 +89,34 @@ def test_app_model(model_tests: Path, scenario: str, tmp_path: Path) -> None:
         (str(model_tests), scenario, str(tmp_path)), capture_output=True, text=True, timeout=60
     )
     assert result.returncode == 0, result.stdout + result.stderr
+
+
+def test_chrome_access_helper_copies_only_after_allow(tmp_path: Path) -> None:
+    root = Path(__file__).resolve().parents[1]
+    executable = tmp_path / "ChromeAccessTests"
+    build = subprocess.run(
+        (
+            "swiftc",
+            "-parse-as-library",
+            "-D",
+            "CHROME_ACCESS_TESTS",
+            "-target",
+            f"{platform.machine()}-apple-macos14.0",
+            "-framework",
+            "AppKit",
+            str(root / "macos/ChromeAccess.swift"),
+            str(root / "tests/ChromeAccessTests.swift"),
+            "-o",
+            str(executable),
+        ),
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+    assert build.returncode == 0, build.stdout + build.stderr
+    data = tmp_path / "data"
+    data.mkdir()
+    result = subprocess.run(
+        (str(executable), str(data)), capture_output=True, text=True, timeout=60
+    )
+    assert result.returncode == 0 and result.stdout.strip() == "ok", result.stdout + result.stderr

@@ -9,7 +9,7 @@ import sys
 from dataclasses import replace
 from pathlib import Path
 
-from devin_switch import browser, handoff, sessions
+from devin_switch import browser, chrome_access, handoff, sessions
 from devin_switch.native import Native, find_binary
 from devin_switch.store import Account, Store, SwitchError
 
@@ -109,6 +109,16 @@ def parser() -> argparse.ArgumentParser:
     stop.add_argument("profile", nargs="?")
     actions.add_parser("mcp", help="Serve the browser MCP server over stdio (started by Devin)")
     actions.add_parser("view", help="Serve the Desktop browser panel over stdio (JSON lines)")
+    chrome = commands.add_parser(
+        "chrome", help="Copy from Chrome's data folder, asking with a popup when macOS blocks it"
+    )
+    chrome_actions = chrome.add_subparsers(dest="action", required=True, metavar="ACTION")
+    chrome_copy = chrome_actions.add_parser(
+        "copy", help="Copy files or folders, relative to Chrome's data folder, into a folder"
+    )
+    chrome_copy.add_argument("items", nargs="+", help='e.g. "Local State" "Profile 1/Preferences"')
+    chrome_copy.add_argument("--to", dest="destination", type=Path, required=True)
+    chrome_copy.add_argument("--reason", required=True, help="Why it is needed; shown in the popup")
     chat = commands.add_parser("chat", help="Inspect the Desktop chat this process belongs to")
     chat_actions = chat.add_subparsers(dest="action", required=True, metavar="ACTION")
     chat_actions.add_parser("id", help="Print the conversation id (used by the whiteboard MCP)")
@@ -213,8 +223,15 @@ def execute(args: argparse.Namespace, store: Store) -> int:
         subprocess.run(("/usr/bin/open", str(app)), check=True, timeout=15)
         return 0
     if args.command == "profiles":
-        for profile in browser.profiles():
+        for profile in browser.profiles(reason="List your Chrome profiles (ds profiles)"):
             print(f"{profile.directory:<14} {profile.name:<24} {profile.email}")
+        return 0
+    if args.command == "chrome":
+        args.destination.mkdir(parents=True, exist_ok=True)
+        chrome_access.copy(browser.CHROME_DATA, args.items, args.destination, args.reason)
+        for item in args.items:
+            target = args.destination / Path(item).name
+            print(f"{item}: {'copied to ' + str(target) if target.exists() else 'not found'}")
         return 0
     if args.command in {"run", "login"}:
         native = Native(store, find_binary())
@@ -330,9 +347,7 @@ def execute(args: argparse.Namespace, store: Store) -> int:
             print(f"Removed {args.account}. Shared conversations and project files were preserved.")
             return 0
         if args.command == "add":
-            if args.chrome_profile and args.chrome_profile not in {
-                item.directory for item in browser.profiles()
-            }:
+            if args.chrome_profile and not browser.has_profile(args.chrome_profile):
                 raise SwitchError("Unknown Chrome profile. Run: ds profiles")
             account = store.add(args.account, args.chrome_profile)
             from devin_switch import agent_browser

@@ -128,21 +128,23 @@ def action(store: Store, request: dict[str, object]) -> dict[str, object]:
             "state": snapshot(store),
             "message": f"Display name saved: {account.display_name or account.name}.",
         }
+    if operation == "import":
+        # Read before locking: macOS may block Chrome's data, and the popup waits for the user.
+        found = browser.profiles(reason="Import your Chrome profiles as Switch accounts")
+        with store.lock():
+            added, renamed = enrollment.import_profiles(store, found)
+        return {
+            "message": (
+                f"Added {added} accounts and renamed {renamed}. "
+                "Sign in to each new account to see usage."
+            )
+        }
     with store.lock():
-        if operation == "import":
-            added, renamed = enrollment.import_profiles(store, browser.profiles())
-            return {
-                "message": (
-                    f"Added {added} accounts and renamed {renamed}. "
-                    "Sign in to each new account to see usage."
-                )
-            }
         if operation == "add":
             name = string_field(request, "account")
             profile = request.get("chrome_profile")
             if profile is not None and (
-                not isinstance(profile, str)
-                or profile not in {item.directory for item in browser.profiles()}
+                not isinstance(profile, str) or not browser.has_profile(profile)
             ):
                 raise SwitchError("Choose an existing Chrome profile, or use the default browser.")
             account = store.add(name, profile)

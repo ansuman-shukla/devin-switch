@@ -1,4 +1,4 @@
-.PHONY: help setup format format-check lint test typecheck secrets check pre-commit install app build dmg smoke-app
+.PHONY: help setup format format-check lint test typecheck secrets check pre-commit install app chrome-access build dmg smoke-app
 
 help:
 	@printf '%s\n' \
@@ -7,6 +7,7 @@ help:
 	  'make format       Format Python source and tests' \
 	  'make install      Install the ds CLI with uv' \
 	  'make app          Build and install a local macOS app' \
+	  'make chrome-access Install the helper that asks before reading Chrome data' \
 	  'make build        Build the Python wheel and source archive' \
 	  'make dmg          Build a portable macOS app and disk image' \
 	  'make smoke-app    Verify the portable app offline in isolated state'
@@ -29,6 +30,7 @@ test:
 
 typecheck:
 	swiftc -typecheck -parse-as-library -target "$$(uname -m)-apple-macos14.0" -framework SwiftUI -framework AppKit macos/DevinSwitch.swift macos/AccountViews.swift
+	swiftc -typecheck -parse-as-library -target "$$(uname -m)-apple-macos14.0" -framework AppKit macos/ChromeAccess.swift
 
 secrets:
 	uv run --locked python scripts/check_secrets.py
@@ -40,8 +42,11 @@ pre-commit: format check
 install:
 	env -u XDG_DATA_HOME -u XDG_CONFIG_HOME -u XDG_CACHE_HOME -u XDG_STATE_HOME uv tool install --force --reinstall-package devin-switch --python 3.11 .
 
-app: install
+app: install chrome-access
 	env -u XDG_DATA_HOME -u XDG_CONFIG_HOME -u XDG_CACHE_HOME -u XDG_STATE_HOME uv run --locked python scripts/build_app.py
+
+chrome-access:
+	uv run --locked python scripts/build_chrome_access.py
 
 build:
 	uv build

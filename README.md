@@ -318,10 +318,33 @@ The agent never attaches to the Chrome you are using:
   chat releases it, and the next browser tool call reopens it with fresh pages.
 
 **macOS 27 and later** only let Chrome itself and apps with Full Disk Access read Chrome's
-profile folder. Agents don't need that access to use profiles Switch already copied: they
-list and open those copies. Copying a profile for the first time (or `ds browser refresh`)
-still reads Chrome's folder, so run it from an app that has Full Disk Access, for example a
-terminal you granted it to.
+profile folder, and never show a prompt. Agents don't need that access to use profiles Switch
+already copied: they list and open those copies without asking. When Switch does need Chrome's
+folder (copying a profile for the first time, `ds browser refresh`, `ds profiles`, or
+`ds chrome copy`), it asks with a popup instead of failing:
+
+```text
+agent needs Chrome data ──► readable? ──yes──► copied directly, no popup
+                               │ no (macOS blocks it)
+                               ▼
+        "Devin Switch Chrome Access" popup: why, which chat folder, what it copies
+                     [ Deny ]  [ Allow ]      (no answer in 2 minutes = Deny)
+                               │ Allow
+                               ▼
+                 the helper copies only those items, then the job continues
+```
+
+Set it up once:
+
+1. `make chrome-access` (also part of `make app`) installs
+   `~/Applications/Devin Switch Chrome Access.app` and opens System Settings.
+2. Under **Privacy & Security → Full Disk Access**, add that app and turn it on.
+
+Only this helper gets Full Disk Access. Devin, your terminal and the agents still can't read
+Chrome's folder on their own, so nothing is read silently. Rebuilding an unchanged helper keeps
+the grant; if the helper's code changes, `make chrome-access` says so and you grant it again.
+Agents (or you) can copy other items with
+`ds chrome copy "Local State" --to /tmp/chrome --reason "why"`.
 
 `ds browser status` lists profiles and running instances, and `ds browser stop` closes them
 immediately. The server runs `npx -y chrome-devtools-mcp@1.10.1`, so Node.js is required.
@@ -525,6 +548,7 @@ extension.
 | `ds browser default PROFILE` | Choose the Chrome profile for chats that name none |
 | `ds browser status` | List Chrome profiles, cloned agent profiles and running instances |
 | `ds browser refresh PROFILE` | Copy a Chrome profile's logins into its agent profile again |
+| `ds chrome copy ITEM... --to DIR --reason TEXT` | Copy from Chrome's data folder, asking with a popup when macOS blocks it |
 | `ds browser stop [PROFILE]` | Close running agent browsers now |
 | `ds panels install` / `ds panels status` | Install or check the Desktop Agent Browser and Canvas panels |
 | `ds chat id` | Print the conversation a Desktop chat's process belongs to |
@@ -636,6 +660,7 @@ make check
 | `make secrets` | Scan all local Git history and publishable working-tree files with Gitleaks |
 | `make check` | Run lint, formatting, tests, Swift typechecking, and secret checks |
 | `make app` | Install `ds` with uv and build `~/Applications/Devin Switch.app` |
+| `make chrome-access` | Install the helper that asks before reading Chrome data (macOS 27) |
 | `make build` | Build a Python wheel and source archive in `dist/` |
 | `make dmg` | Build a portable app, DMG, and SHA-256 checksum in `dist/` |
 | `make smoke-app` | Test the portable app after relocation using isolated state and a fake CLI |

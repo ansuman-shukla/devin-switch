@@ -15,9 +15,9 @@ send the invites yourself, and you approve Chrome's remote-debugging prompt.
 
 | Plus addresses | Switch aliases | Chrome profile folders |
 | --- | --- | --- |
-| `ansuman0026+1` … `+26` | `ansuman-27` … `ansuman-52` | `Plus 1` … `Plus 26` |
+| `ansuman0026+1` … `+100` | `ansuman-27` … `ansuman-126` | `Plus 1` … `Plus 100` (folders removed later; re-login with `ds login ALIAS --default-browser`) |
 
-The next batch starts at **`+27`** and alias **`ansuman-53`**. Check with `ds list` first.
+The next batch starts at **`+101`** and alias **`ansuman-127`**. Check with `ds list` first.
 
 ## What the script does
 
@@ -69,6 +69,12 @@ and the invite attaches them to the team.
    by its title, so it must be the right account.
 3. Go to `chrome://inspect/#remote-debugging` and tick **Allow remote debugging for
    this browser instance**. It should say `Server running at: 127.0.0.1:9222`.
+4. **macOS 27 and later:** the script has to read Chrome's `DevToolsActivePort` file, and
+   macOS blocks that with `Operation not permitted`. Set up the Chrome access helper once
+   (see "Agent browser" in the README): `make chrome-access`, then give
+   “Devin Switch Chrome Access” Full Disk Access. After that, the script shows a
+   **"A Devin agent wants to read your Chrome data"** popup when it starts. Click **Allow**,
+   then click **Allow** again on Chrome's remote debugging prompt.
 
 ### 3. Preview the mapping
 
@@ -143,6 +149,8 @@ ansuman-54 <- ansuman0026+28@gmail.com
 | Message | Fix |
 | --- | --- |
 | Connection hangs on "Connecting to Chrome" | Click **Allow** on Chrome's prompt; confirm remote debugging is on. |
+| `PermissionError … Local State` or `DevToolsActivePort` / `macOS blocks reading Chrome's data` | Set up the Chrome access helper (Prepare Chrome, step 4) and rerun. |
+| `denied in the popup` / `Nobody answered the Chrome access popup` | Rerun and click **Allow** within 2 minutes. |
 | `Open Gmail signed in as …` | Open the right Gmail tab in the profile with remote debugging enabled. |
 | `No Devin code arrived` | Check Spam manually and rerun. Persistent failures usually mean rate limiting. |
 | `This profile is in use` | A previous `ds login` is still running. Find it with `ps -ax \| grep "auth login"`, stop it, and rerun. |

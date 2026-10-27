@@ -10,7 +10,7 @@ from pathlib import Path
 
 import pytest
 
-from devin_switch import agent_browser, browser, cli, handoff
+from devin_switch import agent_browser, browser, chrome_access, cli, handoff
 from devin_switch.store import Store, SwitchError
 
 FAKE_CHROME = """\
@@ -340,11 +340,9 @@ def test_visible_mode_restarts_only_when_no_other_chat_uses_the_browser(
 
 
 @pytest.fixture
-def blocked(chrome: Path):
+def blocked(chrome: Path, protect):
     """Chrome's data folder as macOS 27 shows it to apps without Full Disk Access."""
-    chrome.chmod(0)
-    yield
-    chrome.chmod(0o700)
+    return protect(chrome)
 
 
 def test_copied_profiles_keep_working_when_macos_blocks_chrome_data(
@@ -366,7 +364,7 @@ def test_copied_profiles_keep_working_when_macos_blocks_chrome_data(
     assert page["data"] == str(cookies.parent.parent)
 
     text, error = chat.tool("browser_profile", profile="work@example.invalid")
-    assert error and "Full Disk Access" in text and "ds browser refresh" in text
+    assert error and "Full Disk Access" in text and "make chrome-access" in text
     chat.tool("browser_close")
     wait_until(lambda: agent_browser.state(store, "Profile 3") is None)
     text, error = chat.tool("browser_profile", profile="Profile 3", refresh=True)
@@ -397,11 +395,52 @@ def test_copies_made_before_names_were_saved_still_resolve_when_blocked(
     (unfinished / "source.json").write_text(json.dumps({"directory": "Profile 9", "email": ""}))
     request.getfixturevalue("blocked")
     assert agent_browser.resolve(store, "WORK@example.invalid").directory == "Profile 7"
-    with pytest.raises(browser.ChromeBlocked, match="ds browser refresh"):
+    with pytest.raises(browser.ChromeBlocked, match="make chrome-access"):
         agent_browser.resolve(store, "Profile 9")
     with pytest.raises(browser.ChromeBlocked, match="Full Disk Access"):
         agent_browser.clone(store, agent_browser.resolve(store, "Profile 7"))
     assert json.loads(source.read_text()) == legacy
+
+
+@pytest.fixture
+def popup(chrome: Path, chrome_helper, blocked, monkeypatch: pytest.MonkeyPatch):
+    """Blocked Chrome data with the Chrome access helper installed."""
+    monkeypatch.setattr(chrome_access, "HELPER_DATA", chrome)
+    chrome_helper.protection = blocked
+    return chrome_helper
+
+
+def test_blocked_refresh_copies_logins_after_the_popup_allows_it(store: Store, popup) -> None:
+    profile = browser.ChromeProfile("Profile 3", "associum.ai", "ansuman@example.invalid")
+    agent_browser.clone(store, profile)
+    data = agent_browser.folder_for(store, "Profile 3") / "user-data/Default"
+    assert (data / "Cookies").read_text() == "cookies Profile 3"
+    assert (data / "Local Storage/leveldb/000003.log").exists()
+    assert not (data / "Login Data").exists()
+    [request] = popup.requests
+    assert request["items"] == [f"Profile 3/{name}" for name in agent_browser.CLONED]
+    assert "Profile 3 (ansuman@example.invalid)" in request["reason"]
+
+    popup.decision = "deny"
+    with pytest.raises(browser.ChromeBlocked, match="denied"):
+        agent_browser.clone(store, profile)
+    assert (data / "Cookies").read_text() == "cookies Profile 3"
+    assert not (data.parent.parent / "user-data.partial").exists()
+
+
+def test_blocked_lookup_asks_only_for_a_profile_that_was_never_copied(store: Store, popup) -> None:
+    popup.decision = "allow"
+    copied = agent_browser.resolve(store, "Profile 3")
+    assert popup.requests[0]["items"] == ["Local State"]
+    assert "'Profile 3'" in popup.requests[0]["reason"]
+    agent_browser.clone(store, copied)
+    popup.requests.clear()
+    assert agent_browser.resolve(store, "ansuman@example.invalid").directory == "Profile 3"
+    assert popup.requests == []
+    assert agent_browser.resolve(store, "WORK@example.invalid").directory == "Profile 7"
+    assert [request["items"] for request in popup.requests] == [["Local State"]]
+    with pytest.raises(SwitchError, match="No Chrome profile matches"):
+        agent_browser.resolve(store, "nobody@example.invalid")
 
 
 class Viewer:

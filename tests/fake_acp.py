@@ -377,6 +377,48 @@ async def handle(message):
                 },
             }
             if text == "question":
+                # The native's card event, as captured from CLI 3000.11.216: labels in _meta,
+                # descriptions only in rawInput, and camelCase multiSelect only when true.
+                asked = [
+                    ("Pick any", True, [("One", "First"), ("Two", "Second")]),
+                    ("Pick one", False, [("Fast", "Quick but rough"), ("Slow", None)]),
+                    ("Plain", False, [("Yes", None), ("No", None)]),
+                ]
+                update(
+                    loaded,
+                    {
+                        "sessionUpdate": "tool_call",
+                        "toolCallId": "ask_user_question:0#test",
+                        "title": "Asked user Pick any",
+                        "rawInput": {
+                            "questions": [
+                                {
+                                    "question": question,
+                                    "header": "T",
+                                    "options": [
+                                        {"label": label} | ({"description": about} if about else {})
+                                        for label, about in options
+                                    ],
+                                }
+                                | ({"multi_select": True} if multiple else {})
+                                for question, multiple, options in asked
+                            ]
+                        },
+                        "_meta": {
+                            "cognition.ai/inferenceToolName": "ask_user_question",
+                            "cognition.ai/eventType": "ask_user_question",
+                            "cognition.ai/questions": [
+                                {
+                                    "question": question,
+                                    "header": "T",
+                                    "options": [label for label, _ in options],
+                                }
+                                | ({"multiSelect": True} if multiple else {})
+                                for question, multiple, options in asked
+                            ],
+                        },
+                    },
+                )
                 request["method"] = "elicitation/create"
                 request["params"] = {
                     "sessionId": loaded,

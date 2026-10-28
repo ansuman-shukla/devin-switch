@@ -409,6 +409,47 @@ def test_gui_delayed_decisions_reach_only_the_requesting_chat(acp_native, tmp_pa
     asyncio.run(scenario())
 
 
+def test_gui_question_card_shows_multi_select_and_option_descriptions(acp_native, tmp_path):
+    async def scenario():
+        async with connect(acp_native) as client:
+            session_id = await client.new(tmp_path)
+            await client.prompt(session_id, "question")
+            (card,) = [
+                message["params"]["update"]
+                for message in client.messages
+                if message.get("method") == "session/update"
+                and message["params"]["update"].get("sessionUpdate") == "tool_call"
+            ]
+            # Desktop's card reads only allow_multiple and plain-string labels from this list.
+            assert card["_meta"]["cognition.ai/questions"] == [
+                {
+                    "question": "Pick any\n\n- **One**: First\n- **Two**: Second",
+                    "header": "T",
+                    "options": ["One", "Two"],
+                    "multiSelect": True,
+                    "allow_multiple": True,
+                },
+                {
+                    "question": "Pick one\n\n- **Fast**: Quick but rough",
+                    "header": "T",
+                    "options": ["Fast", "Slow"],
+                },
+                {"question": "Plain", "header": "T", "options": ["Yes", "No"]},
+            ]
+            assert [item["question"] for item in card["rawInput"]["questions"]] == [
+                "Pick any",
+                "Pick one",
+                "Plain",
+            ]
+            (form,) = client.permissions
+            assert form["params"]["message"] == "Choose an approach"
+            assert form["params"]["requestedSchema"]["properties"] == {
+                "approach": {"type": "string", "enum": ["one", "two"]}
+            }
+
+    asyncio.run(scenario())
+
+
 @pytest.mark.parametrize(
     ("method", "params"),
     [

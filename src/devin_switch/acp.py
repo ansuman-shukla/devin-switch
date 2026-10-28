@@ -47,6 +47,7 @@ LOCAL_COMMANDS = [
 LOCAL_NAMES = {"/" + command["name"] for command in LOCAL_COMMANDS}
 AGENT_STOPPED = "_cognition.ai/agent_stopped"
 CANCEL_REQUEST = "$/cancel_request"
+QUESTIONS = "cognition.ai/questions"
 RESOURCE_EXHAUSTED = -32011
 RESOURCE_NOT_FOUND = -32002
 AUTO_SWITCH_LIMIT = 3
@@ -208,6 +209,32 @@ def failure_detail(error: Exception) -> str:
         if isinstance(error, SwitchError)
         else f"Operation failed ({type(error).__name__})."
     )
+
+
+def show_question_details(update: dict) -> None:
+    """Desktop 1.126 builds its question card from `cognition.ai/questions`, reading only
+    `allow_multiple` and label strings, so the native's `multiSelect` and the option
+    descriptions (sent only in rawInput) never show. Answers still use the unchanged form."""
+    meta, raw = update.get("_meta"), update.get("rawInput")
+    cards = meta.get(QUESTIONS) if isinstance(meta, dict) else None
+    asked = raw.get("questions") if isinstance(raw, dict) else None
+    if not isinstance(cards, list):
+        return
+    for index, card in enumerate(cards):
+        if not isinstance(card, dict):
+            continue
+        if card.get("multiSelect") is True:
+            card.setdefault("allow_multiple", True)
+        source = asked[index] if isinstance(asked, list) and index < len(asked) else None
+        if not isinstance(source, dict) or source.get("question") != card.get("question"):
+            continue
+        lines = [
+            f"- **{option['label']}**: {option['description']}"
+            for option in source.get("options") or ()
+            if isinstance(option, dict) and option.get("label") and option.get("description")
+        ]
+        if lines:
+            card["question"] = f"{card['question']}\n\n" + "\n".join(lines)
 
 
 def is_activity(message: dict) -> bool:
@@ -684,6 +711,7 @@ class Bridge:
         if message.get("method") == "session/update":
             update = message.get("params", {}).get("update", {})
             kind = update.get("sessionUpdate")
+            show_question_details(update)
             if kind == "config_option_update":
                 backend.remember(update)
             if kind == "current_mode_update":

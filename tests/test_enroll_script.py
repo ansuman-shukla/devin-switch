@@ -383,16 +383,43 @@ def test_blocked_chrome_port_is_read_through_the_popup(
     assert [request["items"] for request in chrome_helper.requests] == [["DevToolsActivePort"]]
 
 
-def test_profile_check_sees_new_folders_when_blocked_and_waits_for_an_index(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, chrome_helper, protect
+def test_new_aliases_get_no_chrome_profile_and_older_ones_are_reused(
+    store, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    from devin_switch import browser
+    with store.lock():
+        store.add("ansuman-5", "Plus 1")
+        store.add("ansuman-6", None)
+    commands = []
+    monkeypatch.setattr(enroll, "store", lambda: store)
+    monkeypatch.setattr(enroll.subprocess, "run", lambda argv, **_: commands.append(argv))
+    args = enroll.parser().parse_args(
+        ["--email", "me@gmail.com", "--first", "1", "--last", "3", "--first-alias", "5"]
+    )
+    enroll.ensure_accounts(enroll.targets(args), "ds")
+    assert commands == [("ds", "add", "ansuman-7")]
 
-    monkeypatch.setattr(browser, "CHROME_DATA", tmp_path)
-    (tmp_path / "Plus 1").mkdir()
-    assert not enroll.has_profile("Plus 1")
-    (tmp_path / "Local State").write_text('{"profile": {"info_cache": {}}}')
-    assert not enroll.has_profile("Plus 1")
-    protect(tmp_path)
-    assert enroll.has_profile("Plus 1") and not enroll.has_profile("Plus 2")
-    assert chrome_helper.requests == []
+
+def test_alias_bound_to_another_chrome_profile_is_not_taken_over(
+    store, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    with store.lock():
+        store.add("ansuman-5", "Profile 3")
+    monkeypatch.setattr(enroll, "store", lambda: store)
+    monkeypatch.setattr(enroll.subprocess, "run", lambda *_, **__: pytest.fail("ran a command"))
+    args = enroll.parser().parse_args(
+        ["--email", "me@gmail.com", "--first", "1", "--last", "1", "--first-alias", "5"]
+    )
+    with pytest.raises(enroll.EnrollError, match="Profile 3"):
+        enroll.ensure_accounts(enroll.targets(args), "ds")
+
+
+def test_login_asks_ds_not_to_open_a_browser(tmp_path: Path) -> None:
+    fake = tmp_path / "ds"
+    fake.write_text(f"#!{sys.executable}\nimport sys\nprint(sys.argv[1:], flush=True)\n")
+    fake.chmod(0o755)
+    login = enroll.Login(str(fake), "ansuman-5")
+    try:
+        login.finish(10)
+        assert "['login', 'ansuman-5', '--no-browser']" in login.text()
+    finally:
+        login.close()

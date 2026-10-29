@@ -1,6 +1,8 @@
 import json
 import os
 import subprocess
+import sys
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -61,6 +63,7 @@ def test_login_uses_selected_chrome_profile_and_manual_flow(
     def login(self: Native, selected: object, arguments: tuple[str, ...]) -> int:
         assert selected == account
         assert arguments == ("auth", "login", "--force-manual-token-flow")
+        assert self.command(arguments) == (str(native.binary), *arguments)
         self.store.credentials(account).write_text("valid-new-account")
         return 0
 
@@ -68,6 +71,85 @@ def test_login_uses_selected_chrome_profile_and_manual_flow(
     assert cli.execute(cli.parser().parse_args(["login", account.name]), store) == 0
     assert opened == ["Profile 11"]
     assert native.authenticated(account)
+
+
+# What the CLI's browser library asks LaunchServices first: the default https app.
+LAUNCH_SERVICES_PROBE = """
+import ctypes, ctypes.util
+cf = ctypes.CDLL(ctypes.util.find_library("CoreFoundation"))
+cs = ctypes.CDLL(ctypes.util.find_library("CoreServices"))
+cf.CFURLCreateWithBytes.restype = ctypes.c_void_p
+cf.CFURLCreateWithBytes.argtypes = [
+    ctypes.c_void_p, ctypes.c_char_p, ctypes.c_long, ctypes.c_uint32, ctypes.c_void_p
+]
+cs.LSCopyDefaultApplicationURLForURL.restype = ctypes.c_void_p
+cs.LSCopyDefaultApplicationURLForURL.argtypes = [ctypes.c_void_p, ctypes.c_uint32, ctypes.c_void_p]
+url = cf.CFURLCreateWithBytes(None, b"https://", 8, 0x08000100, None)
+can_open_browser = bool(cs.LSCopyDefaultApplicationURLForURL(url, 2, None))
+"""
+
+
+@pytest.mark.skipif(sys.platform != "darwin", reason="LaunchServices sandboxing is macOS-only")
+def test_no_browser_login_skips_chrome_and_blocks_the_native_browser(
+    native: Native, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    store = native.store
+    with store.lock():
+        account = store.add("browser-account", "Profile 11")
+    binary = tmp_path / "fake native"
+    binary.write_text(
+        f"#!{sys.executable}\n"
+        "import os, pathlib, sys\n"
+        "credential = pathlib.Path(os.environ['XDG_DATA_HOME']) / 'devin/credentials.toml'\n"
+        "if sys.argv[1:] == ['auth', 'status']:\n"
+        "    print('Logged in as a@test' if credential.exists() else 'Not logged in.')\n"
+        "    sys.exit(0)\n"
+        "assert sys.argv[1:] == ['auth', 'login', '--force-manual-token-flow'], sys.argv\n"
+        f"{LAUNCH_SERVICES_PROBE}\n"
+        "if can_open_browser:\n"
+        "    sys.exit('LaunchServices is reachable; a browser would open')\n"
+        "credential.write_text('valid-new-account')\n"
+    )
+    binary.chmod(0o700)
+    monkeypatch.setattr(cli, "find_binary", lambda: binary)
+    monkeypatch.setattr(browser, "open_login", lambda _: pytest.fail("Chrome window opened"))
+    args = cli.parser().parse_args(["login", account.name, "--no-browser"])
+    assert cli.execute(args, store) == 0
+    assert store.credentials(account).read_text() == "valid-new-account"
+
+
+@pytest.mark.skipif(sys.platform != "darwin", reason="LaunchServices sandboxing is macOS-only")
+def test_only_no_browser_commands_lose_launch_services(native: Native) -> None:
+    probe = ("-c", LAUNCH_SERVICES_PROBE + "print(can_open_browser)")
+    plain = replace(native, binary=Path(sys.executable))
+
+    def reachable(runner: Native) -> str:
+        return subprocess.run(
+            runner.command(probe), capture_output=True, text=True, check=True
+        ).stdout.strip()
+
+    assert reachable(plain) == "True"
+    assert reachable(replace(plain, no_browser=True)) == "False"
+
+
+@pytest.mark.skipif(sys.platform != "darwin", reason="LaunchServices sandboxing is macOS-only")
+def test_no_browser_commands_cannot_reach_the_app_launcher(native: Native) -> None:
+    plain = replace(native, binary=Path("/usr/bin/lsappinfo"))
+
+    def front(runner: Native) -> str:
+        return subprocess.run(
+            runner.command(("front",)), capture_output=True, text=True, check=True
+        ).stdout.strip()
+
+    if not front(plain).startswith("ASN:"):
+        pytest.skip("No GUI login session to compare against")
+    assert front(replace(plain, no_browser=True)) == "[ NULL ]"
+
+
+def test_login_browser_choices_are_exclusive(capsys: pytest.CaptureFixture[str]) -> None:
+    with pytest.raises(SystemExit):
+        cli.parser().parse_args(["login", "a", "--no-browser", "--default-browser"])
+    assert "not allowed with argument" in capsys.readouterr().err
 
 
 def test_existing_login_never_opens_browser(

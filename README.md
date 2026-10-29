@@ -158,8 +158,9 @@ it would otherwise use to open the page in your default browser.
 
 To add many plus-address seats (`you+1@gmail.com`, `you+2@gmail.com`, …) at once, follow
 [docs/enrolling-accounts.md](docs/enrolling-accounts.md). `scripts/enroll_accounts.py`
-creates the Chrome profiles and aliases and drives each sign-in through your local Chrome,
-typing login codes straight into `ds login` without displaying them.
+creates the aliases and drives each sign-in in a headless Chrome, reading codes from the
+Gmail tab of your local Chrome and typing them straight into `ds login --no-browser`
+without displaying them.
 
 ### Switch inside a chat when an account runs out
 

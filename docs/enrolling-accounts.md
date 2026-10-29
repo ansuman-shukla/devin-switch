@@ -16,8 +16,10 @@ send the invites yourself, and you approve Chrome's remote-debugging prompt.
 | Plus addresses | Switch aliases | Chrome profile folders |
 | --- | --- | --- |
 | `ansuman0026+1` … `+100` | `ansuman-27` … `ansuman-126` | `Plus 1` … `Plus 100` (folders removed later; re-login with `ds login ALIAS --default-browser`) |
+| `ansuman0026+101` … `+173` | `ansuman-127` … `ansuman-199` | `Plus 101` … `Plus 173` (created before headless enrollment; not needed for sign-in) |
 
-The next batch starts at **`+101`** and alias **`ansuman-127`**. Check with `ds list` first.
+The next `ansuman0026` batch starts at **`+174`**. Other base addresses may have taken the
+following aliases, so pick `--first-alias` past the highest one in `ds list`.
 Earlier batches created a `Plus N` Chrome profile per account; the script no
 longer does, and reuses those aliases as they are.
 

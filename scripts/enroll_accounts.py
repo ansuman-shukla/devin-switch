@@ -7,16 +7,17 @@ Run from the repository (see docs/enrolling-accounts.md):
 
 For every number N in [--first, --last] this:
 
-1. creates a Chrome profile folder "Plus N" (no Google account) and registers
-   `<prefix>-<alias>` bound to it with `ds add`, unless it already exists;
-2. runs `ds login` in a private PTY and reads the one-time sign-in URL;
-3. opens that URL in a fresh, isolated browser context, signs up (or logs in)
+1. registers `<prefix>-<alias>` with `ds add`, unless it already exists;
+2. runs `ds login --no-browser` in a private PTY and reads the one-time sign-in URL;
+3. opens that URL in a fresh context of a separate headless Chrome, signs up (or logs in)
    as `you+N@gmail.com`, and reads Devin's emailed code from the signed-in
    Gmail tab, checking the recipient;
 4. picks the organization with the requested plan, then types the CLI code
    straight into the waiting `ds login` prompt. Codes are never printed;
 5. confirms with Devin's usage endpoint that the alias reports the expected
-   email and plan, and closes leftover Devin sign-in windows.
+   email and plan.
+
+Only the Gmail tab of your Chrome is used; no other window opens.
 
 It never purchases anything and stops at the first unexpected page.
 """
@@ -37,37 +38,15 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 
-CHROME_APP = "/Applications/Google Chrome.app"
 CHROME_DATA = Path.home() / "Library/Application Support/Google/Chrome"
 LOGIN_URL = re.compile(r"https://app\.devin\.ai/auth/cli/continue\?\S*?cli_pkce_marker=1")
 ANY_LOGIN_URL = re.compile(r"https://\S*?cli_pkce_marker=1")
 ANSI = re.compile(rb"\x1b\[[0-9;?]*[A-Za-z]")
 LONG_VALUE = re.compile(r"[A-Za-z0-9_\-\.]{20,}")
 CODE_SUBJECT = 'subject:"Devin Login Code" in:anywhere newer_than:15m'
+TERMS = re.compile("agree to the Terms of Service")
 RATE_LIMIT_WAIT = 300
 OTHER_LOGIN_RETRIES = 3
-CLEANUP_SCRIPT = """
-on run keep
-  set closed to 0
-  tell application "Google Chrome"
-    set ids to id of every window
-    repeat with wid in ids
-      set w to window id (contents of wid)
-      set stale to true
-      repeat with t in (every tab of w)
-        set u to URL of t
-        if not (u starts with "https://app.devin.ai/auth/") then set stale to false
-        if keep contains u then set stale to false
-      end repeat
-      if stale then
-        close w
-        set closed to closed + 1
-      end if
-    end repeat
-  end tell
-  return closed
-end run
-"""
 
 
 class EnrollError(Exception):
@@ -128,16 +107,6 @@ def redact(text: str) -> str:
     return LONG_VALUE.sub("<redacted>", text)
 
 
-def has_profile(directory: str) -> bool:
-    from devin_switch import browser
-    from devin_switch.store import SwitchError
-
-    try:
-        return browser.has_profile(directory)
-    except SwitchError:  # Chrome has not written a readable profile index yet.
-        return False
-
-
 def store():
     from devin_switch.store import Store
 
@@ -149,35 +118,14 @@ def ensure_accounts(plan: list[Target], ds: str) -> None:
     existing = {account.name: account for account in store().accounts()}
     for target in plan:
         account = existing.get(target.alias)
-        if account and account.chrome_profile != target.profile:
+        if account and account.chrome_profile not in (None, target.profile):
             raise EnrollError(
                 f"{target.alias} exists but uses Chrome profile {account.chrome_profile!r}, "
                 f"not {target.profile!r}. Choose another --first-alias."
             )
     for target in plan:
-        if not has_profile(target.profile):
-            subprocess.run(
-                (
-                    "/usr/bin/open",
-                    "-na",
-                    CHROME_APP,
-                    "--args",
-                    f"--profile-directory={target.profile}",
-                    "about:blank",
-                ),
-                check=True,
-            )
-            time.sleep(2)
-    deadline = time.time() + 90
-    while missing := [t.profile for t in plan if not has_profile(t.profile)]:
-        if time.time() > deadline:
-            raise EnrollError(f"Chrome did not register profiles: {', '.join(missing)}")
-        time.sleep(3)
-    for target in plan:
         if target.alias not in existing:
-            subprocess.run(
-                (ds, "add", target.alias, "--chrome-profile", target.profile), check=True
-            )
+            subprocess.run((ds, "add", target.alias), check=True)
 
 
 def verify(target: Target, plan_name: str) -> str:
@@ -203,7 +151,7 @@ class Login:
         self.master, child = pty.openpty()
         fcntl.ioctl(child, termios.TIOCSWINSZ, struct.pack("HHHH", 50, 1000, 0, 0))
         self.process = subprocess.Popen(
-            (ds, "login", alias),
+            (ds, "login", alias, "--no-browser"),
             stdin=child,
             stdout=child,
             stderr=child,
@@ -307,6 +255,11 @@ class Enroller:
             "remote debugging is enabled, then retry."
         )
 
+    async def launch(self, playwright) -> None:
+        """A separate headless Chrome for Devin's pages, so nothing opens on screen."""
+        self.playwright = playwright
+        self.devin = await playwright.chromium.launch(channel="chrome", headless=True)
+
     async def search(self, query: str) -> None:
         await self.gmail.evaluate("location.hash = '#inbox'")
         await self.gmail.wait_for_timeout(1500)
@@ -349,6 +302,8 @@ class Enroller:
             )
             await page.wait_for_timeout(2500)
         await page.get_by_label("Email address").fill(email)
+        if signup:
+            await page.get_by_role("checkbox", name=TERMS).check()
         await page.get_by_role("button", name="Sign up" if signup else "Log in", exact=True).click()
         await page.wait_for_timeout(4000)
         body = await page.inner_text("body")
@@ -357,7 +312,10 @@ class Enroller:
         return "We've sent" in body
 
     async def cli_code(self, target: Target, url: str) -> str:
-        context = await self.browser.new_context()
+        if not self.devin.is_connected():
+            print("  Devin's headless Chrome closed; relaunching", flush=True)
+            await self.launch(self.playwright)
+        context = await self.devin.new_context()
         try:
             page = await context.new_page()
             sent = await self.request_code(page, url, target.email, signup=True)
@@ -387,10 +345,6 @@ class Enroller:
         finally:
             await context.close()
 
-    def cleanup(self) -> None:
-        keep = sorted({page.url for c in self.browser.contexts[1:] for page in c.pages})
-        subprocess.run(("osascript", "-e", CLEANUP_SCRIPT, *keep), capture_output=True)
-
     async def enroll(self, target: Target) -> str:
         waits = others = 0
         while True:
@@ -417,7 +371,6 @@ class Enroller:
                 delay = 5
             finally:
                 login.close()
-                self.cleanup()
             await asyncio.sleep(delay)
 
 
@@ -433,6 +386,7 @@ async def run(args: argparse.Namespace, plan: list[Target]) -> int:
     async with async_playwright() as playwright:
         enroller = Enroller(args)
         await enroller.connect(playwright)
+        await enroller.launch(playwright)
         pending = list(plan)
         for attempt in range(1, args.passes + 1):
             failed = []
@@ -489,7 +443,7 @@ def main() -> int:
     try:
         plan = targets(args)
         for target in plan:
-            print(f"{target.alias:<14} {target.profile:<10} {target.email}")
+            print(f"{target.alias:<14} {target.email}")
         if args.dry_run:
             return 0
         ensure_accounts(plan, args.ds)

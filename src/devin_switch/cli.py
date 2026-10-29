@@ -44,7 +44,13 @@ def parser() -> argparse.ArgumentParser:
         "login", help="Sign into an account once using native authentication"
     )
     login.add_argument("account")
-    login.add_argument("--default-browser", action="store_true", help="Use native browser login")
+    browser_choice = login.add_mutually_exclusive_group()
+    browser_choice.add_argument(
+        "--default-browser", action="store_true", help="Use native browser login"
+    )
+    browser_choice.add_argument(
+        "--no-browser", action="store_true", help="Print the sign-in link; open no browser"
+    )
     use = commands.add_parser("use", help="Select an account with saved credentials")
     use.add_argument("account")
     commands.add_parser("next", help="Cycle to another saved login; does not measure quota")
@@ -251,7 +257,10 @@ def execute(args: argparse.Namespace, store: Store) -> int:
                     if runner.authenticated(account):
                         print(f"{account.name} already has a saved login; no browser needed.")
                         return 0
-                    if account.chrome_profile and not args.default_browser:
+                    if args.no_browser:
+                        runner = replace(runner, no_browser=True)
+                        arguments += ("--force-manual-token-flow",)
+                    elif account.chrome_profile and not args.default_browser:
                         print(
                             f"Opening {account.chrome_profile}. Sign in, then paste the token into "
                             "Devin's terminal prompt. The token is not saved by this wrapper.",

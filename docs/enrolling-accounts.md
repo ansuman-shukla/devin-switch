@@ -3,7 +3,7 @@
 This is the runbook for adding a batch of new Devin Team seats to Devin Switch using
 Gmail plus addresses (`you+1@gmail.com`, `you+2@gmail.com`, …). All mail for every
 plus address arrives in the one `you@gmail.com` inbox, so no new Google accounts or
-signed-in Chrome profiles are needed.
+Chrome profiles are needed.
 
 `scripts/enroll_accounts.py` automates the browser part. You still buy the seats and
 send the invites yourself, and you approve Chrome's remote-debugging prompt.
@@ -16,20 +16,25 @@ send the invites yourself, and you approve Chrome's remote-debugging prompt.
 | Plus addresses | Switch aliases | Chrome profile folders |
 | --- | --- | --- |
 | `ansuman0026+1` … `+100` | `ansuman-27` … `ansuman-126` | `Plus 1` … `Plus 100` (folders removed later; re-login with `ds login ALIAS --default-browser`) |
+| `ansuman0026+101` … `+173` | `ansuman-127` … `ansuman-199` | `Plus 101` … `Plus 173` (created before headless enrollment; not needed for sign-in) |
 
-The next batch starts at **`+101`** and alias **`ansuman-127`**. Check with `ds list` first.
+The next `ansuman0026` batch starts at **`+174`**. Other base addresses may have taken the
+following aliases, so pick `--first-alias` past the highest one in `ds list`.
+Earlier batches created a `Plus N` Chrome profile per account; the script no
+longer does, and reuses those aliases as they are.
 
 ## What the script does
 
 For each number N it:
 
-1. **Creates the Chrome profile folder** `Plus N` (no Google account) and registers
-   the Switch alias bound to it with `ds add`. Existing matching aliases are reused.
-2. **Starts `ds login <alias>`** on a private terminal (PTY) and reads the one-time
-   sign-in URL the CLI prints.
-3. **Opens that URL in a fresh, isolated, incognito-style browser context** in your
-   Chrome, so Devin cookies from different accounts never mix. It signs up as
-   `you+N@gmail.com`, or logs in if the account already exists.
+1. **Registers the Switch alias** with `ds add` (no Chrome profile). Existing aliases
+   with no profile, or with the older `Plus N` profile, are reused.
+2. **Starts `ds login <alias> --no-browser`** on a private terminal (PTY) and reads the
+   one-time sign-in URL the CLI prints. Nothing opens in your browser.
+3. **Opens that URL in a separate headless Chrome** (a temporary profile, no window),
+   in a fresh context per account so Devin cookies from different accounts never mix.
+   It signs up as `you+N@gmail.com`, ticking Devin's Terms checkbox, or logs in if the
+   account already exists.
 4. **Finds Devin's verification code in your Gmail tab** (Inbox or Spam). It only opens
    emails with the subject "Devin Login Code" and checks the recipient is exactly
    `you+N@gmail.com`.
@@ -39,8 +44,8 @@ For each number N it:
    never printed, logged, or shown in any terminal.
 7. **Verifies the result** through Devin's usage endpoint: the alias must report
    `you+N@gmail.com` on the expected plan, or the script stops.
-8. **Closes leftover Devin sign-in windows**, which `ds login` and the native CLI open
-   on their own. It only closes windows whose tabs are all `app.devin.ai/auth/…` pages.
+
+Your own Chrome is only used to read the Gmail tab; no other window opens.
 
 It never clicks Purchase. On Devin's upgrade page it just navigates away. It stops at
 the first unexpected page and is safe to rerun: aliases that already have a working
@@ -103,8 +108,6 @@ uv run --locked --with playwright python scripts/enroll_accounts.py \
 
 - Chrome shows an **Allow remote debugging?** prompt when the script connects. Click
   **Allow**. It may be behind other windows.
-- Blank Chrome windows appear while the `Plus N` profiles are created. You can close
-  them afterwards.
 - Expect roughly 1–2 minutes per account, plus pauses.
 - **Rate limits are normal.** Devin limits how quickly new accounts can sign up. The
   script waits 5 minutes and retries (up to 8 times by default), then continues.
@@ -137,7 +140,7 @@ ansuman-54 <- ansuman0026+28@gmail.com
 | `--first` / `--last` | required | Inclusive range of plus numbers |
 | `--first-alias` | required | Alias number for `--first`; the rest follow in order |
 | `--prefix` | `ansuman` | Alias prefix (`ansuman-53`) |
-| `--profile-prefix` | `Plus` | Chrome profile folder prefix (`Plus 27`) |
+| `--profile-prefix` | `Plus` | Chrome profile prefix of older aliases that may be reused (`Plus 27`) |
 | `--plan` | `Teams` | Organization plan to select and verify |
 | `--pause` | `45` | Seconds between accounts |
 | `--rate-limit-retries` | `8` | 5-minute waits allowed per account |

@@ -149,13 +149,18 @@ When a Chrome profile is assigned, Switch opens the native manual-token login pa
 that profile. Paste the token **only into the native CLI's Terminal prompt**—never into
 an issue, screenshot, README, or chat. Switch does not collect it in its own prompts.
 For native default-browser login instead, use `ds login work --default-browser`.
+To open no browser at all (for example to sign in from another browser or device), use
+`ds login work --no-browser`: it prints the sign-in link and waits for the code. On macOS
+the native CLI is started under a `sandbox-exec` rule that denies only LaunchServices, which
+it would otherwise use to open the page in your default browser.
 
 ### Enroll a batch of Team seats
 
 To add many plus-address seats (`you+1@gmail.com`, `you+2@gmail.com`, …) at once, follow
 [docs/enrolling-accounts.md](docs/enrolling-accounts.md). `scripts/enroll_accounts.py`
-creates the Chrome profiles and aliases and drives each sign-in through your local Chrome,
-typing login codes straight into `ds login` without displaying them.
+creates the aliases and drives each sign-in in a headless Chrome, reading codes from the
+Gmail tab of your local Chrome and typing them straight into `ds login --no-browser`
+without displaying them.
 
 ### Switch inside a chat when an account runs out
 
@@ -531,7 +536,7 @@ extension.
 | `ds close --run RUN_ID` | Release an exact saved GUI connection when idle; reconnect on the next message |
 | `ds add ALIAS` | Register a local profile |
 | `ds profiles` | List available Chrome profile identifiers |
-| `ds login ALIAS` | Enroll or check a saved login |
+| `ds login ALIAS [--no-browser]` | Enroll or check a saved login |
 | `ds list` | List profiles and the selected default |
 | `ds status [ALIAS]` | Check a saved login with the native CLI |
 | `ds use ALIAS` | Change the default for future launches |

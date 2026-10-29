@@ -39,6 +39,13 @@ verified_logins: dict[tuple, float] = {}
 CAPTURE_TIMEOUT = 30
 TELEMETRY_VARIABLE = "OTEL_EXPORTER_OTLP_LOGS_ENDPOINT"
 RECEIVER_ENDPOINT = re.compile(r"http://127\.0\.0\.1:\d+/[0-9a-f]{32}/v1/logs")
+# The CLI opens its sign-in page through LaunchServices and ignores $BROWSER on macOS, so
+# denying only these lookups keeps it from opening a browser while everything else works.
+NO_BROWSER_SANDBOX = (
+    "(version 1)(allow default)(deny mach-lookup"
+    ' (global-name "com.apple.coreservices.launchservicesd")'
+    ' (global-name-prefix "com.apple.lsd."))'
+)
 
 
 def find_binary() -> Path:
@@ -86,6 +93,13 @@ class Native:
     run_id: str | None = None
     select_on_start: bool = False
     launch_id: str | None = None
+    no_browser: bool = False
+
+    def command(self, arguments: tuple[str, ...]) -> tuple[str, ...]:
+        native = (str(self.binary), *arguments)
+        if self.no_browser:
+            return ("/usr/bin/sandbox-exec", "-p", NO_BROWSER_SANDBOX, *native)
+        return native
 
     def track_process(self, pid: int) -> None:
         if self.launch_id:
@@ -192,7 +206,7 @@ class Native:
                 with self.launch_selection(account):
                     process = stack.enter_context(
                         subprocess.Popen(
-                            (str(self.binary), *arguments),
+                            self.command(arguments),
                             env=self.environment(account),
                             pass_fds=self.lock_fds,
                         )

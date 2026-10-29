@@ -257,6 +257,7 @@ class Enroller:
 
     async def launch(self, playwright) -> None:
         """A separate headless Chrome for Devin's pages, so nothing opens on screen."""
+        self.playwright = playwright
         self.devin = await playwright.chromium.launch(channel="chrome", headless=True)
 
     async def search(self, query: str) -> None:
@@ -311,6 +312,9 @@ class Enroller:
         return "We've sent" in body
 
     async def cli_code(self, target: Target, url: str) -> str:
+        if not self.devin.is_connected():
+            print("  Devin's headless Chrome closed; relaunching", flush=True)
+            await self.launch(self.playwright)
         context = await self.devin.new_context()
         try:
             page = await context.new_page()

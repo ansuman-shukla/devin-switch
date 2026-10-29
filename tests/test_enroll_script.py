@@ -178,6 +178,9 @@ def test_devin_pages_open_in_a_separate_headless_chrome() -> None:
             contexts.append("closed")
 
     class Headless:
+        def is_connected(self) -> bool:
+            return True
+
         async def new_context(self) -> Context:
             contexts.append("new")
             return Context()
@@ -199,6 +202,43 @@ def test_devin_pages_open_in_a_separate_headless_chrome() -> None:
         asyncio.run(go())
     assert launched == [{"channel": "chrome", "headless": True}]
     assert contexts == ["new", "closed"]
+
+
+def test_closed_headless_chrome_is_relaunched_before_the_next_seat(capsys) -> None:
+    """A headless Chrome that died mid-run failed every later seat: 'browser has been closed'."""
+    browsers = []
+
+    class Headless:
+        def __init__(self) -> None:
+            self.connected, self.contexts = True, 0
+
+        def is_connected(self) -> bool:
+            return self.connected
+
+        async def new_context(self):
+            if not self.connected:
+                raise RuntimeError("Target page, context or browser has been closed")
+            self.contexts += 1
+            raise Opened
+
+    class Chromium:
+        async def launch(self, **options: object) -> Headless:
+            browsers.append(Headless())
+            return browsers[-1]
+
+    enroller = enroll.Enroller(plan_args())
+    target = enroll.targets(plan_args())[0]
+
+    async def go() -> None:
+        await enroller.launch(types.SimpleNamespace(chromium=Chromium()))
+        browsers[0].connected = False
+        await enroller.cli_code(target, "https://app.devin.ai/auth/cli/continue")
+
+    with pytest.raises(Opened):
+        asyncio.run(go())
+    assert len(browsers) == 2
+    assert (browsers[0].contexts, browsers[1].contexts) == (0, 1)
+    assert "relaunching" in capsys.readouterr().out
 
 
 @pytest.fixture

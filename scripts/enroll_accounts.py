@@ -44,6 +44,7 @@ ANY_LOGIN_URL = re.compile(r"https://\S*?cli_pkce_marker=1")
 ANSI = re.compile(rb"\x1b\[[0-9;?]*[A-Za-z]")
 LONG_VALUE = re.compile(r"[A-Za-z0-9_\-\.]{20,}")
 CODE_SUBJECT = 'subject:"Devin Login Code" in:anywhere newer_than:15m'
+TERMS = re.compile("agree to the Terms of Service")
 RATE_LIMIT_WAIT = 300
 OTHER_LOGIN_RETRIES = 3
 CLEANUP_SCRIPT = """
@@ -349,6 +350,8 @@ class Enroller:
             )
             await page.wait_for_timeout(2500)
         await page.get_by_label("Email address").fill(email)
+        if signup:
+            await page.get_by_role("checkbox", name=TERMS).check()
         await page.get_by_role("button", name="Sign up" if signup else "Log in", exact=True).click()
         await page.wait_for_timeout(4000)
         body = await page.inner_text("body")

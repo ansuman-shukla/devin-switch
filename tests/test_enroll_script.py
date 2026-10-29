@@ -93,6 +93,76 @@ def test_redact_hides_code_like_values() -> None:
     assert "Copy your login code" in enroll.redact(text)
 
 
+class AuthForm:
+    """Devin's sign-in page: sign-up sends a code only after the Terms box is ticked."""
+
+    def __init__(self) -> None:
+        self.url, self.form, self.agreed, self.actions = "", "login", False, []
+
+    async def goto(self, url: str, wait_until: str, timeout: int) -> None:
+        self.url, self.form = "https://app.devin.ai/auth/login", "login"
+
+    def get_by_role(self, role: str, name, exact: bool = False) -> "AuthControl":
+        return AuthControl(self, role, name.pattern if hasattr(name, "pattern") else name)
+
+    def get_by_label(self, label: str) -> "AuthControl":
+        return AuthControl(self, "textbox", label)
+
+    async def wait_for_timeout(self, ms: int) -> None:
+        pass
+
+    async def inner_text(self, selector: str) -> str:
+        if self.form == "signup" and not self.agreed:
+            return "Please agree before signing up."
+        return "We've sent a code to your email"
+
+
+class AuthControl:
+    def __init__(self, page: AuthForm, role: str, name: str) -> None:
+        self.page, self.role, self.name = page, role, name
+
+    def or_(self, other: "AuthControl") -> "AuthControl":
+        return self
+
+    @property
+    def first(self) -> "AuthControl":
+        return self
+
+    async def click(self) -> None:
+        self.page.actions.append(("click", self.role, self.name))
+        if self.role == "link" and self.name == "Sign up":
+            self.page.form = "signup"
+
+    async def fill(self, value: str) -> None:
+        self.page.actions.append(("fill", self.name, value))
+
+    async def check(self) -> None:
+        if self.page.form != "signup" or "Terms of Service" not in self.name:
+            raise AssertionError(f"No {self.name!r} checkbox on the {self.page.form} form")
+        self.page.agreed = True
+        self.page.actions.append(("check", self.name))
+
+
+def test_signup_ticks_the_terms_box_before_asking_for_a_code() -> None:
+    page = AuthForm()
+    enroller = enroll.Enroller(plan_args())
+    assert asyncio.run(enroller.request_code(page, "https://x", "me+1@gmail.com", signup=True))
+    assert page.actions[-2:] == [
+        ("check", enroll.TERMS.pattern),
+        ("click", "button", "Sign up"),
+    ]
+
+
+def test_login_does_not_look_for_a_terms_box() -> None:
+    page = AuthForm()
+    enroller = enroll.Enroller(plan_args())
+    assert asyncio.run(enroller.request_code(page, "https://x", "me+1@gmail.com", signup=False))
+    assert page.actions == [
+        ("fill", "Email address", "me+1@gmail.com"),
+        ("click", "button", "Log in"),
+    ]
+
+
 @pytest.fixture
 def fake_playwright(monkeypatch: pytest.MonkeyPatch):
     browser = FakeBrowser()

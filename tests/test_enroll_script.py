@@ -163,6 +163,44 @@ def test_login_does_not_look_for_a_terms_box() -> None:
     ]
 
 
+class Opened(Exception):
+    pass
+
+
+def test_devin_pages_open_in_a_separate_headless_chrome() -> None:
+    launched, contexts = [], []
+
+    class Context:
+        async def new_page(self):
+            raise Opened
+
+        async def close(self) -> None:
+            contexts.append("closed")
+
+    class Headless:
+        async def new_context(self) -> Context:
+            contexts.append("new")
+            return Context()
+
+    class Chromium:
+        async def launch(self, **options: object) -> Headless:
+            launched.append(options)
+            return Headless()
+
+    enroller = enroll.Enroller(plan_args())
+    enroller.browser = FakeBrowser()
+    target = enroll.targets(plan_args())[0]
+
+    async def go() -> None:
+        await enroller.launch(types.SimpleNamespace(chromium=Chromium()))
+        await enroller.cli_code(target, "https://app.devin.ai/auth/cli/continue")
+
+    with pytest.raises(Opened):
+        asyncio.run(go())
+    assert launched == [{"channel": "chrome", "headless": True}]
+    assert contexts == ["new", "closed"]
+
+
 @pytest.fixture
 def fake_playwright(monkeypatch: pytest.MonkeyPatch):
     browser = FakeBrowser()
@@ -230,12 +268,16 @@ def fake_enroller(monkeypatch, failures: dict[str, int], browser: FakeBrowser) -
 
     class Enroller:
         def __init__(self, args: argparse.Namespace) -> None:
-            self.browser = browser
+            self.browser, self.launched = browser, False
 
         async def connect(self, playwright) -> None:
             pass
 
+        async def launch(self, playwright) -> None:
+            self.launched = True
+
         async def enroll(self, target) -> str:
+            assert self.launched, "Devin's headless browser was never started"
             calls.append(target.alias)
             if failures.get(target.alias, 0) > 0:
                 failures[target.alias] -= 1

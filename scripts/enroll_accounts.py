@@ -10,7 +10,7 @@ For every number N in [--first, --last] this:
 1. creates a Chrome profile folder "Plus N" (no Google account) and registers
    `<prefix>-<alias>` bound to it with `ds add`, unless it already exists;
 2. runs `ds login` in a private PTY and reads the one-time sign-in URL;
-3. opens that URL in a fresh, isolated browser context, signs up (or logs in)
+3. opens that URL in a fresh context of a separate headless Chrome, signs up (or logs in)
    as `you+N@gmail.com`, and reads Devin's emailed code from the signed-in
    Gmail tab, checking the recipient;
 4. picks the organization with the requested plan, then types the CLI code
@@ -308,6 +308,10 @@ class Enroller:
             "remote debugging is enabled, then retry."
         )
 
+    async def launch(self, playwright) -> None:
+        """A separate headless Chrome for Devin's pages, so nothing opens on screen."""
+        self.devin = await playwright.chromium.launch(channel="chrome", headless=True)
+
     async def search(self, query: str) -> None:
         await self.gmail.evaluate("location.hash = '#inbox'")
         await self.gmail.wait_for_timeout(1500)
@@ -360,7 +364,7 @@ class Enroller:
         return "We've sent" in body
 
     async def cli_code(self, target: Target, url: str) -> str:
-        context = await self.browser.new_context()
+        context = await self.devin.new_context()
         try:
             page = await context.new_page()
             sent = await self.request_code(page, url, target.email, signup=True)
@@ -436,6 +440,7 @@ async def run(args: argparse.Namespace, plan: list[Target]) -> int:
     async with async_playwright() as playwright:
         enroller = Enroller(args)
         await enroller.connect(playwright)
+        await enroller.launch(playwright)
         pending = list(plan)
         for attempt in range(1, args.passes + 1):
             failed = []

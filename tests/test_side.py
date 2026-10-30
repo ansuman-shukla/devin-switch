@@ -1,10 +1,6 @@
 import asyncio
 import json
-import os
-import subprocess
-import sys
-from pathlib import Path
-from subprocess import PIPE
+from urllib.parse import quote
 
 import pytest
 from test_acp import acp_native as acp_native  # noqa: F401 (a fixture)
@@ -20,83 +16,80 @@ from test_acp import (
 from devin_switch import acp, side
 from devin_switch.store import SwitchError
 
-WINDOW = 4242
+QUOTED = (
+    '\n<quoted_artifact kind="message" event_id="agent_message:1" author="devin">\n'
+    "<caption>/btw and this?</caption>\n<content>\nx = 1\ny &lt; 2\n</content>\n</quoted_artifact>"
+)
 
 
-class Panel:
-    """A Desktop window's side panel, talking to `ds side view` like the extension does."""
-
-    def __init__(self, process):
-        self.process = process
-        self.sequence = 0
-        self.pending = {}
-        self.events = []
-        self.pump = asyncio.create_task(self.read())
-
-    @classmethod
-    async def open(cls, store, host_pid=WINDOW):
-        process = await asyncio.create_subprocess_exec(
-            sys.executable,
-            "-m",
-            "devin_switch",
-            "side",
-            "view",
-            "--host-pid",
-            str(host_pid),
-            env={
-                **os.environ,
-                "DS_HOME": str(store.root),
-                "PYTHONPATH": str(Path(__file__).resolve().parents[1] / "src"),
-            },
-            stdin=asyncio.subprocess.PIPE,
-            stdout=asyncio.subprocess.PIPE,
-        )
-        return cls(process)
-
-    async def read(self):
-        while line := await self.process.stdout.readline():
-            message = json.loads(line)
-            if "ok" in message and (future := self.pending.pop(message["id"], None)):
-                future.set_result(message)
-            else:
-                self.events.append(message)
-
-    def start(self, op, **fields):
-        self.sequence += 1
-        future = asyncio.get_running_loop().create_future()
-        self.pending[self.sequence] = future
-        line = json.dumps({"id": self.sequence, "op": op, **fields}) + "\n"
-        self.process.stdin.write(line.encode())
-        return self.sequence, future
-
-    async def ask(self, op, **fields):
-        _, future = self.start(op, **fields)
-        return await asyncio.wait_for(future, 15)
-
-    def updates(self, identifier):
-        return [
-            event["update"]
-            for event in self.events
-            if event.get("id") == identifier and event.get("event") == "update"
-        ]
-
-    def answers(self, identifier):
-        return [
-            json.loads(update["content"]["text"])
-            for update in self.updates(identifier)
-            if update["sessionUpdate"] == "agent_message_chunk"
-        ]
-
-    async def close(self):
-        self.process.stdin.close()
-        await asyncio.wait_for(self.process.wait(), 10)
-        await self.pump
+def previews(messages):
+    return [
+        update
+        for update in replayed(messages, "tool_call")
+        if update.get("_meta", {}).get("cognition.ai/eventType") == "browser_preview"
+    ]
 
 
-@pytest.fixture
-def window(monkeypatch):
-    """The bridge runs as an agent Desktop started from this window's extension host."""
-    monkeypatch.setenv(side.HOST_VARIABLE, str(WINDOW))
+async def request(port, method, target, body=None, host=None):
+    reader, writer = await asyncio.open_connection("127.0.0.1", port)
+    data = b"" if body is None else json.dumps(body).encode()
+    writer.write(
+        f"{method} {target} HTTP/1.1\r\nHost: {host or f'127.0.0.1:{port}'}\r\n"
+        f"Content-Type: application/json\r\nContent-Length: {len(data)}\r\n\r\n".encode()
+        + data
+    )
+    await writer.drain()
+    status = int((await reader.readline()).split()[1])
+    while (await reader.readline()).strip():
+        pass
+    return status, reader, writer
+
+
+async def fetch(port, method, target, body=None, host=None):
+    status, reader, writer = await request(port, method, target, body, host)
+    content = await asyncio.wait_for(reader.read(), 10)
+    writer.close()
+    return status, content.decode()
+
+
+async def lines(reader, count):
+    """The next JSON lines of a streamed answer (or `data:` lines of the event stream)."""
+    found = []
+    async with asyncio.timeout(10):
+        while len(found) < count:
+            line = (await reader.readline()).decode().strip()
+            assert line or not reader.at_eof(), "stream ended early"
+            if line.startswith("data: "):
+                found.append(json.loads(line[6:]))
+            elif line.startswith("{"):
+                found.append(json.loads(line))
+    return found
+
+
+class Page:
+    """A chat's side page, found through the preview card a /btw puts in the chat."""
+
+    def __init__(self, card):
+        meta = card["_meta"]
+        self.port = meta["cognition.ai/ports"][0]
+        self.path = meta["cognition.ai/path"]
+        self.token = self.path.split("?t=")[1]
+
+    def url(self, route, extra=""):
+        return f"/side/{route}?t={self.token}{extra}"
+
+    async def ask(self, session_id, text, history=()):
+        body = {"sessionId": session_id, "history": list(history), "text": text}
+        status, reader, writer = await request(self.port, "POST", self.url("ask"), body)
+        assert status == 200
+        return reader, writer
+
+
+async def open_page(client, session_id):
+    start = len(client.messages)
+    assert (await client.prompt(session_id, "/btw"))["result"] == {"stopReason": "end_turn"}
+    (card,) = previews(client.messages[start:])
+    return Page(card)
 
 
 def test_prompt_text_carries_the_earlier_side_turns_the_native_forgets():
@@ -109,6 +102,19 @@ def test_prompt_text_carries_the_earlier_side_turns_the_native_forgets():
     for history, text in (([], "  "), ([{"user": "q"}], "x"), ("q", "x"), ([], None)):
         with pytest.raises(SwitchError):
             side.prompt_text(history, text)
+
+
+def test_btw_questions_come_typed_alone_or_as_a_quotes_comment():
+    assert side.btw_question("  /btw why async?  ") == "why async?"
+    assert side.btw_question("/btw") == ""
+    assert side.btw_question("/btwx no") is None
+    assert side.btw_question("why? /btw") is None
+    assert side.btw_question(QUOTED) == "> x = 1\n> y < 2\n\nand this?"
+    plain = QUOTED.replace("/btw and this?", "keep going")
+    assert side.btw_question(plain) is None
+    assert (
+        side.btw_question(plain + "\n/btw what about it?") == "> x = 1\n> y < 2\n\nwhat about it?"
+    )
 
 
 def test_gui_natives_answer_side_questions_that_never_reach_desktop(acp_native, tmp_path):
@@ -143,33 +149,77 @@ def test_gui_natives_answer_side_questions_that_never_reach_desktop(acp_native, 
     asyncio.run(scenario())
 
 
-def test_side_panel_answers_from_the_chat_beside_its_running_turn(acp_native, tmp_path, window):
+def test_btw_opens_the_side_page_in_the_chat_without_waiting_for_the_turn(acp_native, tmp_path):
     async def scenario():
         async with connect(acp_native) as client:
-            other = await client.new(tmp_path / "other")
             session_id = await client.new(tmp_path)
+            turn = asyncio.create_task(client.prompt(session_id, "busy"))
+            await wait_for_text(client, "live progress")
+
+            start = len(client.messages)
+            asked = await asyncio.wait_for(client.prompt(session_id, " /btw why async?"), 5)
+            assert asked["result"] == {"stopReason": "end_turn"}
+            (card,) = previews(client.messages[start:])
+            page = Page(card)
+            assert card["title"] == "Side chat" and card["status"] == "completed"
+            meta = card["_meta"]
+            assert meta["cognition.ai/name"] == "Side chat"
+            assert page.path.startswith(f"/side/{quote(session_id, safe='')}?t=")
+            assert meta["cognition.ai/url"] == f"http://127.0.0.1:{page.port}{page.path}"
+
+            status, html = await fetch(page.port, "GET", page.path)
+            assert status == 200 and f'data-session="{session_id}"' in html
+            status, script = await fetch(page.port, "GET", page.url("assets/side.js"))
+            assert status == 200 and "EventSource" in script
+
+            # The page loads after the card opens it: the question waited for it.
+            target = page.url("events", f"&session={quote(session_id, safe='')}")
+            status, events, stream = await request(page.port, "GET", target)
+            assert status == 200
+            assert await lines(events, 1) == [{"text": "why async?"}]
+
+            start = len(client.messages)
+            await asyncio.wait_for(client.prompt(session_id, QUOTED), 5)
+            assert await lines(events, 1) == [{"text": "> x = 1\n> y < 2\n\nand this?"}]
+            assert previews(client.messages[start:]) == []
+            # A bare /btw shows the open page again without asking anything.
+            await asyncio.wait_for(client.prompt(session_id, "/btw"), 5)
+            assert len(previews(client.messages[start:])) == 1
+            stream.close()
+
+            start = len(client.messages)
+            params = {"sessionId": session_id, "cwd": str(tmp_path), "mcpServers": []}
+            await asyncio.wait_for(client.request("session/load", params), 5)
+            assert len(previews(client.messages[start:])) == 2
+            assert not turn.done()
+            await client.send({"method": "session/cancel", "params": {"sessionId": session_id}})
+            await turn
+
+        assert not any("btw" in (call["text"] or "") for call in logged(acp_native))
+        assert not any("why async" in text for text in client.texts())
+
+    asyncio.run(scenario())
+
+
+def test_side_page_answers_beside_the_running_turn(acp_native, tmp_path):
+    async def scenario():
+        async with connect(acp_native) as client:
+            session_id = await client.new(tmp_path)
+            page = await open_page(client, session_id)
             await client.prompt(session_id, "hello")
             turn = asyncio.create_task(client.prompt(session_id, "busy"))
             await wait_for_text(client, "live progress")
-            panel = await Panel.open(acp_native.store)
-
-            listed = await panel.ask("chats")
-            assert listed["ok"], listed
-            assert [chat["sessionId"] for chat in listed["chats"]] == [session_id, other]
-            assert listed["chats"][0]["title"] == "Test chat"
-            assert listed["chats"][0]["folder"] == str(tmp_path)
 
             history = [{"user": "What is X?", "assistant": "A cache."}]
-            identifier, answer = panel.start(
-                "ask", sessionId=session_id, history=history, text="Shared?"
-            )
-            reply = await asyncio.wait_for(answer, 10)
-            assert reply == {"id": identifier, "ok": True, "stopReason": "end_turn"}
-            (answered,) = panel.answers(identifier)
-            assert answered["side"] == side.prompt_text(history, "Shared?")
-            assert answered["session"] == session_id
-            kinds = [update["sessionUpdate"] for update in panel.updates(identifier)]
+            reader, writer = await page.ask(session_id, "Shared?", history)
+            *updates, done = await lines(reader, 4)
+            writer.close()
+            assert done == {"done": "end_turn"}
+            kinds = [line["update"]["sessionUpdate"] for line in updates]
             assert kinds == ["agent_thought_chunk", "usage_update", "agent_message_chunk"]
+            answer = json.loads(updates[-1]["update"]["content"]["text"])
+            assert answer["side"] == side.prompt_text(history, "Shared?")
+            assert answer["session"] == session_id
             assert not turn.done()
 
             start = len(client.messages)
@@ -181,7 +231,6 @@ def test_side_panel_answers_from_the_chat_beside_its_running_turn(acp_native, tm
             ]
             await client.send({"method": "session/cancel", "params": {"sessionId": session_id}})
             assert (await turn)["result"]["stopReason"] == "cancelled"
-            await panel.close()
 
         assert not any("Shared?" in text for text in client.texts())
         sides = [call for call in logged(acp_native) if call["chain"] == "side"]
@@ -192,32 +241,29 @@ def test_side_panel_answers_from_the_chat_beside_its_running_turn(acp_native, tm
     asyncio.run(scenario())
 
 
-def test_side_panel_stop_ends_only_the_side_answer(acp_native, tmp_path, window):
+def test_side_page_stop_and_leaving_end_only_the_side_answer(acp_native, tmp_path):
     async def scenario():
         async with connect(acp_native) as client:
             session_id = await client.new(tmp_path)
+            page = await open_page(client, session_id)
             turn = asyncio.create_task(client.prompt(session_id, "busy"))
             await wait_for_text(client, "live progress")
-            panel = await Panel.open(acp_native.store)
-            identifier, answer = panel.start(
-                "ask", sessionId=session_id, history=[], text="side-wait"
+
+            reader, writer = await page.ask(session_id, "side-wait")
+            await lines(reader, 3)
+            status, _ = await fetch(
+                page.port, "POST", page.url("cancel"), {"sessionId": session_id}
             )
-            async with asyncio.timeout(10):
-                while not panel.answers(identifier):
-                    await asyncio.sleep(0.02)
-            assert (await panel.ask("cancel", sessionId=session_id))["ok"]
-            assert (await asyncio.wait_for(answer, 10))["stopReason"] == "cancelled"
+            assert status == 200
+            assert await lines(reader, 1) == [{"done": "cancelled"}]
+            writer.close()
             await asyncio.sleep(0.2)
             assert not turn.done()
 
-            # Closing the panel mid-answer stops that answer too.
-            identifier, answer = panel.start(
-                "ask", sessionId=session_id, history=[], text="side-wait"
-            )
-            async with asyncio.timeout(10):
-                while not panel.answers(identifier):
-                    await asyncio.sleep(0.02)
-            await panel.close()
+            # Closing the page mid-answer stops that answer too.
+            reader, writer = await page.ask(session_id, "side-wait")
+            await lines(reader, 3)
+            writer.close()
             async with asyncio.timeout(10):
                 while sum(1 for c in logged(acp_native) if c["method"] == "session/cancel") < 2:
                     await asyncio.sleep(0.02)
@@ -233,141 +279,34 @@ def test_side_panel_stop_ends_only_the_side_answer(acp_native, tmp_path, window)
     asyncio.run(scenario())
 
 
-def test_side_panel_reaches_only_its_own_window_with_the_token(acp_native, tmp_path, window):
+def test_side_page_needs_its_token_and_a_loopback_host(acp_native, tmp_path):
     async def scenario():
         async with connect(acp_native) as client:
             session_id = await client.new(tmp_path)
-            (record,) = side.find(acp_native.store, WINDOW)
-            path = side.records(acp_native.store) / f"{record['pid']}.json"
-            assert path.stat().st_mode & 0o077 == 0
-            assert side.find(acp_native.store, WINDOW + 1) == []
+            page = await open_page(client, session_id)
+            wrong = page.path.replace(page.token, "wrong")
+            assert (await fetch(page.port, "GET", wrong))[0] == 403
+            assert (await fetch(page.port, "GET", page.path.split("?")[0]))[0] == 403
+            assert (await fetch(page.port, "GET", page.path, host="evil.example"))[0] == 403
+            assert (await fetch(page.port, "GET", page.url("assets/x.js")))[0] == 404
+            assert (await fetch(page.port, "GET", page.path, host=f"localhost:{page.port}"))[
+                0
+            ] == 200
 
-            stranger = await Panel.open(acp_native.store, WINDOW + 1)
-            refused = await stranger.ask("chats")
-            assert refused == {"id": 1, "ok": False, "error": side.NO_BRIDGE}
-            await stranger.close()
-
-            reader, writer = await asyncio.open_connection("127.0.0.1", record["port"])
-            writer.write(b'{"token": "wrong"}\n{"id": 1, "op": "chats"}\n')
-            await writer.drain()
-            assert await asyncio.wait_for(reader.read(), 5) == b""
+            reader, writer = await page.ask("not-open", "hi")
+            (refused,) = await lines(reader, 1)
+            assert "isn't open in this window" in refused["error"]
+            writer.close()
+            reader, writer = await page.ask(session_id, " ")
+            assert await lines(reader, 1) == [{"error": "Type a side question first."}]
             writer.close()
 
-            panel = await Panel.open(acp_native.store)
-            missing = await panel.ask("ask", sessionId="not-open", history=[], text="hi")
-            assert not missing["ok"] and "isn't open in this window" in missing["error"]
-            empty = await panel.ask("ask", sessionId=session_id, history=[], text=" ")
-            assert empty["error"] == "Type a side question first."
-            await panel.close()
-        assert list(side.records(acp_native.store).glob("*.json")) == []
+        assert not any(call["chain"] == "side" for call in logged(acp_native))
 
     asyncio.run(scenario())
 
 
-def test_btw_in_a_chat_opens_the_side_panel_without_waiting_for_the_turn(
-    acp_native, tmp_path, window
-):
-    async def scenario():
-        async with connect(acp_native) as client:
-            session_id = await client.new(tmp_path)
-            local = [
-                item
-                for item in replayed(client.messages, "available_commands_update")[-1][
-                    "availableCommands"
-                ]
-                if item["name"] == "btw"
-            ]
-            assert local == [entry for entry in acp.LOCAL_COMMANDS if entry["name"] == "btw"]
-            turn = asyncio.create_task(client.prompt(session_id, "busy"))
-            await wait_for_text(client, "live progress")
-            panel = await Panel.open(acp_native.store)
-            assert (await panel.ask("chats"))["ok"]
-
-            asked = await asyncio.wait_for(
-                client.prompt(session_id, "  /btw why is this async?"), 5
-            )
-            assert asked["result"] == {"stopReason": "end_turn"}
-            async with asyncio.timeout(5):
-                while not panel.events:
-                    await asyncio.sleep(0.02)
-            assert panel.events == [
-                {"event": "ask", "sessionId": session_id, "text": "why is this async?"}
-            ]
-            assert not turn.done()
-            await panel.close()
-
-            await asyncio.wait_for(client.prompt(session_id, "/btw"), 5)
-            assert client.texts()[-1] == "Send /btw followed by your question.\n\n"
-            await client.send({"method": "session/cancel", "params": {"sessionId": session_id}})
-            await turn
-
-            # Asked just before the window's panel found this bridge (e.g. right after a reload).
-            early = asyncio.create_task(client.prompt(session_id, "/btw asked early"))
-            await asyncio.sleep(0.5)
-            assert not early.done()
-            panel = await Panel.open(acp_native.store)
-            assert (await asyncio.wait_for(early, side.PUSH_WAIT + 2))["result"]
-            async with asyncio.timeout(5):
-                while not panel.events:
-                    await asyncio.sleep(0.02)
-            assert panel.events[0]["text"] == "asked early"
-            await panel.close()
-
-            # A window without the panel says how to get it.
-            await client.prompt(session_id, "/btw anyone there?")
-            assert client.texts()[-1] == acp.SIDE_PANEL_MISSING + "\n\n"
-
-        assert not any("btw" in (call["text"] or "") for call in logged(acp_native))
-        start = [m for m in client.messages if m.get("method") == "session/update"]
-        assert not any(
-            "btw" in str(m["params"]["update"].get("content", ""))
-            for m in start
-            if m["params"]["update"]["sessionUpdate"] == "user_message_chunk"
-        )
-
-    asyncio.run(scenario())
-
-
-def write_record(store, pid, host_pid, port, token="t0k"):
-    folder = side.records(store)
-    folder.mkdir(exist_ok=True)
-    record = {"pid": pid, "host_pid": host_pid, "port": port, "token": token}
-    (folder / f"{pid}.json").write_text(json.dumps(record))
-    return folder / f"{pid}.json"
-
-
-def test_side_records_of_crashed_bridges_are_dropped(store):
-    exited = subprocess.run((sys.executable, "-c", "import os; print(os.getpid())"), stdout=PIPE)
-    stale = write_record(store, int(exited.stdout), WINDOW, 1)
-    other = write_record(store, os.getpid(), WINDOW + 1, 2)
-    assert side.find(store, WINDOW) == []
-    assert not stale.exists() and other.exists()
-    assert side.find(store, WINDOW + 1) == [json.loads(other.read_text())]
-
-
-def test_side_panel_hears_when_its_bridge_goes_away_mid_answer(store):
-    async def scenario():
-        heard = []
-
-        async def vanishing_bridge(reader, writer):
-            heard.append(json.loads(await reader.readline()))
-            heard.append(json.loads(await reader.readline()))
-            writer.close()
-
-        server = await asyncio.start_server(vanishing_bridge, "127.0.0.1", 0)
-        write_record(store, os.getpid(), WINDOW, server.sockets[0].getsockname()[1])
-        panel = await Panel.open(store)
-        reply = await panel.ask("ask", sessionId="s", history=[], text="hi")
-        assert reply == {"id": 1, "ok": False, "error": side.BRIDGE_GONE}
-        assert heard[0] == {"token": "t0k"}
-        assert heard[1] == {"id": 1, "op": "ask", "sessionId": "s", "history": [], "text": "hi"}
-        await panel.close()
-        server.close()
-
-    asyncio.run(scenario())
-
-
-def test_side_question_reconnects_a_chat_released_for_idleness(acp_native, tmp_path, window):
+def test_side_question_reconnects_a_chat_released_for_idleness(acp_native, tmp_path):
     async def scenario():
         async with in_process(acp_native) as (bridge, messages):
             result = await bridge.dispatch("session/new", {"cwd": str(tmp_path), "mcpServers": []})

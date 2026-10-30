@@ -1,7 +1,6 @@
 import asyncio
 import copy
 import json
-import os
 import platform
 import subprocess
 import sys
@@ -46,7 +45,7 @@ LOCAL_COMMANDS = [
     },
     {
         "name": "btw",
-        "description": "Ask a side question in the Switch side panel; this chat keeps working",
+        "description": "Ask on the side in a Side chat tab; this chat keeps working",
         "input": {"hint": "question"},
     },
 ]
@@ -124,10 +123,6 @@ STILL_CLOSING = (
     "This chat's previous agent is still shutting down after Devin reloaded its agents "
     "(it is never force-killed). Send your message again in a few seconds."
 )
-SIDE_PANEL_MISSING = (
-    "The Switch side panel isn't running in this window. Install it once with "
-    "`ds panels install` in Terminal, reload the window, then ask again."
-)
 BLANK_RELEASED = (
     "This empty chat was closed after 15 idle minutes to free its agent. Nothing was sent "
     "to the model; start a new chat."
@@ -167,6 +162,12 @@ def prompt_command(params: dict) -> tuple[list, list[str], str]:
         command = "/switch-continue" if "--continue" in options else "/switch"
         words = [command, *(word for word in options if word != "--continue")]
     return blocks, words, command
+
+
+def prompt_text(params: dict) -> str:
+    return "\n".join(
+        block.get("text", "") for block in params.get("prompt", []) if block.get("type") == "text"
+    )
 
 
 def is_local_command(command: str) -> bool:
@@ -832,9 +833,8 @@ class Bridge:
             self.ready = True
             self.spawn(self.refill())
             self.spawn(self.prune_runs())
-            if (host := os.environ.get(side.HOST_VARIABLE, "")).isdigit():
-                self.side_server = side.Server(self, int(host))
-                await self.side_server.start()
+            self.side_server = side.Server(self)
+            await self.side_server.start()
             return result
         if not self.ready:
             raise RpcError("Initialize the GUI bridge first.", -32600)
@@ -869,9 +869,12 @@ class Bridge:
                 return {}
             raise RpcError("Load the exact saved conversation before using it.", -32602)
         chat = self.chats[session_id]
-        if method == "session/prompt" and prompt_command(params)[2] == "/btw":
-            # Answered in the side panel, so it never waits for (or joins) this chat's turn.
-            return await self.side_question(chat, params)
+        if (
+            method == "session/prompt"
+            and (question := side.btw_question(prompt_text(params))) is not None
+        ):
+            # Answered on the chat's side page, so it never waits for (or joins) the turn.
+            return await self.side_question(chat, question)
         if method in SIDE_REQUESTS and chat.suspended and await self.held_elsewhere(session_id):
             # The native answers this for a chat it hasn't loaded; Desktop ignores it quietly.
             raise RpcError("Session not found: this chat is open in another window.", -32602)
@@ -1012,26 +1015,6 @@ class Bridge:
         own = {backend.lease.run.id for backend in self.backends if backend.lease}
         return await asyncio.to_thread(acp_state.held_elsewhere, self.native.store, session_id, own)
 
-    async def side_chats(self):
-        """This window's open chats for the side panel, the most recently active first."""
-        rows = await asyncio.to_thread(sessions.history, self.native.store)
-        titles = {row["id"]: row["title"] for row in rows}
-        now = time.monotonic()
-        chats = sorted(
-            (chat for chat in self.chats.values() if not (chat.suspended and chat.blank)),
-            key=lambda chat: chat.backend.last_activity,
-            reverse=True,
-        )
-        return [
-            {
-                "sessionId": chat.session_id,
-                "title": titles.get(chat.session_id) or "New chat",
-                "folder": str(chat.backend.project),
-                "idleSeconds": int(now - chat.backend.last_activity),
-            }
-            for chat in chats
-        ]
-
     async def side_ask(self, session_id, text, sink):
         """Answer a side question from the chat's context, beside any running turn.
 
@@ -1039,7 +1022,9 @@ class Bridge:
         """
         chat = self.chats.get(session_id)
         if chat is None:
-            raise SwitchError("This chat isn't open in this window anymore. Pick another chat.")
+            raise SwitchError(
+                "This chat isn't open in this window anymore. Reopen it, then ask again."
+            )
         async with chat.side:
             if chat.suspended:
                 if await self.held_elsewhere(session_id):
@@ -1063,20 +1048,27 @@ class Bridge:
                 self.side_sinks.pop(backend, None)
             return {"stopReason": result.get("stopReason")}
 
-    async def side_question(self, chat, params):
-        """A /btw typed in the chat: the window's side panel opens and answers it."""
-        blocks = prompt_command(params)[0]
-        text = next(block["text"] for block in blocks if block.get("type") == "text")
-        text = text.strip().removeprefix("/btw").strip()
-        if not text:
-            await self.note(chat.session_id, "Send /btw followed by your question.")
-        elif not (
-            self.side_server
-            and await self.side_server.push(
-                {"event": "ask", "sessionId": chat.session_id, "text": text}
-            )
-        ):
-            await self.note(chat.session_id, SIDE_PANEL_MISSING)
+    async def side_question(self, chat, question):
+        """A /btw typed in the chat: its side page answers it in the chat's "Side chat" preview.
+
+        An open page gets the question directly; otherwise the preview opens and the page asks
+        once it loads. Nothing reaches the chat's agent or waits for its turn.
+        """
+        server = self.side_server
+        if question:
+            showing = server.showing(chat.session_id)
+            server.ask(chat.session_id, question)
+            if showing:
+                return {"stopReason": "end_turn"}
+        message = {
+            "jsonrpc": "2.0",
+            "method": "session/update",
+            "params": {"sessionId": chat.session_id, "update": server.preview(chat.session_id)},
+        }
+        # Recorded, so a reload during a turn still shows the preview card.
+        chat.backend.record(message)
+        async with chat.backend.emitting:
+            await self.emit(message)
         return {"stopReason": "end_turn"}
 
     async def side_cancel(self, session_id):

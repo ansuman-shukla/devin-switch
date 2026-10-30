@@ -5,31 +5,40 @@ With `cognition.ai/chains` offered at initialize, the native runs a `session/pro
 even beside a running turn, and tags each notification of that answer the same way. Every side
 prompt forks afresh, so a follow-up carries the earlier side exchange in its text.
 
-Each bridge serves its Desktop window's side panel on a loopback port. The panel's `ds side
-view` helper finds that port through a record naming the window's extension host, which
-Desktop passes to the agents it starts as WINDSURF_EXT_HOST_PID.
+The bridge serves each chat's side page on loopback behind a random token. A `/btw` typed in
+the chat opens it inside Desktop's agents view, in the chat's own preview tab: the bridge emits
+the `browser_preview` tool call Desktop turns into a named preview of a local port. An editor
+panel would not do: Desktop switches the agents view to IDE mode for any editor tab.
 """
 
 import asyncio
+import html
 import json
-import os
+import re
 import secrets
-import sys
+import uuid
 from contextlib import suppress
 from pathlib import Path
+from urllib.parse import parse_qs, quote, unquote, urlsplit
 
-from devin_switch.store import Store, SwitchError, write_json
+from devin_switch.store import SwitchError
 
 CHAIN = "cognition.ai/chain"
 SIDE = {CHAIN: "side"}
 CAPABILITY = "cognition.ai/chains"
-HOST_VARIABLE = "WINDSURF_EXT_HOST_PID"
-MAX_LINE = 8 * 1024 * 1024
-RECONNECT_DELAY = 2.0
-# A just-started bridge waits this long for the window's panel helper to find it.
-PUSH_WAIT = 2 * RECONNECT_DELAY
-NO_BRIDGE = "No Switch chat is open in this window yet. Open a chat with the Devin Switch agent."
-BRIDGE_GONE = "This window's Switch agent closed before answering. Ask again."
+PREVIEW_NAME = "Side chat"
+PAGE = Path(__file__).parent / "side_page"
+ASSETS = {
+    "side.css": "text/css",
+    "side.js": "text/javascript",
+    "side-thread.js": "text/javascript",
+    "markdown.js": "text/javascript",
+}
+MAX_BODY = 1024 * 1024
+KEEPALIVE = 15
+QUOTE = re.compile(r"<quoted_artifact\b[^>]*>(.*?)</quoted_artifact>", re.S)
+CAPTION = re.compile(r"<caption>(.*?)</caption>", re.S)
+CONTENT = re.compile(r"<content>(.*?)</content>", re.S)
 
 
 def is_side(message: dict) -> bool:
@@ -55,232 +64,218 @@ def prompt_text(history: object, text: object) -> str:
     return f"<side_chat_history>\n{turns}\n</side_chat_history>\n\n{text}"
 
 
-def records(store: Store) -> Path:
-    return store.root / "side"
+def is_btw(text: str) -> bool:
+    return text == "/btw" or text.startswith(("/btw ", "/btw\n"))
 
 
-def alive(pid: int) -> bool:
-    try:
-        os.kill(pid, 0)
-    except ProcessLookupError:
-        return False
-    except PermissionError:
-        return True
-    return True
+def btw_question(text: str) -> str | None:
+    """The side question of a prompt starting with /btw, typed alone or as a quote's comment.
 
-
-def find(store: Store, host_pid: int) -> list[dict]:
-    """Live bridges of one window, newest first; records of exited bridges are removed."""
-    found = []
-    for path in records(store).glob("*.json"):
-        try:
-            record = json.loads(path.read_text())
-            pid, host = int(record["pid"]), int(record["host_pid"])
-            int(record["port"]), str(record["token"])
-            modified = path.stat().st_mtime
-        except (OSError, ValueError, KeyError, TypeError):
-            continue
-        if not alive(pid):
-            path.unlink(missing_ok=True)
-        elif host == host_pid:
-            found.append((modified, record))
-    return [record for _, record in sorted(found, key=lambda item: item[0], reverse=True)]
-
-
-class Client:
-    def __init__(self, writer: asyncio.StreamWriter):
-        self.writer = writer
-        self.lock = asyncio.Lock()
-        self.asking: dict[object, str] = {}
-
-    async def send(self, message: dict) -> None:
-        async with self.lock:
-            if self.writer.is_closing():
-                return
-            self.writer.write((json.dumps(message) + "\n").encode())
-            with suppress(OSError):
-                await self.writer.drain()
+    Desktop sends a quoted chat message as a `<quoted_artifact>` whose `<caption>` holds what
+    was typed with it; the quoted text goes along as a Markdown quote. None: not a /btw.
+    """
+    rest, quoted, comments = text.strip(), [], []
+    while found := QUOTE.match(rest):
+        caption, content = CAPTION.search(found.group(1)), CONTENT.search(found.group(1))
+        comments.append(html.unescape(caption.group(1)).strip() if caption else "")
+        if content and (lines := html.unescape(content.group(1)).strip()):
+            quoted.append("\n".join(f"> {line}" for line in lines.splitlines()))
+        rest = rest[found.end() :].strip()
+    asked = next((part for part in (rest, *comments) if is_btw(part)), None)
+    if asked is None:
+        return None
+    return "\n\n".join([*quoted, asked.removeprefix("/btw").strip()]).strip()
 
 
 class Server:
-    """The side panel's door into this bridge: JSON lines over loopback, after a token."""
+    """Each chat's side page, for Desktop's in-chat preview: loopback HTTP behind a token."""
 
-    def __init__(self, bridge, host_pid: int):
+    def __init__(self, bridge):
         self.bridge = bridge
-        self.host_pid = host_pid
-        self.token = secrets.token_hex(16)
-        self.path = records(bridge.native.store) / f"{os.getpid()}.json"
-        self.server = None
-        self.clients: set[Client] = set()
-        self.listening = asyncio.Event()
+        self.token = secrets.token_urlsafe(24)
+        self.port = None
+        self.servers = []
+        self.listeners: dict[str, set[asyncio.Queue]] = {}
+        self.waiting: dict[str, list[str]] = {}
 
     async def start(self) -> None:
-        self.server = await asyncio.start_server(self.serve, "127.0.0.1", 0, limit=MAX_LINE)
-        port = self.server.sockets[0].getsockname()[1]
-        self.path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-        # write_json's temporary file is private (0600) before it takes the record's name.
-        record = {"pid": os.getpid(), "host_pid": self.host_pid, "port": port, "token": self.token}
-        await asyncio.to_thread(write_json, self.path, record)
+        server = await asyncio.start_server(self.serve, "127.0.0.1", 0)
+        self.port = server.sockets[0].getsockname()[1]
+        self.servers = [server]
+        # The preview shows localhost:<port>, which may resolve to ::1 first.
+        with suppress(OSError):
+            self.servers.append(await asyncio.start_server(self.serve, "::1", self.port))
 
     async def close(self) -> None:
-        self.path.unlink(missing_ok=True)
-        if self.server:
-            self.server.close()
-        for client in list(self.clients):
-            client.writer.close()
+        for server in self.servers:
+            server.close()
+        for queues in self.listeners.values():
+            for queue in queues:
+                queue.put_nowait(None)
 
-    async def push(self, event: dict) -> bool:
-        """Send an event to every connected panel; False when none is listening."""
-        if not self.clients:
-            with suppress(TimeoutError):
-                await asyncio.wait_for(self.listening.wait(), PUSH_WAIT)
-        clients = list(self.clients)
-        for client in clients:
-            await client.send(event)
-        return bool(clients)
+    def path(self, session_id: str) -> str:
+        return f"/side/{quote(session_id, safe='')}?t={self.token}"
+
+    def preview(self, session_id: str) -> dict:
+        """The tool call Desktop shows as a "Side chat" preview of the chat's side page."""
+        path = self.path(session_id)
+        return {
+            "sessionUpdate": "tool_call",
+            "toolCallId": f"switch-side-{uuid.uuid4().hex}",
+            "title": PREVIEW_NAME,
+            "kind": "other",
+            "status": "completed",
+            "_meta": {
+                "cognition.ai/eventType": "browser_preview",
+                "cognition.ai/name": PREVIEW_NAME,
+                "cognition.ai/ports": [self.port],
+                "cognition.ai/path": path,
+                "cognition.ai/url": f"http://127.0.0.1:{self.port}{path}",
+            },
+        }
+
+    def showing(self, session_id: str) -> bool:
+        return bool(self.listeners.get(session_id))
+
+    def ask(self, session_id: str, text: str) -> None:
+        """Hand a /btw question to the chat's open side page, or keep it until one opens."""
+        if queues := self.listeners.get(session_id):
+            for queue in queues:
+                queue.put_nowait(text)
+        else:
+            self.waiting.setdefault(session_id, []).append(text)
 
     async def serve(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
-        client = Client(writer)
-        tasks = set()
         try:
-            hello = json.loads(await reader.readline() or b"null")
-            if not isinstance(hello, dict) or not secrets.compare_digest(
-                str(hello.get("token", "")), self.token
+            method, target, headers, body = await read_request(reader)
+            url = urlsplit(target)
+            query = {key: values[0] for key, values in parse_qs(url.query).items()}
+            allowed = {f"{host}:{self.port}" for host in ("127.0.0.1", "localhost", "[::1]")}
+            if headers.get("host") not in allowed or not secrets.compare_digest(
+                query.get("t", ""), self.token
             ):
-                return
-            self.clients.add(client)
-            self.listening.set()
-            while line := await reader.readline():
-                task = asyncio.create_task(self.handle(client, line))
-                tasks.add(task)
-                task.add_done_callback(tasks.discard)
-        except (ValueError, OSError):
-            pass
-        finally:
-            self.clients.discard(client)
-            if not self.clients:
-                self.listening.clear()
-            # A closed panel can't read its answers; stop them instead of paying for them.
-            for session_id in set(client.asking.values()):
-                with suppress(SwitchError, OSError):
-                    await self.bridge.side_cancel(session_id)
-            writer.close()
-
-    async def handle(self, client: Client, line: bytes) -> None:
-        request: dict = {}
-        try:
-            request = json.loads(line)
-            if not isinstance(request, dict):
-                raise ValueError
-            identifier, op = request.get("id"), request.get("op")
-            if op == "chats":
-                result = {"chats": await self.bridge.side_chats()}
-            elif op == "ask":
-                session_id = str(request.get("sessionId"))
-                text = prompt_text(request.get("history", []), request.get("text"))
-
-                async def forward(update):
-                    await client.send({"id": identifier, "event": "update", "update": update})
-
-                client.asking[identifier] = session_id
-                try:
-                    result = await self.bridge.side_ask(session_id, text, forward)
-                finally:
-                    client.asking.pop(identifier, None)
-            elif op == "cancel":
-                await self.bridge.side_cancel(str(request.get("sessionId")))
-                result = {}
-            else:
-                raise SwitchError(f"Unknown side request {op!r}.")
-            await client.send({"id": identifier, "ok": True, **result})
-        except (SwitchError, OSError, ValueError, TypeError, KeyError) as exc:
-            text = str(exc) if isinstance(exc, SwitchError) else "Invalid side request."
-            await client.send({"id": request.get("id"), "ok": False, "error": text})
-
-
-async def view(store: Store, host_pid: int) -> None:
-    """Serve one Desktop window's side panel over stdio, through that window's bridge.
-
-    Stays connected while the window has a Switch bridge, so pushed events (a /btw typed in
-    a chat) reach the panel; reconnects when the bridge is replaced.
-    """
-    loop = asyncio.get_running_loop()
-    stdin = asyncio.StreamReader(limit=MAX_LINE)
-    await loop.connect_read_pipe(lambda: asyncio.StreamReaderProtocol(stdin), sys.stdin)
-    transport, protocol = await loop.connect_write_pipe(
-        asyncio.streams.FlowControlMixin, sys.stdout
-    )
-    stdout = asyncio.StreamWriter(transport, protocol, None, loop)
-    bridge: asyncio.StreamWriter | None = None
-    pending: set = set()
-    pumps: set[asyncio.Task] = set()
-    connecting = asyncio.Lock()
-
-    async def emit(message: dict) -> None:
-        stdout.write((json.dumps(message) + "\n").encode())
-        await stdout.drain()
-
-    async def pump(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
-        nonlocal bridge
-        try:
-            while line := await reader.readline():
-                message = json.loads(line)
-                if "ok" in message:
-                    pending.discard(message.get("id"))
-                await emit(message)
-        except (ValueError, OSError):
-            pass
-        finally:
-            if bridge is writer:
-                bridge = None
-                for identifier in list(pending):
-                    pending.discard(identifier)
-                    await emit({"id": identifier, "ok": False, "error": BRIDGE_GONE})
-            writer.close()
-
-    async def connect() -> asyncio.StreamWriter | None:
-        nonlocal bridge
-        async with connecting:
-            if bridge is not None:
-                return bridge
-            for record in await asyncio.to_thread(find, store, host_pid):
-                try:
-                    reader, writer = await asyncio.open_connection(
-                        "127.0.0.1", record["port"], limit=MAX_LINE
-                    )
-                    writer.write((json.dumps({"token": record["token"]}) + "\n").encode())
-                    await writer.drain()
-                except OSError:
-                    continue
-                bridge = writer
-                task = asyncio.create_task(pump(reader, writer))
-                pumps.add(task)
-                task.add_done_callback(pumps.discard)
-                return bridge
-            return None
-
-    async def keep_connected() -> None:
-        while True:
-            await connect()
-            await asyncio.sleep(RECONNECT_DELAY)
-
-    keeper = asyncio.create_task(keep_connected())
-    try:
-        while line := await stdin.readline():
-            try:
-                request = json.loads(line)
-                identifier = request.get("id") if isinstance(request, dict) else None
-            except ValueError:
-                continue
-            writer = await connect()
-            if writer is None:
-                await emit({"id": identifier, "ok": False, "error": NO_BRIDGE})
-                continue
-            pending.add(identifier)
-            writer.write(line if line.endswith(b"\n") else line + b"\n")
+                return await respond(writer, 403, "Forbidden")
+            route = url.path
+            if method == "GET" and route.startswith("/side/assets/"):
+                name = route.removeprefix("/side/assets/")
+                if name not in ASSETS:
+                    return await respond(writer, 404, "Not found")
+                return await respond(writer, 200, (PAGE / name).read_bytes(), ASSETS[name])
+            if method == "GET" and route == "/side/events":
+                return await self.events(writer, query.get("session", ""))
+            if method == "POST" and route == "/side/ask":
+                return await self.answer(reader, writer, json.loads(body))
+            if method == "POST" and route == "/side/cancel":
+                await self.bridge.side_cancel(str(json.loads(body).get("sessionId")))
+                return await respond(writer, 200, "{}", "application/json")
+            if method == "GET" and route.startswith("/side/") and route.count("/") == 2:
+                return await respond(writer, 200, self.page(unquote(route[6:])), "text/html")
+            await respond(writer, 404, "Not found")
+        except (ValueError, AttributeError, OSError, asyncio.IncompleteReadError):
             with suppress(OSError):
+                await respond(writer, 400, "Bad request")
+        finally:
+            writer.close()
+
+    def page(self, session_id: str) -> str:
+        token = html.escape(self.token)
+        assets = lambda name: f"/side/assets/{name}?t={token}"  # noqa: E731
+        scripts = "".join(
+            f'<script src="{assets(name)}"></script>'
+            for name in ("side-thread.js", "markdown.js", "side.js")
+        )
+        return (
+            '<!doctype html><html><head><meta charset="utf-8"><title>Side chat</title>'
+            '<meta name="viewport" content="width=device-width, initial-scale=1">'
+            f'<link rel="stylesheet" href="{assets("side.css")}"></head>'
+            f'<body data-session="{html.escape(session_id)}" data-token="{token}">'
+            f"{scripts}</body></html>"
+        )
+
+    async def events(self, writer: asyncio.StreamWriter, session_id: str) -> None:
+        """Server-sent /btw questions for one chat's side page."""
+        queue: asyncio.Queue = asyncio.Queue()
+        for text in self.waiting.pop(session_id, []):
+            queue.put_nowait(text)
+        self.listeners.setdefault(session_id, set()).add(queue)
+        try:
+            writer.write(head(200, "text/event-stream"))
+            await writer.drain()
+            while True:
+                try:
+                    text = await asyncio.wait_for(queue.get(), KEEPALIVE)
+                except TimeoutError:
+                    writer.write(b": keepalive\n\n")
+                else:
+                    if text is None:
+                        return
+                    writer.write(f"data: {json.dumps({'text': text})}\n\n".encode())
                 await writer.drain()
-    finally:
-        keeper.cancel()
-        if bridge is not None:
-            bridge.close()
+        except OSError:
+            pass
+        finally:
+            self.listeners[session_id].discard(queue)
+            if not self.listeners[session_id]:
+                del self.listeners[session_id]
+
+    async def answer(
+        self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter, request: dict
+    ) -> None:
+        """Stream one side answer as JSON lines; a page that goes away stops the answer."""
+        session_id = str(request.get("sessionId"))
+
+        async def send(message: dict) -> None:
+            if writer.is_closing():
+                return
+            with suppress(OSError):
+                writer.write((json.dumps(message) + "\n").encode())
+                await writer.drain()
+
+        async def watch() -> None:
+            # The page sends nothing more, so end of input means it closed or reloaded.
+            with suppress(OSError):
+                await reader.read()
+            writer.close()
+            await self.bridge.side_cancel(session_id)
+
+        writer.write(head(200, "application/x-ndjson"))
+        watcher = asyncio.create_task(watch())
+        try:
+            text = prompt_text(request.get("history", []), request.get("text"))
+            result = await self.bridge.side_ask(
+                session_id, text, lambda update: send({"update": update})
+            )
+            await send({"done": result["stopReason"]})
+        except SwitchError as exc:
+            await send({"error": str(exc)})
+        finally:
+            watcher.cancel()
+
+
+async def read_request(reader: asyncio.StreamReader) -> tuple[str, str, dict, bytes]:
+    method, target, _ = (await reader.readline()).decode("latin-1").split(" ", 2)
+    headers = {}
+    while (line := (await reader.readline()).decode("latin-1").strip()) != "":
+        name, _, value = line.partition(":")
+        headers[name.strip().lower()] = value.strip()
+    length = int(headers.get("content-length") or 0)
+    if not 0 <= length <= MAX_BODY:
+        raise ValueError("body too large")
+    return method, target, headers, await reader.readexactly(length) if length else b""
+
+
+def head(status: int, content_type: str) -> bytes:
+    reason = {200: "OK", 400: "Bad Request", 403: "Forbidden", 404: "Not Found"}[status]
+    return (
+        f"HTTP/1.1 {status} {reason}\r\nContent-Type: {content_type}; charset=utf-8\r\n"
+        "Cache-Control: no-store\r\nX-Content-Type-Options: nosniff\r\n"
+        "Content-Security-Policy: default-src 'self'\r\n"
+        "Connection: close\r\n\r\n"
+    ).encode()
+
+
+async def respond(
+    writer: asyncio.StreamWriter, status: int, body: str | bytes, kind: str = "text/plain"
+) -> None:
+    writer.write(head(status, kind) + (body.encode() if isinstance(body, str) else body))
+    await writer.drain()

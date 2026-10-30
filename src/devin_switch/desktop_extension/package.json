@@ -1,8 +1,8 @@
 {
   "name": "panels",
   "displayName": "Switch Panels",
-  "description": "Live whiteboard and agent browser beside the chat.",
-  "version": "0.1.0",
+  "description": "Live whiteboard, agent browser and side chat beside the chat.",
+  "version": "0.2.0",
   "publisher": "devin-switch",
   "license": "Apache-2.0",
   "engines": { "vscode": "^1.90.0" },
@@ -12,8 +12,31 @@
   "contributes": {
     "commands": [
       { "command": "switchPanels.openCanvas", "title": "Open Whiteboard", "category": "Switch" },
-      { "command": "switchPanels.openBrowser", "title": "Open Agent Browser", "category": "Switch" }
+      { "command": "switchPanels.openBrowser", "title": "Open Agent Browser", "category": "Switch" },
+      { "command": "switchPanels.openSideChat", "title": "Open Side Chat", "category": "Switch" },
+      { "command": "switchPanels.askOnSide", "title": "Ask on the Side", "category": "Switch" }
     ],
+    "keybindings": [
+      {
+        "command": "switchPanels.askOnSide",
+        "key": "ctrl+alt+b",
+        "mac": "ctrl+cmd+b",
+        "when": "editorTextFocus && editorHasSelection",
+        "args": { "from": "selection" }
+      },
+      {
+        "command": "switchPanels.askOnSide",
+        "key": "ctrl+alt+b",
+        "mac": "ctrl+cmd+b",
+        "when": "!editorTextFocus || !editorHasSelection",
+        "args": { "from": "clipboard" }
+      }
+    ],
+    "menus": {
+      "editor/context": [
+        { "command": "switchPanels.askOnSide", "when": "editorHasSelection", "group": "9_cutcopypaste@99" }
+      ]
+    },
     "configuration": {
       "title": "Switch Panels",
       "properties": {

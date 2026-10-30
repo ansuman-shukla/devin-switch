@@ -7,6 +7,7 @@ const { Cdp } = require('./cdp');
 const { BrowserView } = require('./browser');
 const { CanvasPanels } = require('./canvas');
 const { Helper } = require('./helper');
+const { SidePanel, sideQuote } = require('./side');
 const { WhiteboardHost, whiteboardHome } = require('./whiteboard');
 
 const STATUS_POLL_MS = 5000;
@@ -168,7 +169,22 @@ function activate(context) {
     onShow: ({ canvasId, url, title }) => canvases.show(canvasId, url, title),
   });
   host.start();
+  // This extension host started the window's chats, so its pid finds their Switch bridge.
+  const sideHelper = new Helper(config.command, ['side', 'view', '--host-pid', String(process.pid)]);
+  const side = new SidePanel(vscode, context.extensionUri, sideHelper);
+  // Started now and kept running, so a /btw typed in a chat can open the panel.
+  sideHelper.onEvent((event) => event?.event === 'ask' && side.question(event.sessionId, event.text));
+  sideHelper.ensure();
+  const askOnSide = async (args) => {
+    const { text, source } = await sideQuote(vscode, args);
+    if (text) side.quote(text, source);
+    else side.show();
+  };
   context.subscriptions.push(
+    { dispose: () => side.dispose() },
+    { dispose: () => sideHelper.dispose() },
+    vscode.commands.registerCommand('switchPanels.openSideChat', () => side.show()),
+    vscode.commands.registerCommand('switchPanels.askOnSide', (args) => askOnSide(args).catch(report)),
     status,
     { dispose: () => clearInterval(timer) },
     { dispose: () => helper.dispose() },

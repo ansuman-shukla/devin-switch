@@ -131,7 +131,7 @@ def parser() -> argparse.ArgumentParser:
         "--host-pid", type=int, required=True, help="The Desktop window's extension host"
     )
     side = commands.add_parser(
-        "panels", help="Install the Desktop side panels (whiteboard, agent browser)"
+        "panels", help="Install the Desktop side panels (whiteboard, agent browser, side chat)"
     )
     side_actions = side.add_subparsers(dest="action", required=True, metavar="ACTION")
     side_actions.add_parser("install", help="Install or update the panels extension")

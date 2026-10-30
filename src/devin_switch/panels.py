@@ -1,4 +1,4 @@
-"""Desktop side panels: the live whiteboard and the agent browser, beside the chat."""
+"""Desktop side panels: the live whiteboard, the agent browser and side chat, beside the chat."""
 
 import json
 import os
@@ -114,7 +114,8 @@ def install() -> str:
     return "\n".join(
         (
             f"Installed the Switch panels {version} into the Desktop app.",
-            "Commands: 'Switch: Open Whiteboard' and 'Switch: Open Agent Browser'.",
+            "Commands: 'Switch: Open Whiteboard', 'Switch: Open Agent Browser' and "
+            "'Switch: Ask on the Side' (ctrl+cmd+B; /btw in a chat).",
             "Whiteboards from chats now open beside the chat in the window showing their folder.",
             "If the commands are missing, run 'Developer: Reload Window' once.",
         )

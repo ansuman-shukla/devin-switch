@@ -4,24 +4,62 @@ const assert = require('node:assert/strict');
 const thread = require('../../src/devin_switch/side_page/side-thread');
 const { renderMarkdown } = require('../../src/devin_switch/side_page/markdown');
 
-test('only finished turns become history, and updates build the answer', () => {
-  let turn = { user: 'q', assistant: '', status: 'answering', activity: 'Asking…' };
-  turn = thread.applyUpdate(turn, { sessionUpdate: 'agent_thought_chunk', content: { type: 'text', text: 'hmm' } });
-  assert.equal(turn.activity, 'Thinking…');
-  turn = thread.applyUpdate(turn, { sessionUpdate: 'tool_call', title: 'Read app.py' });
-  assert.equal(turn.activity, 'Looking at Read app.py…');
-  turn = thread.applyUpdate(turn, { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'A ' } });
-  turn = thread.applyUpdate(turn, { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'cache.' } });
-  turn = thread.applyUpdate(turn, { sessionUpdate: 'agent_thought_chunk', content: { type: 'text', text: 'more' } });
-  turn = thread.applyUpdate(turn, { sessionUpdate: 'usage_update', used: 1 });
-  assert.deepEqual(turn, { user: 'q', assistant: 'A cache.', status: 'answering', activity: '' });
-  const done = thread.finish(turn, 'end_turn');
-  const stopped = thread.finish({ ...turn, user: 'q2' }, 'cancelled');
-  assert.equal(done.status, 'done');
+const thought = (text) => ({ sessionUpdate: 'agent_thought_chunk', content: { type: 'text', text } });
+const message = (text) => ({ sessionUpdate: 'agent_message_chunk', content: { type: 'text', text } });
+
+test('updates stream the thoughts, the tool steps and the answer apart', () => {
+  let turn = thread.newTurn('q');
+  assert.deepEqual(turn, { user: 'q', assistant: '', status: 'answering', thoughts: '', steps: [], thinkingSince: null, thoughtMs: 0 });
+  turn = thread.applyUpdate(turn, thought('Let me '), 1000);
+  turn = thread.applyUpdate(turn, thought('check.'), 1500);
+  turn = thread.applyUpdate(turn, { sessionUpdate: 'tool_call', toolCallId: 't1', title: 'Read app.py', kind: 'read' }, 2000);
+  turn = thread.applyUpdate(turn, { sessionUpdate: 'tool_call', toolCallId: 't2', title: 'Searched cache' }, 2100);
+  turn = thread.applyUpdate(turn, { sessionUpdate: 'tool_call_update', toolCallId: 't1', status: 'in_progress' }, 2200);
+  turn = thread.applyUpdate(turn, { sessionUpdate: 'tool_call_update', toolCallId: 't1', status: 'completed', title: 'Read app.py#L1-40' }, 2500);
+  turn = thread.applyUpdate(turn, { sessionUpdate: 'tool_call_update', toolCallId: 't2', status: 'failed' }, 2600);
+  turn = thread.applyUpdate(turn, { sessionUpdate: 'tool_call_update', toolCallId: 'unknown', status: 'completed' }, 2700);
+  assert.equal(turn.thoughts, 'Let me check.');
+  assert.deepEqual(turn.steps, [
+    { id: 't1', title: 'Read app.py#L1-40', status: 'completed' },
+    { id: 't2', title: 'Searched cache', status: 'failed' },
+  ]);
+  assert.equal(turn.thinkingSince, 1000);
+  assert.equal(thread.thinkingLabel(turn), 'Thinking');
+
+  turn = thread.applyUpdate(turn, message('A '), 7000);
+  turn = thread.applyUpdate(turn, message('cache.'), 7100);
+  turn = thread.applyUpdate(turn, { sessionUpdate: 'usage_update', used: 1 }, 7200);
+  assert.equal(turn.assistant, 'A cache.');
+  assert.deepEqual([turn.thinkingSince, turn.thoughtMs], [null, 6000]);
+  assert.equal(thread.thinkingLabel(turn), 'Thought for 6s');
+
+  // Thinking again later adds to the time, and finishing closes it.
+  turn = thread.applyUpdate(turn, thought(' More.'), 8000);
+  assert.equal(thread.thinkingLabel(turn), 'Thinking');
+  const done = thread.finish(turn, 'end_turn', 9000);
+  assert.deepEqual([done.status, done.thinkingSince, done.thoughtMs, done.thoughts], ['done', null, 7000, 'Let me check. More.']);
+  assert.equal(thread.thinkingLabel(done), 'Thought for 7s');
+});
+
+test('the thinking label rounds the time and is absent without thoughts or steps', () => {
+  const finished = (thoughtMs) => ({ ...thread.newTurn('q'), status: 'done', thoughts: 'x', thoughtMs });
+  assert.equal(thread.thinkingLabel(finished(400)), 'Thought for 1s');
+  assert.equal(thread.thinkingLabel(finished(59_400)), 'Thought for 59s');
+  assert.equal(thread.thinkingLabel(finished(65_000)), 'Thought for 1m 5s');
+  assert.equal(thread.thinkingLabel({ ...finished(0), thoughts: '', steps: [{ id: 't', title: 'Read a', status: 'completed' }] }), 'Thought for 1s');
+  assert.equal(thread.thinkingLabel(thread.newTurn('q')), null);
+  assert.equal(thread.thinkingLabel(thread.finish(thread.applyUpdate(thread.newTurn('q'), message('hi'), 5), 'end_turn', 9)), null);
+  // Turns saved by the older page have no thinking fields.
+  assert.equal(thread.thinkingLabel({ user: 'q', assistant: 'a', status: 'done', activity: '' }), null);
+});
+
+test('only finished turns become history', () => {
+  const answered = thread.finish(thread.applyUpdate(thread.newTurn('q'), message('A cache.'), 1), 'end_turn', 2);
+  const stopped = thread.finish({ ...answered, user: 'q2' }, 'cancelled', 3);
   assert.equal(stopped.status, 'stopped');
-  const failed = { user: 'q3', assistant: '', status: 'error', error: 'x' };
-  const empty = { user: 'q4', assistant: '', status: 'done' };
-  assert.deepEqual(thread.historyOf([done, stopped, failed, empty]), [{ user: 'q', assistant: 'A cache.' }]);
+  const failed = { ...thread.newTurn('q3'), status: 'error', error: 'x' };
+  const empty = thread.finish(thread.applyUpdate(thread.newTurn('q4'), thought('hmm'), 1), 'end_turn', 2);
+  assert.deepEqual(thread.historyOf([answered, stopped, failed, empty]), [{ user: 'q', assistant: 'A cache.' }]);
 });
 
 test('answers render code, lists and emphasis but never markup from the text', () => {

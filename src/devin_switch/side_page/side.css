@@ -40,6 +40,26 @@ button.primary { background: var(--accent); color: var(--accent-fg); border-colo
 .empty { margin: auto; max-width: 320px; text-align: center; color: var(--muted); }
 .user { align-self: flex-end; max-width: 90%; padding: 4px 10px; border-radius: 10px; background: var(--bubble); }
 .answer:empty { display: none; }
+.thinking summary { list-style: none; cursor: pointer; width: fit-content; }
+.thinking summary::-webkit-details-marker { display: none; }
+.thinking-label { color: var(--muted); font-size: 13px; }
+.thinking summary .thinking-label::after { content: "›"; display: inline-block; margin-left: 6px; transition: transform 0.15s; }
+.thinking[open] summary .thinking-label::after { transform: rotate(90deg); }
+.thinking-label.live {
+  background: linear-gradient(90deg, var(--muted) 0%, var(--fg) 50%, var(--muted) 100%) 0 0 / 200% 100%;
+  -webkit-background-clip: text;
+  background-clip: text;
+  color: transparent;
+  animation: shimmer 1.6s linear infinite;
+}
+@keyframes shimmer { to { background-position: -200% 0; } }
+.thinking-body { margin: 6px 0 4px 2px; padding-left: 12px; border-left: 2px solid var(--border); color: var(--muted); font-size: 12.5px; }
+.thoughts p { margin: 4px 0; }
+.steps { list-style: none; margin: 4px 0; padding: 0; }
+.step::before { content: "•"; margin-right: 6px; }
+.step.completed::before { content: "✓"; }
+.step.failed { text-decoration: line-through; }
+.step.failed::before { content: "✕"; }
 .note { font-size: 12px; color: var(--muted); font-style: italic; }
 .note.error { color: var(--error); font-style: normal; }
 .user p, .answer p { margin: 4px 0; }

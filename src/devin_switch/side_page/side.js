@@ -2,7 +2,7 @@
 // The side page of one chat, shown in a Browser tab of the chat. Questions go to the Switch
 // bridge that served it; /btw typed in the chat arrives as a server-sent event.
 (() => {
-  const { historyOf, applyUpdate, finish, takeLines } = window.SideThread;
+  const { newTurn, historyOf, applyUpdate, finish, thinkingLabel, takeLines } = window.SideThread;
   const { renderMarkdown } = window.SideMarkdown;
   const { session, token } = document.body.dataset;
   const url = (path, extra = '') => `/side/${path}?t=${encodeURIComponent(token)}${extra}`;
@@ -18,9 +18,11 @@
     turns = JSON.parse(localStorage.getItem(key) || '[]');
   } catch {}
   // A page reloaded mid-answer can't resume it.
-  turns = turns.map((t) => (t.status === 'answering' ? { ...t, status: 'stopped', activity: '' } : t));
+  turns = turns.map((t) => (t.status === 'answering' ? finish(t, 'cancelled') : t));
   let asking = false;
   const queued = [];
+  // Thinking blocks the reader opened or closed by hand, by turn index.
+  const toggled = new Map();
   const save = () => localStorage.setItem(key, JSON.stringify(turns));
 
   const transcript = el('div', { className: 'transcript' });
@@ -43,6 +45,7 @@
   function newThread() {
     if (asking) return;
     turns = [];
+    toggled.clear();
     save();
     render();
   }
@@ -55,16 +58,48 @@
       return;
     }
     transcript.replaceChildren(
-      ...turns.flatMap((turn) => {
+      ...turns.flatMap((turn, index) => {
         const user = el('div', { className: 'user' });
         user.innerHTML = renderMarkdown(turn.user); // renderMarkdown escapes everything first
         const answer = el('div', { className: 'answer' });
         answer.innerHTML = renderMarkdown(turn.assistant);
-        const note = turn.error || turn.activity || (turn.status === 'stopped' ? 'Stopped.' : '');
-        return [user, answer, ...(note ? [el('div', { className: turn.error ? 'note error' : 'note', textContent: note })] : [])];
+        const waiting = turn.status === 'answering' && !turn.assistant && !thinkingLabel(turn);
+        const note = turn.error || (turn.status === 'stopped' ? 'Stopped.' : '');
+        return [
+          user,
+          ...(waiting ? [el('div', { className: 'thinking-label live', textContent: 'Thinking' })] : []),
+          ...thinkingBlock(turn, index),
+          answer,
+          ...(note ? [el('div', { className: turn.error ? 'note error' : 'note', textContent: note })] : []),
+        ];
       }),
     );
     transcript.scrollTop = transcript.scrollHeight;
+  }
+
+  /** ChatGPT-style thoughts: streamed open while thinking, then folded into "Thought for 6s". */
+  function thinkingBlock(turn, index) {
+    const label = thinkingLabel(turn);
+    if (!label) return [];
+    const live = turn.thinkingSince != null && turn.status === 'answering';
+    const block = el('details', { className: 'thinking', open: toggled.get(index) ?? live });
+    const summary = el('summary', {}, [el('span', { className: live ? 'thinking-label live' : 'thinking-label', textContent: label })]);
+    const body = el('div', { className: 'thinking-body' });
+    if (turn.thoughts) {
+      const thoughts = el('div', { className: 'thoughts' });
+      thoughts.innerHTML = renderMarkdown(turn.thoughts);
+      body.append(thoughts);
+    }
+    if (turn.steps?.length) {
+      body.append(el('ul', { className: 'steps' }, turn.steps.map((step) => el('li', { className: `step ${step.status}`, textContent: step.title }))));
+    }
+    block.append(summary, body);
+    summary.addEventListener('click', (event) => {
+      event.preventDefault();
+      toggled.set(index, !block.open);
+      block.open = !block.open;
+    });
+    return [block];
   }
 
   function update(change) {
@@ -77,7 +112,7 @@
     if (!question.trim()) return;
     if (asking) return void queued.push(question);
     const history = historyOf(turns);
-    turns.push({ user: question.trim(), assistant: '', status: 'answering', activity: 'Asking…' });
+    turns.push(newTurn(question.trim()));
     asking = true;
     input.value = '';
     save();
@@ -96,18 +131,22 @@
         for (const message of messages) {
           if (message.update) update((turn) => applyUpdate(turn, message.update));
           else if (message.done) (update((turn) => finish(turn, message.done)), (ended = true));
-          else if (message.error) (update((turn) => ({ ...turn, status: 'error', activity: '', error: message.error })), (ended = true));
+          else if (message.error) (update((turn) => fail(turn, message.error)), (ended = true));
         }
       }
-      if (!ended) update((turn) => ({ ...turn, status: 'error', activity: '', error: 'The Switch agent closed before answering. Ask again.' }));
+      if (!ended) update((turn) => fail(turn, 'The Switch agent closed before answering. Ask again.'));
     } catch {
-      update((turn) => ({ ...turn, status: 'error', activity: '', error: 'Could not reach the Switch agent. Reopen the chat and ask again.' }));
+      update((turn) => fail(turn, 'Could not reach the Switch agent. Reopen the chat and ask again.'));
     } finally {
       asking = false;
       render();
       input.focus();
       if (queued.length) ask(queued.shift());
     }
+  }
+
+  function fail(turn, error) {
+    return { ...finish(turn, 'cancelled'), status: 'error', error };
   }
 
   function stop() {

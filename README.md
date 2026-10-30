@@ -349,45 +349,10 @@ Agents (or you) can copy other items with
 `ds browser status` lists profiles and running instances, and `ds browser stop` closes them
 immediately. The server runs `npx -y chrome-devtools-mcp@1.10.1`, so Node.js is required.
 
-### Watch the agent's browser and canvas, and ask on the side
-
-`ds panels install` adds three panels to Devin Desktop (a small extension with no dependencies):
-
-```
-┌──────────── chat ────────────┬──────── Agent Browser / Canvas ────────┐
-│ you: why does login fail?    │ [profile ▾] ← → ⟳ [ address      ] ⦿ + │
-│ agent: opening the app…      │ ┌────────────────────────────────────┐ │
-│                              │ │  live view of the agent's Chrome   │ │
-│                              │ │  (click, type, scroll to take over)│ │
-│                              │ └────────────────────────────────────┘ │
-└──────────────────────────────┴────────────────────────────────────────┘
-```
-
-- **Agent Browser** (`Switch: Open Agent Browser`, or the globe in the status bar while an agent
-  browser runs) streams the agent's headless Chrome. It follows the tab the agent is using,
-  and you can click, type, paste, scroll, navigate, open tabs or pick another Chrome profile.
-  While the panel is open it holds the browser like a chat does, so Chrome stays open after
-  the agent is done; closing the panel releases it.
-- **Whiteboard** shows boards from
-  [whiteboard-mcp](https://github.com/ansuman-shukla/whiteboard-mcp). Each chat gets its own
-  board, and when the agent explains something visually it opens beside the chat in that chat's
-  own window, in its own tab named after the board. Other chats' boards keep their tabs, and a
-  window never shows a board from a chat in another window (that window has to run the panels
-  too: reload windows opened before an update). The extension connects to the whiteboard daemon
-  directly, so no browser tab and no restart of open chats is needed.
-  `Switch: Open Whiteboard` lists this workspace's boards (newest first) so you can reopen one
-  yourself. Setting `switchPanels.whiteboardHome` points at a non-default `WHITEBOARD_HOME`.
-- **Side chat** answers questions about a chat without interrupting it or adding anything to
-  it, even while its agent is working. Copy text from the chat (or select code in an editor)
-  and press `⌃⌘B` (`Switch: Ask on the Side`, also in the editor's right-click menu), or type
-  `/btw your question` in the chat. The side agent sees the chat's conversation and can read
-  files, but can't edit, run commands or ask you questions. Follow-ups work: each question is
-  sent with the earlier side turns, so long side threads cost a little more per turn. `Stop`
-  ends only the side answer, and `New` starts a fresh thread. Threads are kept per chat until
-  the panel is closed. It works with chats run through the Devin Switch agent in that window.
+### Keep a whiteboard per chat
 
 Switch gives chats `WHITEBOARD_CHAT_COMMAND="ds chat id"` (unless you set it), so a chat keeps
-its board across account handoffs. `ds panels status` shows the installed version.
+its board across account handoffs.
 
 ### Switch accounts inside Devin Desktop (experimental)
 
@@ -558,9 +523,7 @@ extension.
 | `ds browser refresh PROFILE` | Copy a Chrome profile's logins into its agent profile again |
 | `ds chrome copy ITEM... --to DIR --reason TEXT` | Copy from Chrome's data folder, asking with a popup when macOS blocks it |
 | `ds browser stop [PROFILE]` | Close running agent browsers now |
-| `ds panels install` / `ds panels status` | Install or check the Desktop Agent Browser, Canvas and Side chat panels |
 | `ds chat id` | Print the conversation a Desktop chat's process belongs to |
-| `ds side view --host-pid PID` | Serve a Desktop window's side chat panel over stdio (started by the panel) |
 
 `ds verify` makes no model request. Matching history across accounts is separate from a
 successful inference request; different credential files alone do not prove distinct users

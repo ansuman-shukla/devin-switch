@@ -108,7 +108,6 @@ def parser() -> argparse.ArgumentParser:
     stop = actions.add_parser("stop", help="Close running agent browsers now")
     stop.add_argument("profile", nargs="?")
     actions.add_parser("mcp", help="Serve the browser MCP server over stdio (started by Devin)")
-    actions.add_parser("view", help="Serve the Desktop browser panel over stdio (JSON lines)")
     chrome = commands.add_parser(
         "chrome", help="Copy from Chrome's data folder, asking with a popup when macOS blocks it"
     )
@@ -122,20 +121,6 @@ def parser() -> argparse.ArgumentParser:
     chat = commands.add_parser("chat", help="Inspect the Desktop chat this process belongs to")
     chat_actions = chat.add_subparsers(dest="action", required=True, metavar="ACTION")
     chat_actions.add_parser("id", help="Print the conversation id (used by the whiteboard MCP)")
-    side_chat = commands.add_parser("side", help="Serve the Desktop side chat panel")
-    side_chat_actions = side_chat.add_subparsers(dest="action", required=True, metavar="ACTION")
-    side_view = side_chat_actions.add_parser(
-        "view", help="Serve one window's side chat panel over stdio (JSON lines)"
-    )
-    side_view.add_argument(
-        "--host-pid", type=int, required=True, help="The Desktop window's extension host"
-    )
-    side = commands.add_parser(
-        "panels", help="Install the Desktop side panels (whiteboard, agent browser, side chat)"
-    )
-    side_actions = side.add_subparsers(dest="action", required=True, metavar="ACTION")
-    side_actions.add_parser("install", help="Install or update the panels extension")
-    side_actions.add_parser("status", help="Show whether the panels extension is installed")
     supervise = actions.add_parser("_supervise")
     supervise.add_argument("profile")
     supervise.add_argument("--token", required=True)
@@ -187,21 +172,10 @@ def execute(args: argparse.Namespace, store: Store) -> int:
         from devin_switch import agent_browser
 
         return agent_browser.command(args, store)
-    if args.command == "panels":
-        from devin_switch import panels
-
-        return panels.command(args)
     if args.command == "chat":
         from devin_switch import acp_state
 
         print(acp_state.current_chat(store))
-        return 0
-    if args.command == "side":
-        import asyncio
-
-        from devin_switch import side
-
-        asyncio.run(side.view(store, args.host_pid))
         return 0
     if args.command == "acp":
         import asyncio

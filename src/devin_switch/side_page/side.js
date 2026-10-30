@@ -25,14 +25,30 @@
   const toggled = new Map();
   const save = () => localStorage.setItem(key, JSON.stringify(turns));
 
-  const transcript = el('div', { className: 'transcript' });
-  const input = el('textarea', { rows: 3, placeholder: 'Ask on the side… (Enter to send, Shift+Enter for a new line)' });
-  const send = el('button', { type: 'button', className: 'primary', textContent: 'Send', onclick: () => (asking ? stop() : ask(input.value)) });
-  const fresh = el('button', { type: 'button', textContent: 'New', title: 'Start a new side thread', onclick: () => newThread() });
+  const STARTERS = ['What is this chat about?', 'Summarize what has been done so far', 'What is left to do?', 'Explain the last change'];
+  const ICONS = {
+    send: '<svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="true"><path d="M12 19V5M5 12l7-7 7 7" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"/></svg>',
+    stop: '<svg viewBox="0 0 24 24" width="14" height="14" aria-hidden="true"><rect x="5" y="5" width="14" height="14" rx="2.5" fill="currentColor"/></svg>',
+    down: '<svg viewBox="0 0 24 24" width="16" height="16" aria-hidden="true"><path d="M12 5v14M5 12l7 7 7-7" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/></svg>',
+  };
+  const NEAR_BOTTOM = 48;
+  const MAX_INPUT = 200;
+
+  const column = el('div', { className: 'column' });
+  const transcript = el('div', { className: 'transcript' }, [column]);
+  const input = el('textarea', { rows: 1, placeholder: 'Ask on the side' });
+  const send = el('button', { type: 'button', className: 'send', onclick: () => (asking ? stop() : ask(input.value)) });
+  const jump = el('button', { type: 'button', className: 'jump', title: 'Scroll to the latest', hidden: true, onclick: () => toBottom('smooth') });
+  jump.innerHTML = ICONS.down;
+  const fresh = el('button', { type: 'button', className: 'new', textContent: 'New', title: 'Start a new side thread', onclick: () => newThread() });
   document.body.append(
-    el('div', { className: 'toolbar' }, [el('strong', { textContent: 'Side chat' }), el('span', { className: 'hint', textContent: 'The chat keeps working and never sees this.' }), fresh]),
+    el('div', { className: 'toolbar' }, [el('strong', { textContent: 'Side chat' }), fresh]),
     transcript,
-    el('div', { className: 'composer' }, [el('div', { className: 'row' }, [input, send])]),
+    el('div', { className: 'composer' }, [
+      jump,
+      el('div', { className: 'pill' }, [input, send]),
+      el('div', { className: 'footer', textContent: 'The main chat keeps working and never sees this.' }),
+    ]),
   );
 
   input.addEventListener('keydown', (event) => {
@@ -41,6 +57,28 @@
       if (!asking) ask(input.value);
     }
   });
+  input.addEventListener('input', () => (fitInput(), renderSend()));
+  transcript.addEventListener('scroll', () => (jump.hidden = nearBottom()));
+
+  function fitInput() {
+    input.style.height = 'auto';
+    input.style.height = `${Math.min(input.scrollHeight, MAX_INPUT)}px`;
+  }
+
+  function nearBottom() {
+    return transcript.scrollHeight - transcript.scrollTop - transcript.clientHeight < NEAR_BOTTOM;
+  }
+
+  function toBottom(behavior = 'auto') {
+    transcript.scrollTo({ top: transcript.scrollHeight, behavior });
+  }
+
+  function renderSend() {
+    send.innerHTML = asking ? ICONS.stop : ICONS.send;
+    send.title = asking ? 'Stop' : 'Send';
+    send.classList.toggle('stop', asking);
+    send.disabled = !asking && !input.value.trim();
+  }
 
   function newThread() {
     if (asking) return;
@@ -50,14 +88,24 @@
     render();
   }
 
-  function render() {
-    send.textContent = asking ? 'Stop' : 'Send';
+  /** Redraws the thread; it follows the stream only while the reader is at the bottom. */
+  function render(follow = false) {
+    renderSend();
     fresh.disabled = asking;
+    const stick = follow || nearBottom();
+    const top = transcript.scrollTop;
     if (!turns.length) {
-      transcript.replaceChildren(el('div', { className: 'empty' }, ['Ask anything about this chat, or type /btw … in the chat itself.']));
+      column.replaceChildren(
+        el('div', { className: 'empty' }, [
+          el('h2', { textContent: 'Ask on the side' }),
+          el('p', { textContent: 'Questions here see this chat but never interrupt it. You can also type /btw … in the chat.' }),
+          el('div', { className: 'starters' }, STARTERS.map((text) => el('button', { type: 'button', textContent: text, onclick: () => ask(text) }))),
+        ]),
+      );
+      jump.hidden = true;
       return;
     }
-    transcript.replaceChildren(
+    column.replaceChildren(
       ...turns.flatMap((turn, index) => {
         const user = el('div', { className: 'user' });
         user.innerHTML = renderMarkdown(turn.user); // renderMarkdown escapes everything first
@@ -74,7 +122,9 @@
         ];
       }),
     );
-    transcript.scrollTop = transcript.scrollHeight;
+    if (stick) toBottom();
+    else transcript.scrollTop = top;
+    jump.hidden = nearBottom();
   }
 
   /** ChatGPT-style thoughts: streamed open while thinking, then folded into "Thought for 6s". */
@@ -115,8 +165,9 @@
     turns.push(newTurn(question.trim()));
     asking = true;
     input.value = '';
+    fitInput();
     save();
-    render();
+    render(true);
     try {
       const response = await fetch(url('ask'), { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ sessionId: session, history, text: question.trim() }) });
       const reader = response.body.getReader();
@@ -156,6 +207,6 @@
   // /btw typed in the chat; EventSource reconnects by itself while the bridge runs.
   new EventSource(url('events', `&session=${encodeURIComponent(session)}`)).onmessage = (event) => ask(JSON.parse(event.data).text);
 
-  render();
+  render(true);
   input.focus();
 })();

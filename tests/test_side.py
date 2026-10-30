@@ -301,6 +301,18 @@ def test_btw_in_a_chat_opens_the_side_panel_without_waiting_for_the_turn(
             await client.send({"method": "session/cancel", "params": {"sessionId": session_id}})
             await turn
 
+            # Asked just before the window's panel found this bridge (e.g. right after a reload).
+            early = asyncio.create_task(client.prompt(session_id, "/btw asked early"))
+            await asyncio.sleep(0.5)
+            assert not early.done()
+            panel = await Panel.open(acp_native.store)
+            assert (await asyncio.wait_for(early, side.PUSH_WAIT + 2))["result"]
+            async with asyncio.timeout(5):
+                while not panel.events:
+                    await asyncio.sleep(0.02)
+            assert panel.events[0]["text"] == "asked early"
+            await panel.close()
+
             # A window without the panel says how to get it.
             await client.prompt(session_id, "/btw anyone there?")
             assert client.texts()[-1] == acp.SIDE_PANEL_MISSING + "\n\n"

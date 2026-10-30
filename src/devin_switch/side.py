@@ -26,6 +26,8 @@ CAPABILITY = "cognition.ai/chains"
 HOST_VARIABLE = "WINDSURF_EXT_HOST_PID"
 MAX_LINE = 8 * 1024 * 1024
 RECONNECT_DELAY = 2.0
+# A just-started bridge waits this long for the window's panel helper to find it.
+PUSH_WAIT = 2 * RECONNECT_DELAY
 NO_BRIDGE = "No Switch chat is open in this window yet. Open a chat with the Devin Switch agent."
 BRIDGE_GONE = "This window's Switch agent closed before answering. Ask again."
 
@@ -110,6 +112,7 @@ class Server:
         self.path = records(bridge.native.store) / f"{os.getpid()}.json"
         self.server = None
         self.clients: set[Client] = set()
+        self.listening = asyncio.Event()
 
     async def start(self) -> None:
         self.server = await asyncio.start_server(self.serve, "127.0.0.1", 0, limit=MAX_LINE)
@@ -128,6 +131,9 @@ class Server:
 
     async def push(self, event: dict) -> bool:
         """Send an event to every connected panel; False when none is listening."""
+        if not self.clients:
+            with suppress(TimeoutError):
+                await asyncio.wait_for(self.listening.wait(), PUSH_WAIT)
         clients = list(self.clients)
         for client in clients:
             await client.send(event)
@@ -143,6 +149,7 @@ class Server:
             ):
                 return
             self.clients.add(client)
+            self.listening.set()
             while line := await reader.readline():
                 task = asyncio.create_task(self.handle(client, line))
                 tasks.add(task)
@@ -151,6 +158,8 @@ class Server:
             pass
         finally:
             self.clients.discard(client)
+            if not self.clients:
+                self.listening.clear()
             # A closed panel can't read its answers; stop them instead of paying for them.
             for session_id in set(client.asking.values()):
                 with suppress(SwitchError, OSError):

@@ -45,8 +45,82 @@ async function whiteboard(method, route, body) {
   return { status: res.status, body: await res.json() };
 }
 
+/** Minimal ACP client for a `ds acp` bridge started as this window's agent. */
+function startBridge() {
+  const { spawn } = require('node:child_process');
+  const [command, ...args] = JSON.parse(env.PANELS_DS);
+  // Desktop starts agents with its extension host's pid; the side panel finds the bridge by it.
+  const child = spawn(command, [...args, 'acp'], { env: { ...env, WINDSURF_EXT_HOST_PID: String(process.pid) }, stdio: ['pipe', 'pipe', 'ignore'] });
+  const pending = new Map();
+  const notes = [];
+  let buffer = '';
+  let next = 0;
+  child.stdout.setEncoding('utf8');
+  child.stdout.on('data', (chunk) => {
+    buffer += chunk;
+    let index;
+    while ((index = buffer.indexOf('\n')) >= 0) {
+      const message = JSON.parse(buffer.slice(0, index));
+      buffer = buffer.slice(index + 1);
+      if (message.method === 'session/update' && message.params.update.sessionUpdate === 'agent_message_chunk') notes.push(message.params.update.content.text);
+      if (pending.has(message.id) && !message.method) {
+        pending.get(message.id)(message);
+        pending.delete(message.id);
+      }
+    }
+  });
+  const request = (method, params) =>
+    new Promise((resolve) => {
+      const id = ++next;
+      pending.set(id, resolve);
+      child.stdin.write(`${JSON.stringify({ jsonrpc: '2.0', id, method, params })}\n`);
+    });
+  return { request, notes, close: () => child.stdin.end() };
+}
+
+const sidePrompts = () =>
+  fs.existsSync(env.FAKE_ACP_LOG)
+    ? fs.readFileSync(env.FAKE_ACP_LOG, 'utf8').split('\n').filter(Boolean).map(JSON.parse).filter((c) => c.chain === 'side').map((c) => c.text)
+    : [];
+
+/** /btw typed in a chat opens the real side panel, which asks, shows the answer and follows up. */
+async function sideChat(results) {
+  await vscode.extensions.getExtension('devin-switch.panels').activate();
+  const commands = await vscode.commands.getCommands(true);
+  results.commands = ['switchPanels.openSideChat', 'switchPanels.askOnSide'].filter((c) => commands.includes(c));
+  const bridge = startBridge();
+  try {
+    await bridge.request('initialize', { protocolVersion: 1, clientCapabilities: {} });
+    const { result } = await bridge.request('session/new', { cwd: env.PANELS_PROJECT, mcpServers: [] });
+    const prompt = (text) => bridge.request('session/prompt', { sessionId: result.sessionId, prompt: [{ type: 'text', text }] });
+    results.first = (await prompt('/btw what is a cache?')).result;
+    results.sideTab = await waitFor('the Side chat tab', () => tabLabels().includes('Side chat'));
+    await waitFor('the side question to reach the agent', () => sidePrompts().length === 1);
+    // The follow-up carries the first answer, which the panel must have streamed and finished.
+    await sleep(500);
+    results.second = (await prompt('/btw is it shared?')).result;
+    results.prompts = await waitFor('the follow-up to reach the agent', () => sidePrompts().length === 2 && sidePrompts());
+    results.sessionId = result.sessionId;
+    await vscode.env.clipboard.writeText('copied from the chat');
+    await vscode.commands.executeCommand('switchPanels.askOnSide', { from: 'clipboard' });
+    results.askedOnSide = tabLabels().filter((l) => l === 'Side chat').length;
+  } finally {
+    results.notes = bridge.notes;
+    bridge.close();
+  }
+}
+
 exports.run = async () => {
   const results = {};
+  if (env.PANELS_SIDE) {
+    try {
+      await sideChat(results);
+    } catch (error) {
+      results.error = String((error && error.stack) || error);
+    }
+    fs.writeFileSync(env.PANELS_RESULT, JSON.stringify(results));
+    return;
+  }
   try {
     await vscode.extensions.getExtension('devin-switch.panels').activate();
     const workspace = vscode.workspace.workspaceFolders[0].uri.fsPath;

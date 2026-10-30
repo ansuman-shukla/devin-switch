@@ -355,7 +355,8 @@ Type `/btw your question` in a Desktop chat run through Devin Switch. A **Side c
 next to the chat, inside the agents view, and answers there while the chat's agent keeps
 working; nothing is added to the chat. To ask about part of a reply, quote it in the chat and
 type `/btw …` as your comment on the quote. The side agent sees the chat's conversation and
-can read files, but can't edit, run commands or ask you questions. Follow-ups work in the tab:
+can read files, but can't edit, run commands or ask you questions. Its thinking and the files
+it reads stream live, then fold into a "Thought for …" line you can expand. Follow-ups work in the tab:
 each question is sent with the earlier side turns, so long side threads cost a little more per
 turn. `Stop` ends only the side answer, and `New` starts a fresh thread. Closed the tab? Type
 `/btw` again, with or without a question, to reopen it. The page is served by Switch on

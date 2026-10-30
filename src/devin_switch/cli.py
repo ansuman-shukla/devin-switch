@@ -122,6 +122,14 @@ def parser() -> argparse.ArgumentParser:
     chat = commands.add_parser("chat", help="Inspect the Desktop chat this process belongs to")
     chat_actions = chat.add_subparsers(dest="action", required=True, metavar="ACTION")
     chat_actions.add_parser("id", help="Print the conversation id (used by the whiteboard MCP)")
+    side_chat = commands.add_parser("side", help="Serve the Desktop side chat panel")
+    side_chat_actions = side_chat.add_subparsers(dest="action", required=True, metavar="ACTION")
+    side_view = side_chat_actions.add_parser(
+        "view", help="Serve one window's side chat panel over stdio (JSON lines)"
+    )
+    side_view.add_argument(
+        "--host-pid", type=int, required=True, help="The Desktop window's extension host"
+    )
     side = commands.add_parser(
         "panels", help="Install the Desktop side panels (whiteboard, agent browser)"
     )
@@ -187,6 +195,13 @@ def execute(args: argparse.Namespace, store: Store) -> int:
         from devin_switch import acp_state
 
         print(acp_state.current_chat(store))
+        return 0
+    if args.command == "side":
+        import asyncio
+
+        from devin_switch import side
+
+        asyncio.run(side.view(store, args.host_pid))
         return 0
     if args.command == "acp":
         import asyncio

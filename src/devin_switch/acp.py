@@ -1,6 +1,7 @@
 import asyncio
 import copy
 import json
+import os
 import platform
 import subprocess
 import sys
@@ -613,6 +614,8 @@ class Chat:
     blank: bool = False
     canceled: bool = False
     next_idle_check: float = 0
+    # Side updates carry no request id, so a chat answers one side question at a time.
+    side: asyncio.Lock = field(default_factory=asyncio.Lock)
 
     @asynccontextmanager
     async def access(self):
@@ -646,6 +649,8 @@ class Bridge:
         self.spare = None
         self.spare_folder = Path.home()
         self.filling = False
+        self.side_server = None
+        self.side_sinks = {}
 
     def spawn(self, coroutine):
         task = asyncio.create_task(coroutine)
@@ -690,6 +695,9 @@ class Bridge:
         params = message.get("params")
         if side.is_side(message):
             # Desktop can't show side answers, and they must never join the chat's replay.
+            sink = self.side_sinks.get(backend)
+            if sink and message.get("method") == "session/update":
+                await sink(params["update"])
             return
         if message.get("method") == CANCEL_REQUEST:
             # The native cancels with its own id; Desktop knows the card by the bridge's id.
@@ -816,6 +824,9 @@ class Bridge:
             self.ready = True
             self.spawn(self.refill())
             self.spawn(self.prune_runs())
+            if (host := os.environ.get(side.HOST_VARIABLE, "")).isdigit():
+                self.side_server = side.Server(self, int(host))
+                await self.side_server.start()
             return result
         if not self.ready:
             raise RpcError("Initialize the GUI bridge first.", -32600)
@@ -850,12 +861,9 @@ class Bridge:
                 return {}
             raise RpcError("Load the exact saved conversation before using it.", -32602)
         chat = self.chats[session_id]
-        if method in SIDE_REQUESTS and chat.suspended:
-            store = self.native.store
-            own = {backend.lease.run.id for backend in self.backends if backend.lease}
-            if await asyncio.to_thread(acp_state.held_elsewhere, store, session_id, own):
-                # The native answers this for a chat it hasn't loaded; Desktop ignores it quietly.
-                raise RpcError("Session not found: this chat is open in another window.", -32602)
+        if method in SIDE_REQUESTS and chat.suspended and await self.held_elsewhere(session_id):
+            # The native answers this for a chat it hasn't loaded; Desktop ignores it quietly.
+            raise RpcError("Session not found: this chat is open in another window.", -32602)
         if notification:
             if method == "session/cancel":
                 chat.canceled = True
@@ -988,6 +996,72 @@ class Bridge:
                 return {"stopReason": "cancelled"}
             tried.add(chat.backend.account.name)
             params = await self.follow_up_params(chat)
+
+    async def held_elsewhere(self, session_id):
+        own = {backend.lease.run.id for backend in self.backends if backend.lease}
+        return await asyncio.to_thread(acp_state.held_elsewhere, self.native.store, session_id, own)
+
+    async def side_chats(self):
+        """This window's open chats for the side panel, the most recently active first."""
+        rows = await asyncio.to_thread(sessions.history, self.native.store)
+        titles = {row["id"]: row["title"] for row in rows}
+        now = time.monotonic()
+        chats = sorted(
+            (chat for chat in self.chats.values() if not (chat.suspended and chat.blank)),
+            key=lambda chat: chat.backend.last_activity,
+            reverse=True,
+        )
+        return [
+            {
+                "sessionId": chat.session_id,
+                "title": titles.get(chat.session_id) or "New chat",
+                "folder": str(chat.backend.project),
+                "idleSeconds": int(now - chat.backend.last_activity),
+            }
+            for chat in chats
+        ]
+
+    async def side_ask(self, session_id, text, sink):
+        """Answer a side question from the chat's context, beside any running turn.
+
+        Neither the prompt gate nor the replay record is touched: the main chat never sees it.
+        """
+        chat = self.chats.get(session_id)
+        if chat is None:
+            raise SwitchError("This chat isn't open in this window anymore. Pick another chat.")
+        async with chat.side:
+            if chat.suspended:
+                if await self.held_elsewhere(session_id):
+                    raise SwitchError("This chat is open in another Devin window. Ask there.")
+                async with chat.access():
+                    if self.chats.get(session_id) is not chat:
+                        raise SwitchError(
+                            "This GUI chat was closed. Reopen the saved conversation."
+                        )
+                    await self.reconnect(chat)
+            backend = chat.backend
+            params = {
+                "sessionId": session_id,
+                "prompt": [{"type": "text", "text": text}],
+                "_meta": dict(side.SIDE),
+            }
+            self.side_sinks[backend] = sink
+            try:
+                result = await backend.request("session/prompt", params)
+            finally:
+                self.side_sinks.pop(backend, None)
+            return {"stopReason": result.get("stopReason")}
+
+    async def side_cancel(self, session_id):
+        """Stop the chat's side answer; a cancel tagged side leaves the main turn running."""
+        chat = self.chats.get(session_id)
+        if chat and chat.backend in self.side_sinks:
+            await chat.backend.send(
+                {
+                    "method": "session/cancel",
+                    "params": {"sessionId": session_id, "_meta": dict(side.SIDE)},
+                }
+            )
 
     async def forward_request(self, backend, method, params):
         result = await backend.request(method, params)
@@ -1762,6 +1836,8 @@ class Bridge:
             await asyncio.sleep(0.1)
 
     async def close(self):
+        if self.side_server:
+            await self.side_server.close()
         for task in self.tasks:
             task.cancel()
         await asyncio.gather(*self.tasks, return_exceptions=True)

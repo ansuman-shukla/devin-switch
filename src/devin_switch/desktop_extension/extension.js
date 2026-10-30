@@ -1,16 +1,15 @@
 'use strict';
 const vscode = require('vscode');
-const { spawn } = require('node:child_process');
 const { randomBytes } = require('node:crypto');
 const { readFileSync } = require('node:fs');
 const path = require('node:path');
 const { Cdp } = require('./cdp');
 const { BrowserView } = require('./browser');
 const { CanvasPanels } = require('./canvas');
+const { Helper } = require('./helper');
 const { WhiteboardHost, whiteboardHome } = require('./whiteboard');
 
 const STATUS_POLL_MS = 5000;
-const HELPER_TIMEOUT_MS = 90_000;
 
 /** `ds` argv recorded by `ds panels install`; falls back to `ds` on PATH. */
 function dsConfig(extensionPath) {
@@ -21,75 +20,6 @@ function dsConfig(extensionPath) {
     // not installed through ds
   }
   return { command: ['ds'] };
-}
-
-/** JSON-lines client for `ds browser view`; one per window, holding at most one lease. */
-class Helper {
-  constructor(command) {
-    this.command = command;
-    this.process = null;
-    this.pending = new Map();
-    this.nextId = 0;
-    this.buffer = '';
-  }
-
-  ensure() {
-    if (this.process) return this.process;
-    const child = spawn(this.command[0], [...this.command.slice(1), 'browser', 'view'], { stdio: ['pipe', 'pipe', 'ignore'] });
-    child.stdout.setEncoding('utf8');
-    child.stdout.on('data', (chunk) => {
-      this.buffer += chunk;
-      let index;
-      while ((index = this.buffer.indexOf('\n')) >= 0) {
-        const line = this.buffer.slice(0, index);
-        this.buffer = this.buffer.slice(index + 1);
-        let reply;
-        try {
-          reply = JSON.parse(line);
-        } catch {
-          continue;
-        }
-        const call = this.pending.get(reply.id);
-        if (!call) continue;
-        this.pending.delete(reply.id);
-        clearTimeout(call.timer);
-        if (reply.ok) call.resolve(reply);
-        else call.reject(new Error(reply.error));
-      }
-    });
-    const fail = (message) => {
-      for (const call of this.pending.values()) {
-        clearTimeout(call.timer);
-        call.reject(new Error(message));
-      }
-      this.pending.clear();
-      this.process = null;
-      this.buffer = '';
-    };
-    child.on('error', (error) => fail(`Could not start ds: ${error.message}`));
-    child.on('exit', () => fail('The ds browser helper exited.'));
-    this.process = child;
-    return child;
-  }
-
-  ask(op, fields = {}) {
-    const child = this.ensure();
-    const id = ++this.nextId;
-    return new Promise((resolve, reject) => {
-      const timer = setTimeout(() => {
-        this.pending.delete(id);
-        reject(new Error(`ds browser ${op} timed out.`));
-      }, HELPER_TIMEOUT_MS);
-      this.pending.set(id, { resolve, reject, timer });
-      child.stdin.write(`${JSON.stringify({ id, op, ...fields })}\n`);
-    });
-  }
-
-  dispose() {
-    // Closing stdin makes the helper release its lease and exit.
-    this.process?.stdin.end();
-    this.process = null;
-  }
 }
 
 function nonce() {
@@ -200,7 +130,7 @@ async function pickBoard(host, canvases) {
 
 function activate(context) {
   const config = dsConfig(context.extensionPath);
-  const helper = new Helper(config.command);
+  const helper = new Helper(config.command, ['browser', 'view']);
   const status = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Right, 90);
   status.command = 'switchPanels.openBrowser';
   status.name = 'Agent Browser';

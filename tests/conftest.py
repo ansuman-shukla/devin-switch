@@ -122,7 +122,6 @@ def chrome_helper(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> FakeHelper
 @pytest.fixture(autouse=True)
 def isolated_cli_state(store: Store, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     monkeypatch.setenv("DS_HOME", str(store.root))
-    monkeypatch.setenv("DS_DESKTOP_EXTENSIONS", str(tmp_path / "desktop-extensions"))
     # Never show the real Chrome access popup from a test.
     monkeypatch.setenv("DS_CHROME_ACCESS_APP", str(tmp_path / "no-chrome-access.app"))
     for name in (

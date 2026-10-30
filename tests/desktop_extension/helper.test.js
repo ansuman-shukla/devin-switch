@@ -23,15 +23,21 @@ lines.on('line', (line) => {
 lines.on('close', () => process.exit(0));
 `;
 
-function fakeHelper() {
+/** A fake helper that is shut down after the test, even when an assertion fails. */
+function fakeHelper(t) {
   const folder = mkdtempSync(path.join(tmpdir(), 'helper-'));
   const script = path.join(folder, 'fake-ds.js');
   writeFileSync(script, FAKE);
-  return new Helper([process.execPath, script], ['side', 'view']);
+  const helper = new Helper([process.execPath, script], ['side', 'view']);
+  t.after(() => {
+    for (const call of helper.pending.values()) clearTimeout(call.timer);
+    helper.process?.kill();
+  });
+  return helper;
 }
 
-test('routes streamed events to the asking request and pushes to listeners', async () => {
-  const helper = fakeHelper();
+test('routes streamed events to the asking request and pushes to listeners', { timeout: 10_000 }, async (t) => {
+  const helper = fakeHelper(t);
   const pushed = [];
   const updates = [];
   const subscription = helper.onEvent((event) => pushed.push(event));
@@ -45,8 +51,8 @@ test('routes streamed events to the asking request and pushes to listeners', asy
   helper.dispose();
 });
 
-test('rejects failed requests with the helper error and every pending one when it exits', async () => {
-  const helper = fakeHelper();
+test('rejects failed requests with the helper error and every pending one when it exits', { timeout: 10_000 }, async (t) => {
+  const helper = fakeHelper(t);
   await assert.rejects(helper.ask('fail'), { message: 'No Switch chat is open' });
   const waiting = helper.ask('never-answered', {}, { timeoutMs: 0 });
   const exiting = helper.ask('exit');
@@ -57,16 +63,19 @@ test('rejects failed requests with the helper error and every pending one when i
   helper.dispose();
 });
 
-test('times out unanswered requests unless asked to wait', async () => {
-  const helper = fakeHelper();
+test('times out unanswered requests unless asked to wait', { timeout: 10_000 }, async (t) => {
+  const helper = fakeHelper(t);
   await assert.rejects(helper.ask('never-answered', {}, { timeoutMs: 50 }), { message: 'ds side never-answered timed out.' });
   assert.equal(helper.pending.size, 0);
   helper.dispose();
 });
 
-test('a disposed helper still settles the requests it was answering', async () => {
-  const helper = fakeHelper();
+test('a disposed helper still settles the requests it was answering', { timeout: 10_000 }, async (t) => {
+  const helper = fakeHelper(t);
   const waiting = helper.ask('never-answered', {}, { timeoutMs: 0 });
   helper.dispose();
+  // Asked before the old helper finished exiting: its exit must not fail the new helper's work.
+  const next = helper.ask('never-answered', {}, { timeoutMs: 500 });
   await assert.rejects(waiting, { message: 'The ds side helper exited.' });
+  await assert.rejects(next, { message: 'ds side never-answered timed out.' });
 });

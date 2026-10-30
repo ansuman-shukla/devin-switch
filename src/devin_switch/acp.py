@@ -1049,26 +1049,19 @@ class Bridge:
             return {"stopReason": result.get("stopReason")}
 
     async def side_question(self, chat, question):
-        """A /btw typed in the chat: its side page answers it in the chat's "Side chat" preview.
+        """A /btw typed in the chat: its side page answers it in a Browser tab of the chat.
 
-        An open page gets the question directly; otherwise the preview opens and the page asks
-        once it loads. Nothing reaches the chat's agent or waits for its turn.
+        An open page gets the question directly; otherwise a tab opens and the page asks once
+        it loads. Desktop opens a new tab for every notice, so an open page gets none. Nothing
+        reaches the chat's agent or waits for its turn.
         """
         server = self.side_server
+        showing = server.showing(chat.session_id)
         if question:
-            showing = server.showing(chat.session_id)
             server.ask(chat.session_id, question)
-            if showing:
-                return {"stopReason": "end_turn"}
-        message = {
-            "jsonrpc": "2.0",
-            "method": "session/update",
-            "params": {"sessionId": chat.session_id, "update": server.preview(chat.session_id)},
-        }
-        # Recorded, so a reload during a turn still shows the preview card.
-        chat.backend.record(message)
-        async with chat.backend.emitting:
-            await self.emit(message)
+        if not showing:
+            async with chat.backend.emitting:
+                await self.emit({"jsonrpc": "2.0", **server.opened(chat.session_id)})
         return {"stopReason": "end_turn"}
 
     async def side_cancel(self, session_id):

@@ -1,5 +1,5 @@
 'use strict';
-// The side page of one chat, shown in Desktop's in-chat preview. Questions go to the Switch
+// The side page of one chat, shown in a Browser tab of the chat. Questions go to the Switch
 // bridge that served it; /btw typed in the chat arrives as a server-sent event.
 (() => {
   const { historyOf, applyUpdate, finish, takeLines } = window.SideThread;

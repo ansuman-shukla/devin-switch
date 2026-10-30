@@ -6,9 +6,11 @@ even beside a running turn, and tags each notification of that answer the same w
 prompt forks afresh, so a follow-up carries the earlier side exchange in its text.
 
 The bridge serves each chat's side page on loopback behind a random token. A `/btw` typed in
-the chat opens it inside Desktop's agents view, in the chat's own preview tab: the bridge emits
-the `browser_preview` tool call Desktop turns into a named preview of a local port. An editor
-panel would not do: Desktop switches the agents view to IDE mode for any editor tab.
+the chat opens it inside Desktop's agents view as a Browser tab of the chat: the bridge sends
+the `browserPreview/opened` notice the native's own previews use, and Desktop loads that URL.
+A `browser_preview` tool call would not do: Desktop loads such named port previews through a
+cloud access link, which a local chat never gets. Nor would an editor panel: Desktop switches
+the agents view to IDE mode for any editor tab.
 """
 
 import asyncio
@@ -16,7 +18,6 @@ import html
 import json
 import re
 import secrets
-import uuid
 from contextlib import suppress
 from pathlib import Path
 from urllib.parse import parse_qs, quote, unquote, urlsplit
@@ -26,7 +27,7 @@ from devin_switch.store import SwitchError
 CHAIN = "cognition.ai/chain"
 SIDE = {CHAIN: "side"}
 CAPABILITY = "cognition.ai/chains"
-PREVIEW_NAME = "Side chat"
+OPENED = "_cognition.ai/browserPreview/opened"
 PAGE = Path(__file__).parent / "side_page"
 ASSETS = {
     "side.css": "text/css",
@@ -116,23 +117,10 @@ class Server:
     def path(self, session_id: str) -> str:
         return f"/side/{quote(session_id, safe='')}?t={self.token}"
 
-    def preview(self, session_id: str) -> dict:
-        """The tool call Desktop shows as a "Side chat" preview of the chat's side page."""
-        path = self.path(session_id)
-        return {
-            "sessionUpdate": "tool_call",
-            "toolCallId": f"switch-side-{uuid.uuid4().hex}",
-            "title": PREVIEW_NAME,
-            "kind": "other",
-            "status": "completed",
-            "_meta": {
-                "cognition.ai/eventType": "browser_preview",
-                "cognition.ai/name": PREVIEW_NAME,
-                "cognition.ai/ports": [self.port],
-                "cognition.ai/path": path,
-                "cognition.ai/url": f"http://127.0.0.1:{self.port}{path}",
-            },
-        }
+    def opened(self, session_id: str) -> dict:
+        """The notice that makes Desktop open the chat's side page as a new Browser tab of it."""
+        url = f"http://127.0.0.1:{self.port}{self.path(session_id)}"
+        return {"method": OPENED, "params": {"sessionId": session_id, "previewUrl": url}}
 
     def showing(self, session_id: str) -> bool:
         return bool(self.listeners.get(session_id))
@@ -162,7 +150,7 @@ class Server:
                     return await respond(writer, 404, "Not found")
                 return await respond(writer, 200, (PAGE / name).read_bytes(), ASSETS[name])
             if method == "GET" and route == "/side/events":
-                return await self.events(writer, query.get("session", ""))
+                return await self.events(reader, writer, query.get("session", ""))
             if method == "POST" and route == "/side/ask":
                 return await self.answer(reader, writer, json.loads(body))
             if method == "POST" and route == "/side/cancel":
@@ -192,12 +180,22 @@ class Server:
             f"{scripts}</body></html>"
         )
 
-    async def events(self, writer: asyncio.StreamWriter, session_id: str) -> None:
+    async def events(
+        self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter, session_id: str
+    ) -> None:
         """Server-sent /btw questions for one chat's side page."""
         queue: asyncio.Queue = asyncio.Queue()
         for text in self.waiting.pop(session_id, []):
             queue.put_nowait(text)
         self.listeners.setdefault(session_id, set()).add(queue)
+
+        async def watch() -> None:
+            # A closed tab must stop counting as open at once, so the next /btw reopens it.
+            with suppress(OSError):
+                await reader.read()
+            queue.put_nowait(None)
+
+        watcher = asyncio.create_task(watch())
         try:
             writer.write(head(200, "text/event-stream"))
             await writer.drain()
@@ -214,6 +212,7 @@ class Server:
         except OSError:
             pass
         finally:
+            watcher.cancel()
             self.listeners[session_id].discard(queue)
             if not self.listeners[session_id]:
                 del self.listeners[session_id]

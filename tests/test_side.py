@@ -1,6 +1,6 @@
 import asyncio
 import json
-from urllib.parse import quote
+from urllib.parse import quote, urlsplit
 
 import pytest
 from test_acp import acp_native as acp_native  # noqa: F401 (a fixture)
@@ -22,7 +22,17 @@ QUOTED = (
 )
 
 
-def previews(messages):
+def opened(messages):
+    """The side tabs a /btw asked Desktop to open, as the native's own previews do."""
+    return [
+        message["params"]
+        for message in messages
+        if message.get("method") == "_cognition.ai/browserPreview/opened"
+    ]
+
+
+def preview_cards(messages):
+    """Named port previews: Desktop loads those through the cloud, never for a local chat."""
     return [
         update
         for update in replayed(messages, "tool_call")
@@ -67,13 +77,14 @@ async def lines(reader, count):
 
 
 class Page:
-    """A chat's side page, found through the preview card a /btw puts in the chat."""
+    """A chat's side page, found through the preview tab a /btw opens."""
 
-    def __init__(self, card):
-        meta = card["_meta"]
-        self.port = meta["cognition.ai/ports"][0]
-        self.path = meta["cognition.ai/path"]
-        self.token = self.path.split("?t=")[1]
+    def __init__(self, preview):
+        url = urlsplit(preview["previewUrl"])
+        assert (url.scheme, url.hostname) == ("http", "127.0.0.1")
+        self.port = url.port
+        self.path = f"{url.path}?{url.query}"
+        self.token = url.query.removeprefix("t=")
 
     def url(self, route, extra=""):
         return f"/side/{route}?t={self.token}{extra}"
@@ -88,8 +99,8 @@ class Page:
 async def open_page(client, session_id):
     start = len(client.messages)
     assert (await client.prompt(session_id, "/btw"))["result"] == {"stopReason": "end_turn"}
-    (card,) = previews(client.messages[start:])
-    return Page(card)
+    (preview,) = opened(client.messages[start:])
+    return Page(preview)
 
 
 def test_prompt_text_carries_the_earlier_side_turns_the_native_forgets():
@@ -159,38 +170,44 @@ def test_btw_opens_the_side_page_in_the_chat_without_waiting_for_the_turn(acp_na
             start = len(client.messages)
             asked = await asyncio.wait_for(client.prompt(session_id, " /btw why async?"), 5)
             assert asked["result"] == {"stopReason": "end_turn"}
-            (card,) = previews(client.messages[start:])
-            page = Page(card)
-            assert card["title"] == "Side chat" and card["status"] == "completed"
-            meta = card["_meta"]
-            assert meta["cognition.ai/name"] == "Side chat"
+            (preview,) = opened(client.messages[start:])
+            page = Page(preview)
+            assert set(preview) == {"sessionId", "previewUrl"}
+            assert preview["sessionId"] == session_id
             assert page.path.startswith(f"/side/{quote(session_id, safe='')}?t=")
-            assert meta["cognition.ai/url"] == f"http://127.0.0.1:{page.port}{page.path}"
+            assert preview_cards(client.messages) == []
 
             status, html = await fetch(page.port, "GET", page.path)
             assert status == 200 and f'data-session="{session_id}"' in html
             status, script = await fetch(page.port, "GET", page.url("assets/side.js"))
             assert status == 200 and "EventSource" in script
 
-            # The page loads after the card opens it: the question waited for it.
+            # The page loads after the tab opens it: the question waited for it.
             target = page.url("events", f"&session={quote(session_id, safe='')}")
             status, events, stream = await request(page.port, "GET", target)
             assert status == 200
             assert await lines(events, 1) == [{"text": "why async?"}]
 
+            # Desktop opens a new tab per preview: an open page gets questions directly.
             start = len(client.messages)
             await asyncio.wait_for(client.prompt(session_id, QUOTED), 5)
             assert await lines(events, 1) == [{"text": "> x = 1\n> y < 2\n\nand this?"}]
-            assert previews(client.messages[start:]) == []
-            # A bare /btw shows the open page again without asking anything.
             await asyncio.wait_for(client.prompt(session_id, "/btw"), 5)
-            assert len(previews(client.messages[start:])) == 1
+            assert opened(client.messages[start:]) == []
+            # Closing the tab is noticed at once, well before the keepalive.
             stream.close()
+            async with asyncio.timeout(side.KEEPALIVE / 3):
+                while not opened(client.messages[start:]):
+                    await asyncio.sleep(0.05)
+                    await asyncio.wait_for(client.prompt(session_id, "/btw"), 5)
+            assert len(opened(client.messages[start:])) == 1
 
+            # A reload mid-turn replays the chat, never a tab to reopen.
             start = len(client.messages)
             params = {"sessionId": session_id, "cwd": str(tmp_path), "mcpServers": []}
             await asyncio.wait_for(client.request("session/load", params), 5)
-            assert len(previews(client.messages[start:])) == 2
+            assert opened(client.messages[start:]) == []
+            assert preview_cards(client.messages) == []
             assert not turn.done()
             await client.send({"method": "session/cancel", "params": {"sessionId": session_id}})
             await turn

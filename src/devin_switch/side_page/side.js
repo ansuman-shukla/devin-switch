@@ -1,38 +1,36 @@
 'use strict';
+// The side page of one chat, shown in Desktop's in-chat preview. Questions go to the Switch
+// bridge that served it; /btw typed in the chat arrives as a server-sent event.
 (() => {
-  const vscode = acquireVsCodeApi();
-  const { userText, historyOf, applyUpdate, finish, pickChat, chatLabel } = window.SideThread;
+  const { historyOf, applyUpdate, finish, takeLines } = window.SideThread;
   const { renderMarkdown } = window.SideMarkdown;
-  const post = (message) => vscode.postMessage(message);
+  const { session, token } = document.body.dataset;
+  const url = (path, extra = '') => `/side/${path}?t=${encodeURIComponent(token)}${extra}`;
+  const key = `switch-side:${session}`;
   const el = (tag, props = {}, children = []) => {
     const node = Object.assign(document.createElement(tag), props);
     node.append(...children);
     return node;
   };
 
-  // Threads survive the panel being hidden; one per chat, so switching chats keeps each one.
-  const state = Object.assign({ sessionId: null, threads: {}, quote: '', source: '' }, vscode.getState());
-  let chats = [];
-  let asking = null; // { requestId, sessionId }
-  const save = () => vscode.setState(state);
-  const thread = () => (state.threads[state.sessionId] ??= []);
+  let turns = [];
+  try {
+    turns = JSON.parse(localStorage.getItem(key) || '[]');
+  } catch {}
+  // A page reloaded mid-answer can't resume it.
+  turns = turns.map((t) => (t.status === 'answering' ? { ...t, status: 'stopped', activity: '' } : t));
+  let asking = false;
+  const queued = [];
+  const save = () => localStorage.setItem(key, JSON.stringify(turns));
 
-  const picker = el('select', { title: 'Ask about this chat', onchange: () => select(picker.value) });
-  const refresh = el('button', { type: 'button', textContent: '⟳', title: 'Refresh chats', onclick: () => post({ type: 'chats' }) });
-  const fresh = el('button', { type: 'button', textContent: 'New', title: 'Start a new side thread for this chat', onclick: () => newThread() });
   const transcript = el('div', { className: 'transcript' });
-  const quoteText = el('div', { className: 'quote-text' });
-  const quoteBox = el('div', { className: 'quote' }, [
-    quoteText,
-    el('button', { type: 'button', textContent: '✕', title: 'Remove quote', onclick: () => setQuote('', '') }),
-  ]);
   const input = el('textarea', { rows: 3, placeholder: 'Ask on the side… (Enter to send, Shift+Enter for a new line)' });
   const send = el('button', { type: 'button', className: 'primary', textContent: 'Send', onclick: () => (asking ? stop() : ask(input.value)) });
-  const status = el('div', { className: 'status' });
+  const fresh = el('button', { type: 'button', textContent: 'New', title: 'Start a new side thread', onclick: () => newThread() });
   document.body.append(
-    el('div', { className: 'toolbar' }, [picker, refresh, fresh]),
+    el('div', { className: 'toolbar' }, [el('strong', { textContent: 'Side chat' }), el('span', { className: 'hint', textContent: 'The chat keeps working and never sees this.' }), fresh]),
     transcript,
-    el('div', { className: 'composer' }, [quoteBox, el('div', { className: 'row' }, [input, send]), status]),
+    el('div', { className: 'composer' }, [el('div', { className: 'row' }, [input, send])]),
   );
 
   input.addEventListener('keydown', (event) => {
@@ -42,130 +40,83 @@
     }
   });
 
-  function setQuote(quote, source) {
-    state.quote = quote;
-    state.source = source;
-    save();
-    quoteText.textContent = source ? `${source}\n${quote}` : quote;
-    quoteBox.hidden = !quote;
-  }
-
-  function select(sessionId) {
-    state.sessionId = sessionId;
-    save();
-    render();
-  }
-
   function newThread() {
     if (asking) return;
-    state.threads[state.sessionId] = [];
+    turns = [];
     save();
     render();
   }
 
   function render() {
-    picker.replaceChildren(...chats.map((chat) => el('option', { value: chat.sessionId, textContent: chatLabel(chat) })));
-    picker.value = state.sessionId ?? '';
-    picker.disabled = Boolean(asking);
     send.textContent = asking ? 'Stop' : 'Send';
-    send.disabled = !asking && !state.sessionId;
-    fresh.disabled = Boolean(asking);
-    const turns = state.sessionId ? thread() : [];
+    fresh.disabled = asking;
     if (!turns.length) {
-      transcript.replaceChildren(
-        el('div', { className: 'empty' }, [
-          state.sessionId
-            ? 'Ask anything about this chat. Its agent keeps working and never sees this side thread.'
-            : 'Open a chat with the Devin Switch agent in this window, then ask here.',
-        ]),
-      );
+      transcript.replaceChildren(el('div', { className: 'empty' }, ['Ask anything about this chat, or type /btw … in the chat itself.']));
       return;
     }
     transcript.replaceChildren(
       ...turns.flatMap((turn) => {
-        const answer = el('div', { className: 'answer' });
-        answer.innerHTML = renderMarkdown(turn.assistant); // escaped by renderMarkdown
-        const note = turn.error || turn.activity || (turn.status === 'stopped' ? 'Stopped.' : '');
         const user = el('div', { className: 'user' });
-        user.innerHTML = renderMarkdown(turn.user);
-        return [user, answer, ...(note ? [el('div', { className: turn.error ? 'note error' : 'note' }, [note])] : [])];
+        user.innerHTML = renderMarkdown(turn.user); // renderMarkdown escapes everything first
+        const answer = el('div', { className: 'answer' });
+        answer.innerHTML = renderMarkdown(turn.assistant);
+        const note = turn.error || turn.activity || (turn.status === 'stopped' ? 'Stopped.' : '');
+        return [user, answer, ...(note ? [el('div', { className: turn.error ? 'note error' : 'note', textContent: note })] : [])];
       }),
     );
     transcript.scrollTop = transcript.scrollHeight;
   }
 
-  function ask(question) {
-    if (!question.trim() || !state.sessionId || asking) return;
-    const turns = thread();
-    const history = historyOf(turns);
-    const user = userText(question, state.quote, state.source);
-    turns.push({ user, assistant: '', status: 'answering', activity: 'Asking…' });
-    const requestId = crypto.randomUUID();
-    asking = { requestId, sessionId: state.sessionId };
-    input.value = '';
-    setQuote('', '');
-    status.textContent = '';
+  function update(change) {
+    turns[turns.length - 1] = change(turns.at(-1));
     save();
     render();
-    post({ type: 'ask', requestId, sessionId: state.sessionId, history, text: user });
+  }
+
+  async function ask(question) {
+    if (!question.trim()) return;
+    if (asking) return void queued.push(question);
+    const history = historyOf(turns);
+    turns.push({ user: question.trim(), assistant: '', status: 'answering', activity: 'Asking…' });
+    asking = true;
+    input.value = '';
+    save();
+    render();
+    try {
+      const response = await fetch(url('ask'), { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ sessionId: session, history, text: question.trim() }) });
+      const reader = response.body.getReader();
+      const decoder = new TextDecoder();
+      let buffer = '';
+      let ended = false;
+      while (!ended) {
+        const { value, done } = await reader.read();
+        if (done) break;
+        const { messages, rest } = takeLines(buffer + decoder.decode(value, { stream: true }));
+        buffer = rest;
+        for (const message of messages) {
+          if (message.update) update((turn) => applyUpdate(turn, message.update));
+          else if (message.done) (update((turn) => finish(turn, message.done)), (ended = true));
+          else if (message.error) (update((turn) => ({ ...turn, status: 'error', activity: '', error: message.error })), (ended = true));
+        }
+      }
+      if (!ended) update((turn) => ({ ...turn, status: 'error', activity: '', error: 'The Switch agent closed before answering. Ask again.' }));
+    } catch {
+      update((turn) => ({ ...turn, status: 'error', activity: '', error: 'Could not reach the Switch agent. Reopen the chat and ask again.' }));
+    } finally {
+      asking = false;
+      render();
+      input.focus();
+      if (queued.length) ask(queued.shift());
+    }
   }
 
   function stop() {
-    if (asking) post({ type: 'cancel', sessionId: asking.sessionId });
+    fetch(url('cancel'), { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ sessionId: session }) }).catch(() => {});
   }
 
-  function update(requestId, change) {
-    if (asking?.requestId !== requestId) return;
-    const turns = state.threads[asking.sessionId];
-    turns[turns.length - 1] = change(turns.at(-1));
-    save();
-    if (asking.sessionId === state.sessionId) render();
-  }
+  // /btw typed in the chat; EventSource reconnects by itself while the bridge runs.
+  new EventSource(url('events', `&session=${encodeURIComponent(session)}`)).onmessage = (event) => ask(JSON.parse(event.data).text);
 
-  window.addEventListener('message', ({ data: message }) => {
-    switch (message.type) {
-      case 'chats':
-        chats = message.chats;
-        state.sessionId = pickChat(chats, state.sessionId);
-        status.textContent = message.error ?? '';
-        save();
-        render();
-        break;
-      case 'quote':
-        setQuote(message.text, message.source ?? '');
-        input.focus();
-        break;
-      case 'question':
-        // A /btw typed in a chat: answer it in that chat's side thread.
-        if (asking) {
-          status.textContent = 'Finish or stop the current side answer first.';
-          break;
-        }
-        if (chats.some((chat) => chat.sessionId === message.sessionId)) select(message.sessionId);
-        else {
-          state.sessionId = message.sessionId;
-          post({ type: 'chats' });
-        }
-        ask(message.text);
-        break;
-      case 'update':
-        update(message.requestId, (turn) => applyUpdate(turn, message.update));
-        break;
-      case 'done':
-        update(message.requestId, (turn) => finish(turn, message.stopReason));
-        if (asking?.requestId === message.requestId) asking = null;
-        render();
-        input.focus();
-        break;
-      case 'failed':
-        update(message.requestId, (turn) => ({ ...turn, status: 'error', activity: '', error: message.error }));
-        if (asking?.requestId === message.requestId) asking = null;
-        render();
-        break;
-    }
-  });
-
-  setQuote(state.quote, state.source);
   render();
-  post({ type: 'ready' });
+  input.focus();
 })();

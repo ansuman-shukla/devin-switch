@@ -36,6 +36,8 @@ loaded = None
 project = None
 host = None
 canceled = asyncio.Event()
+side_canceled = asyncio.Event()
+chains = False
 # Running "busy" turns by request ID; like the native, a session/load ends them.
 turns = {}
 INFERENCE = "/exa.api_server_pb.ApiServerService/GetChatMessage"
@@ -121,8 +123,43 @@ def configs():
     ]
 
 
-def update(session_id, change):
-    emit({"method": "session/update", "params": {"sessionId": session_id, "update": change}})
+def update(session_id, change, meta=None):
+    params = {"sessionId": session_id, "update": change}
+    if meta:
+        params["_meta"] = meta
+    emit({"method": "session/update", "params": params})
+
+
+def chain(params):
+    meta = params.get("_meta")
+    return meta.get("cognition.ai/chain") if isinstance(meta, dict) else None
+
+
+async def side_prompt(message, params):
+    """Like the native: a read-only fork of the chat answers, tagging each update side."""
+    side = {"cognition.ai/chain": "side"}
+    text = params["prompt"][0]["text"]
+    update(
+        loaded,
+        {"sessionUpdate": "agent_thought_chunk", "content": {"type": "text", "text": "…"}},
+        side,
+    )
+    update(loaded, {"sessionUpdate": "usage_update", "used": 1, "size": 10}, side)
+    reply = {"side": text, "account": account, "session": loaded}
+    update(
+        loaded,
+        {
+            "sessionUpdate": "agent_message_chunk",
+            "content": {"type": "text", "text": json.dumps(reply)},
+        },
+        side,
+    )
+    stop = "end_turn"
+    if text.endswith("side-wait"):
+        side_canceled.clear()
+        await side_canceled.wait()
+        stop = "cancelled"
+    emit({"id": message["id"], "result": {"stopReason": stop}})
 
 
 def process_cwd():
@@ -142,7 +179,7 @@ def whiteboard_chat(params):
 
 
 async def handle(message):
-    global loaded, project, host
+    global loaded, project, host, chains
     method, params = message["method"], message.get("params", {})
     if path := os.environ.get("FAKE_ACP_LOG"):
         with open(path, "a") as handle:
@@ -159,12 +196,18 @@ async def handle(message):
                         "uri": params.get("uri"),
                         "process_cwd": process_cwd(),
                         "chat_id": whiteboard_chat(params),
+                        "chain": chain(params),
+                        "chains": (params.get("clientCapabilities") or {})
+                        .get("_meta", {})
+                        .get("cognition.ai/chains"),
                     }
                 )
                 + "\n"
             )
     result = {}
     if method == "initialize":
+        meta = (params.get("clientCapabilities") or {}).get("_meta") or {}
+        chains = meta.get("cognition.ai/chains") is True
         result = {
             "protocolVersion": 1,
             "agentCapabilities": {
@@ -240,6 +283,8 @@ async def handle(message):
                     {"name": "help", "description": "Help"},
                     {"name": "login", "description": "Login"},
                     {"name": "logout", "description": "Logout"},
+                    # The native offers /btw only to clients that support side chains.
+                    *([{"name": "btw", "description": "Side question"}] if chains else []),
                 ],
             },
         )
@@ -248,6 +293,9 @@ async def handle(message):
             result["sessionId"] = session_id
     elif method == "session/prompt":
         assert params["sessionId"] == loaded
+        if chain(params) == "side":
+            await side_prompt(message, params)
+            return
         if os.environ.get("FAKE_SAVE_ON_PROMPT"):
             connection.execute(
                 "INSERT OR IGNORE INTO sessions VALUES (?, ?, ?, ?, 0)",
@@ -314,6 +362,16 @@ async def handle(message):
             )
             emit({"id": message["id"], "result": {"stopReason": "end_turn"}})
             return
+        if text == "side-noise":
+            # A side answer streaming while this main turn runs.
+            update(
+                loaded,
+                {
+                    "sessionUpdate": "agent_message_chunk",
+                    "content": {"type": "text", "text": "aside"},
+                },
+                {"cognition.ai/chain": "side"},
+            )
         if text == "slow":
             await asyncio.sleep(0.5)
         if text == "wait":
@@ -447,7 +505,8 @@ async def handle(message):
         )
         result = {"stopReason": "cancelled" if text == "wait" else "end_turn"}
     elif method == "session/cancel":
-        canceled.set()
+        # A cancel tagged side stops only the side answer; the main turn keeps running.
+        (side_canceled if chain(params) == "side" else canceled).set()
     elif method == "session/set_config_option":
         if cold and params["configId"] == "model":
             emit(

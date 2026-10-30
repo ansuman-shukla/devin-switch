@@ -44,8 +44,6 @@ def bundle_runtime(app: Path, workspace: Path) -> None:
             str(ROOT / "src"),
             "--exclude-module",
             "tkinter",
-            "--add-data",
-            f"{ROOT / 'src/devin_switch/desktop_extension'}:devin_switch/desktop_extension",
             str(ROOT / "src/devin_switch/__main__.py"),
         ),
         check=True,

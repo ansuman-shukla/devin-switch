@@ -536,68 +536,6 @@ def overview(store: Store, current: browser.ChromeProfile | None = None) -> str:
     return "\n".join(lines)
 
 
-def profile_rows(store: Store, attached: browser.ChromeProfile | None = None) -> list[dict]:
-    default = settings(store).get("default")
-    rows = []
-    for profile in profiles(store)[0]:
-        folder = folder_for(store, profile.directory)
-        cloned = (folder / "user-data").is_dir()
-        live = running(store, profile.directory) if cloned else None
-        try:
-            since = (folder / "state.json").stat().st_mtime if live else None
-        except OSError:
-            since = None
-        rows.append(
-            {
-                "directory": profile.directory,
-                "name": profile.name,
-                "email": profile.email,
-                "default": profile.directory == default,
-                "cloned": cloned,
-                "attached": profile == attached,
-                "running": live
-                and {"port": live["port"], "headed": live["headed"], "since": since},
-            }
-        )
-    return rows
-
-
-def view(store: Store, stdin=sys.stdin, stdout=sys.stdout) -> None:
-    """Serve the Desktop browser panel: JSON lines in, JSON lines out, one lease while attached."""
-    lease = Lease(store)
-
-    def handle(request: dict) -> dict:
-        op = request.get("op")
-        if op == "profiles":
-            return {"profiles": profile_rows(store, lease.profile if lease.held else None)}
-        if op == "attach":
-            profile = resolve(store, str(request.get("profile") or ""))
-            message = lease.acquire(profile)
-            current = running(store, profile.directory)
-            if not current:
-                raise SwitchError("The agent browser stopped while attaching; retry.")
-            return {"profile": profile.directory, "port": current["port"], "message": message}
-        if op == "detach":
-            lease.release()
-            return {}
-        raise SwitchError(f"Unknown request {op!r}.")
-
-    try:
-        for line in stdin:
-            if not line.strip():
-                continue
-            request: dict = {}
-            try:
-                request = json.loads(line)
-                reply = {"id": request.get("id"), "ok": True, **handle(request)}
-            except (SwitchError, ValueError, AttributeError) as exc:
-                reply = {"id": request.get("id"), "ok": False, "error": str(exc)}
-            stdout.write(json.dumps(reply) + "\n")
-            stdout.flush()
-    finally:
-        lease.release()
-
-
 class Proxy:
     """Serve chrome-devtools-mcp to one chat, bound to the chat's chosen agent browser."""
 
@@ -935,8 +873,6 @@ def install(store: Store, default: str | None) -> str:
 def command(args, store: Store) -> int:
     if args.action == "mcp":
         asyncio.run(Proxy(store).run())
-    elif args.action == "view":
-        view(store)
     elif args.action == "_supervise":
         supervise(store, args.profile, args.headed, args.token)
     elif args.action == "install":

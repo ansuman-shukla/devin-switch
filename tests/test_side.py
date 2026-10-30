@@ -23,11 +23,6 @@ from devin_switch.store import SwitchError
 WINDOW = 4242
 
 
-def command_names(messages):
-    (*_, latest) = replayed(messages, "available_commands_update")
-    return {item["name"] for item in latest["availableCommands"]}
-
-
 class Panel:
     """A Desktop window's side panel, talking to `ds side view` like the extension does."""
 
@@ -139,9 +134,11 @@ def test_gui_natives_answer_side_questions_that_never_reach_desktop(acp_native, 
         )
         assert replayed_texts(replay, "user_message_chunk") == ["side-noise", "busy"]
         assert "aside" not in replayed_texts(replay, "agent_message_chunk")
-        # The native's own /btw would answer where Desktop can't show it.
-        assert "btw" not in command_names(client.messages)
-        assert "help" in command_names(client.messages)
+        # The native's own /btw would answer where Desktop can't show it; Switch's replaces it.
+        (*_, latest) = replayed(client.messages, "available_commands_update")
+        descriptions = {item["name"]: item["description"] for item in latest["availableCommands"]}
+        assert descriptions["btw"] != "Side question" and "help" in descriptions
+        assert [item["name"] for item in latest["availableCommands"]].count("btw") == 1
 
     asyncio.run(scenario())
 
@@ -263,6 +260,58 @@ def test_side_panel_reaches_only_its_own_window_with_the_token(acp_native, tmp_p
             assert empty["error"] == "Type a side question first."
             await panel.close()
         assert list(side.records(acp_native.store).glob("*.json")) == []
+
+    asyncio.run(scenario())
+
+
+def test_btw_in_a_chat_opens_the_side_panel_without_waiting_for_the_turn(
+    acp_native, tmp_path, window
+):
+    async def scenario():
+        async with connect(acp_native) as client:
+            session_id = await client.new(tmp_path)
+            local = [
+                item
+                for item in replayed(client.messages, "available_commands_update")[-1][
+                    "availableCommands"
+                ]
+                if item["name"] == "btw"
+            ]
+            assert local == [entry for entry in acp.LOCAL_COMMANDS if entry["name"] == "btw"]
+            turn = asyncio.create_task(client.prompt(session_id, "busy"))
+            await wait_for_text(client, "live progress")
+            panel = await Panel.open(acp_native.store)
+            assert (await panel.ask("chats"))["ok"]
+
+            asked = await asyncio.wait_for(
+                client.prompt(session_id, "  /btw why is this async?"), 5
+            )
+            assert asked["result"] == {"stopReason": "end_turn"}
+            async with asyncio.timeout(5):
+                while not panel.events:
+                    await asyncio.sleep(0.02)
+            assert panel.events == [
+                {"event": "ask", "sessionId": session_id, "text": "why is this async?"}
+            ]
+            assert not turn.done()
+            await panel.close()
+
+            await asyncio.wait_for(client.prompt(session_id, "/btw"), 5)
+            assert client.texts()[-1] == "Send /btw followed by your question.\n\n"
+            await client.send({"method": "session/cancel", "params": {"sessionId": session_id}})
+            await turn
+
+            # A window without the panel says how to get it.
+            await client.prompt(session_id, "/btw anyone there?")
+            assert client.texts()[-1] == acp.SIDE_PANEL_MISSING + "\n\n"
+
+        assert not any("btw" in (call["text"] or "") for call in logged(acp_native))
+        start = [m for m in client.messages if m.get("method") == "session/update"]
+        assert not any(
+            "btw" in str(m["params"]["update"].get("content", ""))
+            for m in start
+            if m["params"]["update"]["sessionUpdate"] == "user_message_chunk"
+        )
 
     asyncio.run(scenario())
 

@@ -44,6 +44,11 @@ LOCAL_COMMANDS = [
         "description": "Show or set switching automatically when usage runs out (all chats)",
         "input": {"hint": "on or off"},
     },
+    {
+        "name": "btw",
+        "description": "Ask a side question in the Switch side panel; this chat keeps working",
+        "input": {"hint": "question"},
+    },
 ]
 LOCAL_NAMES = {"/" + command["name"] for command in LOCAL_COMMANDS}
 AGENT_STOPPED = "_cognition.ai/agent_stopped"
@@ -118,6 +123,10 @@ BUSY_ELSEWHERE = (
 STILL_CLOSING = (
     "This chat's previous agent is still shutting down after Devin reloaded its agents "
     "(it is never force-killed). Send your message again in a few seconds."
+)
+SIDE_PANEL_MISSING = (
+    "The Switch side panel isn't running in this window. Install it once with "
+    "`ds panels install` in Terminal, reload the window, then ask again."
 )
 BLANK_RELEASED = (
     "This empty chat was closed after 15 idle minutes to free its agent. Nothing was sent "
@@ -733,7 +742,6 @@ class Bridge:
                     for item in update.get("availableCommands", [])
                     if "/" + str(item.get("name")) not in LOCAL_NAMES
                     and item.get("name") not in BLOCKED_COMMANDS
-                    and item.get("name") != "btw"
                 ] + LOCAL_COMMANDS
                 backend.commands = update["availableCommands"]
             meta = update.get("_meta")
@@ -861,6 +869,9 @@ class Bridge:
                 return {}
             raise RpcError("Load the exact saved conversation before using it.", -32602)
         chat = self.chats[session_id]
+        if method == "session/prompt" and prompt_command(params)[2] == "/btw":
+            # Answered in the side panel, so it never waits for (or joins) this chat's turn.
+            return await self.side_question(chat, params)
         if method in SIDE_REQUESTS and chat.suspended and await self.held_elsewhere(session_id):
             # The native answers this for a chat it hasn't loaded; Desktop ignores it quietly.
             raise RpcError("Session not found: this chat is open in another window.", -32602)
@@ -1051,6 +1062,22 @@ class Bridge:
             finally:
                 self.side_sinks.pop(backend, None)
             return {"stopReason": result.get("stopReason")}
+
+    async def side_question(self, chat, params):
+        """A /btw typed in the chat: the window's side panel opens and answers it."""
+        blocks = prompt_command(params)[0]
+        text = next(block["text"] for block in blocks if block.get("type") == "text")
+        text = text.strip().removeprefix("/btw").strip()
+        if not text:
+            await self.note(chat.session_id, "Send /btw followed by your question.")
+        elif not (
+            self.side_server
+            and await self.side_server.push(
+                {"event": "ask", "sessionId": chat.session_id, "text": text}
+            )
+        ):
+            await self.note(chat.session_id, SIDE_PANEL_MISSING)
+        return {"stopReason": "end_turn"}
 
     async def side_cancel(self, session_id):
         """Stop the chat's side answer; a cancel tagged side leaves the main turn running."""

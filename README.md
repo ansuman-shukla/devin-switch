@@ -357,8 +357,9 @@ working; nothing is added to the chat. To ask about part of a reply, quote it in
 type `/btw …` as your comment on the quote. The side agent sees the chat's conversation and
 can read files, but can't edit, run commands or ask you questions. Follow-ups work in the tab:
 each question is sent with the earlier side turns, so long side threads cost a little more per
-turn. `Stop` ends only the side answer, and `New` starts a fresh thread. The page is served by
-Switch on `127.0.0.1` with a random token and lives as long as the window's Switch agent.
+turn. `Stop` ends only the side answer, and `New` starts a fresh thread. Closed the tab? Type
+`/btw` again, with or without a question, to reopen it. The page is served by Switch on
+`127.0.0.1` with a random token and lives as long as the window's Switch agent.
 
 ### Keep a whiteboard per chat
 

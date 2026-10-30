@@ -9,7 +9,7 @@ from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from devin_switch import acp_state, handoff, relay, sessions, subagents
+from devin_switch import acp_state, handoff, relay, sessions, side, subagents
 from devin_switch.native import Native
 from devin_switch.store import Account, SwitchError, write_json
 
@@ -688,6 +688,9 @@ class Bridge:
             await self.emit({**message, "id": identifier})
             return
         params = message.get("params")
+        if side.is_side(message):
+            # Desktop can't show side answers, and they must never join the chat's replay.
+            return
         if message.get("method") == CANCEL_REQUEST:
             # The native cancels with its own id; Desktop knows the card by the bridge's id.
             original = params.get("requestId") if isinstance(params, dict) else None
@@ -722,6 +725,7 @@ class Bridge:
                     for item in update.get("availableCommands", [])
                     if "/" + str(item.get("name")) not in LOCAL_NAMES
                     and item.get("name") not in BLOCKED_COMMANDS
+                    and item.get("name") != "btw"
                 ] + LOCAL_COMMANDS
                 backend.commands = update["availableCommands"]
             meta = update.get("_meta")
@@ -786,6 +790,8 @@ class Bridge:
             # Desktop offers this only to its bundled agents; it adds the chat to diagnostics.
             client = self.initialization.setdefault("clientCapabilities", {})
             client.setdefault("_meta", {}).setdefault("cognition.ai/diagnosticsSessionExport", True)
+            # Side answers go to the Switch side panel; Desktop never sees them.
+            client["_meta"][side.CAPABILITY] = True
             probe = Backend(self, self.default_account(), Path.cwd(), chat=False)
             result = await probe.start()
             self.lister = probe

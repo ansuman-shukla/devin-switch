@@ -40,6 +40,10 @@ side_canceled = asyncio.Event()
 chains = False
 # Running "busy" turns by request ID; like the native, a session/load ends them.
 turns = {}
+# A turn waiting on a foreground subagent. Like native 3000.11.228, steering sent during it stays
+# open, and a Stop with steering pending only interrupts the subagent wait: the turn keeps working
+# on the steering and ends (answering every open prompt "cancelled") only on another cancel.
+foreground = None
 INFERENCE = "/exa.api_server_pb.ApiServerService/GetChatMessage"
 STATUS = "/exa.seat_management_pb.SeatManagementService/GetUserStatus"
 
@@ -179,7 +183,7 @@ def whiteboard_chat(params):
 
 
 async def handle(message):
-    global loaded, project, host, chains
+    global loaded, project, host, chains, foreground
     method, params = message["method"], message.get("params", {})
     if path := os.environ.get("FAKE_ACP_LOG"):
         with open(path, "a") as handle:
@@ -362,6 +366,32 @@ async def handle(message):
             )
             emit({"id": message["id"], "result": {"stopReason": "end_turn"}})
             return
+        if foreground is not None and text.startswith("steer"):
+            foreground["steering"].append(message["id"])
+            return
+        if text == "foreground":
+            foreground = {"steering": [], "stops": asyncio.Queue()}
+            update(
+                loaded,
+                {
+                    "sessionUpdate": "agent_message_chunk",
+                    "content": {"type": "text", "text": "live progress"},
+                },
+            )
+            await foreground["stops"].get()
+            if foreground["steering"]:
+                update(
+                    loaded,
+                    {
+                        "sessionUpdate": "agent_message_chunk",
+                        "content": {"type": "text", "text": "checking on subagent"},
+                    },
+                )
+                await foreground["stops"].get()
+            for identifier in (message["id"], *foreground["steering"]):
+                emit({"id": identifier, "result": {"stopReason": "cancelled"}})
+            foreground = None
+            return
         if text == "side-noise":
             # A side answer streaming while this main turn runs.
             update(
@@ -507,6 +537,8 @@ async def handle(message):
     elif method == "session/cancel":
         # A cancel tagged side stops only the side answer; the main turn keeps running.
         (side_canceled if chain(params) == "side" else canceled).set()
+        if foreground is not None and chain(params) != "side":
+            foreground["stops"].put_nowait(None)
     elif method == "session/set_config_option":
         if cold and params["configId"] == "model":
             emit(

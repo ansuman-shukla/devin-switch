@@ -56,6 +56,8 @@ QUESTIONS = "cognition.ai/questions"
 RESOURCE_EXHAUSTED = -32011
 RESOURCE_NOT_FOUND = -32002
 AUTO_SWITCH_LIMIT = 3
+CANCEL_RETRIES = 10
+CANCEL_RETRY_DELAY = 1.0
 CATALOG_ATTEMPTS = 3
 CATALOG_RETRY_DELAY = 1.0
 BLOCKED_COMMANDS = {"login", "logout", "org", "new", "resume"}
@@ -881,6 +883,8 @@ class Bridge:
         if notification:
             if method == "session/cancel":
                 chat.canceled = True
+                if chat.controls is not None and not chat.suspended:
+                    self.spawn(self.keep_canceling(chat, params))
             if chat.suspended:
                 if method == "session/cancel":
                     return {}
@@ -1010,6 +1014,22 @@ class Bridge:
                 return {"stopReason": "cancelled"}
             tried.add(chat.backend.account.name)
             params = await self.follow_up_params(chat)
+
+    async def keep_canceling(self, chat, params):
+        """Repeat a Stop until its turn's prompt ends.
+
+        With steering pending, the native's first cancel only interrupts the current wait and the
+        turn carries on with the steering, while Desktop greys out Stop until the prompt ends.
+        """
+        controls, backend = chat.controls, chat.backend
+        for _ in range(CANCEL_RETRIES):
+            await asyncio.sleep(CANCEL_RETRY_DELAY)
+            if chat.controls is not controls or chat.backend is not backend or backend.stopping:
+                return
+            try:
+                await backend.send({"method": "session/cancel", "params": params})
+            except (SwitchError, OSError):
+                return
 
     async def held_elsewhere(self, session_id):
         own = {backend.lease.run.id for backend in self.backends if backend.lease}

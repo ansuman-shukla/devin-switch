@@ -1395,6 +1395,40 @@ def test_gui_mid_turn_prompt_reaches_the_native_during_the_turn(acp_native, tmp_
     asyncio.run(scenario())
 
 
+def test_gui_stop_with_steering_pending_ends_the_turn(acp_native, tmp_path):
+    """The native survives a Stop with steering pending, and Desktop greys out Stop meanwhile."""
+
+    def cancels():
+        return [call for call in logged(acp_native) if call["method"] == "session/cancel"]
+
+    async def scenario():
+        async with connect(acp_native) as client:
+            session_id = await client.new(tmp_path)
+            cancel = {"method": "session/cancel", "params": {"sessionId": session_id}}
+            plain = asyncio.create_task(client.prompt(session_id, "busy"))
+            await wait_for_text(client, "live progress")
+            await client.send(cancel)
+            assert (await asyncio.wait_for(plain, 5))["result"]["stopReason"] == "cancelled"
+            await asyncio.sleep(acp.CANCEL_RETRY_DELAY * 2)
+            assert len(cancels()) == 1
+
+            turn = asyncio.create_task(client.prompt(session_id, "foreground"))
+            await asyncio.sleep(0.5)
+            steer = asyncio.create_task(client.prompt(session_id, "steer: whats the update"))
+            while "steer: whats the update" not in [call["text"] for call in logged(acp_native)]:
+                await asyncio.sleep(0.05)
+            await client.send(cancel)
+            assert (await asyncio.wait_for(turn, 10))["result"]["stopReason"] == "cancelled"
+            assert (await asyncio.wait_for(steer, 5))["result"]["stopReason"] == "cancelled"
+            assert "checking on subagent" in client.texts()
+            sent = len(cancels())
+            assert sent > 2
+            await asyncio.sleep(acp.CANCEL_RETRY_DELAY * 2)
+            assert len(cancels()) == sent
+
+    asyncio.run(scenario())
+
+
 @pytest.mark.parametrize("text", ["/switch-status", "!ds switch", "/login"])
 def test_gui_mid_turn_local_command_waits_for_the_turn(acp_native, tmp_path, text):
     async def scenario():

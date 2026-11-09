@@ -49,6 +49,23 @@ CLONED = (
 # Chrome's web cache is otherwise uncapped: 1.2 GB of a 1.8 GB copy, beside a few MB of logins.
 DISK_CACHE_LIMIT = 100 * 1024 * 1024
 MEDIA_CACHE_LIMIT = 100 * 1024 * 1024
+# Rebuildable folders only. Cookies and site data (Cookies, Local Storage, IndexedDB, Session
+# Storage, Service Worker/Database, Preferences, Local State, Extensions) are never listed.
+PROFILE_CACHES = (
+    "Cache",
+    "Code Cache",
+    "GPUCache",
+    "Service Worker/CacheStorage",
+    "Service Worker/ScriptCache",
+)
+BROWSER_CACHES = (
+    "component_crx_cache",
+    "extensions_crx_cache",
+    "GraphiteDawnCache",
+    "GPUPersistentCache",
+    "GrShaderCache",
+    "ShaderCache",
+)
 LINE_LIMIT = 256 * 1024 * 1024
 LOCAL = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 INSTRUCTIONS = (
@@ -374,6 +391,33 @@ def terminate(pid: int) -> None:
             time.sleep(0.1)
 
 
+def trim(data: Path) -> None:
+    """Delete the rebuildable caches of a Chrome user-data directory, and nothing else."""
+    profiles = (*data.glob("Default"), *data.glob("Profile [0-9]*"))
+    for cache in (
+        *(profile / name for profile in profiles for name in PROFILE_CACHES),
+        *(data / name for name in BROWSER_CACHES),
+    ):
+        # Missing folders are fine, and rmtree refuses to follow a link.
+        shutil.rmtree(cache, ignore_errors=True)
+
+
+def trim_idle(lease: int, data: Path) -> bool:
+    """Trim a profile copy no chat holds and no Chrome runs on.
+
+    The exclusive lease is what chats hold shared, so none can start Chrome meanwhile; the
+    caller releases it by closing the descriptor.
+    """
+    try:
+        fcntl.flock(lease, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        return False
+    if chrome_pid(data) is not None:
+        return False
+    trim(data)
+    return True
+
+
 def supervise(store: Store, directory: str, headed: bool, token: str) -> None:
     if os.fork():
         os._exit(0)
@@ -413,6 +457,9 @@ def supervise(store: Store, directory: str, headed: bool, token: str) -> None:
                 (folder / "state.json").unlink()
         except (OSError, ValueError):
             pass
+        # Last, still under the lease: a chat that restarts or refreshes this browser holds
+        # the lease itself, and then the copy is left as it is.
+        trim_idle(lease, data)
 
 
 def start_supervisor(store: Store, profile: browser.ChromeProfile, headed: bool) -> dict:

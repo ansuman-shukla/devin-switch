@@ -440,6 +440,57 @@ def test_blocked_lookup_asks_only_for_a_profile_that_was_never_copied(store: Sto
         agent_browser.resolve(store, "nobody@example.invalid")
 
 
+CACHES = (
+    "Default/Cache/Cache_Data/f_000001",
+    "Default/Code Cache/js/index",
+    "Default/GPUCache/data_1",
+    "Default/Service Worker/CacheStorage/origin/cache",
+    "Default/Service Worker/ScriptCache/index",
+    "Profile 2/Cache/Cache_Data/f_000002",
+    "Profile 2/Code Cache/wasm/index",
+    "component_crx_cache/component",
+    "extensions_crx_cache/extension",
+    "GraphiteDawnCache/data_1",
+    "GPUPersistentCache/data_1",
+    "GrShaderCache/data_1",
+    "ShaderCache/data_1",
+)
+LOGINS = (
+    "Default/Cookies",
+    "Default/Cookies-journal",
+    "Default/Network/Cookies",
+    "Default/Local Storage/leveldb/000003.log",
+    "Default/IndexedDB/https_site.invalid_0.indexeddb.leveldb/000004.log",
+    "Default/Session Storage/000005.log",
+    "Default/Service Worker/Database/000006.log",
+    "Default/WebStorage/QuotaManager",
+    "Default/Preferences",
+    "Default/Extensions/extension-id/1.0/manifest.json",
+    # The same names anywhere else are not Chrome's caches.
+    "Default/Extensions/extension-id/1.0/Cache/asset",
+    "Default/Local Storage/GPUCache/entry",
+    "Profile 2/Cookies",
+    "Guest Profile/Cache/kept",
+    "Local State",
+    "First Run",
+)
+
+
+def fill(data: Path, names: tuple[str, ...]) -> dict[str, bytes]:
+    for name in names:
+        (data / name).parent.mkdir(parents=True, exist_ok=True)
+        (data / name).write_bytes(os.urandom(64))
+    return contents(data)
+
+
+def contents(data: Path) -> dict[str, bytes]:
+    return {
+        str(path.relative_to(data)): path.read_bytes()
+        for path in sorted(data.rglob("*"))
+        if path.is_file() and not path.is_symlink()
+    }
+
+
 def test_chrome_starts_with_capped_web_and_media_caches(tmp_path: Path) -> None:
     assert agent_browser.DISK_CACHE_LIMIT == agent_browser.MEDIA_CACHE_LIMIT == 104857600
     for headed in (False, True):
@@ -447,3 +498,59 @@ def test_chrome_starts_with_capped_web_and_media_caches(tmp_path: Path) -> None:
         assert "--disk-cache-size=104857600" in command
         assert "--media-cache-size=104857600" in command
         assert command[-1] == "about:blank" and f"--user-data-dir={tmp_path}" in command
+
+
+def test_trim_deletes_only_caches_and_keeps_logins_byte_identical(tmp_path: Path) -> None:
+    data = tmp_path / "user-data"
+    logins = fill(data, LOGINS)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "precious").write_text("not a cache")
+    (data / "Profile 2/GPUCache").symlink_to(outside)
+    assert set(fill(data, CACHES)) == set(logins) | set(CACHES)
+
+    agent_browser.trim(data)
+
+    assert contents(data) == logins
+    for folder in (
+        "Default/Cache",
+        "Default/Code Cache",
+        "Default/GPUCache",
+        "Default/Service Worker/CacheStorage",
+        "Default/Service Worker/ScriptCache",
+        "Profile 2/Cache",
+        "Profile 2/Code Cache",
+        "component_crx_cache",
+        "extensions_crx_cache",
+        "GraphiteDawnCache",
+        "GPUPersistentCache",
+        "GrShaderCache",
+        "ShaderCache",
+    ):
+        assert not (data / folder).exists()
+    assert (data / "Profile 2/GPUCache").is_symlink()
+    assert (outside / "precious").read_text() == "not a cache"
+    # Nothing left to trim is fine, as is a copy that was never opened.
+    agent_browser.trim(data)
+    agent_browser.trim(tmp_path / "missing")
+    assert contents(data) == logins
+
+
+def test_supervisor_trims_the_cache_once_chrome_has_closed(store: Store, fakes: None) -> None:
+    client = Client(store)
+    client.tool("browser_profile", profile="Profile 3")
+    data = agent_browser.folder_for(store, "Profile 3") / "user-data"
+    supervisor = agent_browser.state(store, "Profile 3")["supervisor"]
+    logins = contents(data)
+    assert {"Default/Cookies", "launches", "DevToolsActivePort"} <= set(logins)
+    filled = fill(data, CACHES)
+    time.sleep(1)
+    # Never while Chrome runs on this copy.
+    assert agent_browser.running(store, "Profile 3") and contents(data) == filled
+
+    client.close()
+
+    wait_until(lambda: not agent_browser.alive(supervisor))
+    del logins["DevToolsActivePort"]
+    assert contents(data) == logins
+    assert agent_browser.chrome_pid(data) is None

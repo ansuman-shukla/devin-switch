@@ -80,7 +80,7 @@ def running_logins(store: Store) -> set[str] | None:
     if listing.returncode:
         return None
     roots = "|".join(re.escape(str(root)) for root in {store.root, store.root.resolve()})
-    return set(re.findall(rf"(?:{roots})/accounts/([^/\s]+)/", listing.stdout))
+    return set(re.findall(rf"(?:{roots})/accounts/([a-z0-9][a-z0-9_-]*)", listing.stdout))
 
 
 def fold(source: Path, target: Path, depth: int = MERGE_DEPTH) -> None:

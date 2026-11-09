@@ -68,6 +68,35 @@ def test_prepare_never_replaces_what_a_login_already_has(store: Store, tmp_path:
     assert (store.tools("cache") / "uv/shared").read_text() == "uv"
 
 
+def test_prepare_never_links_through_a_linked_cache_folder(store: Store, tmp_path: Path) -> None:
+    account = store.account("ansuman-1")
+    base = store.directory(account.name)
+    shared_tool(store, "cache", "uv")
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (base / "cache").rmdir()
+    (base / "cache").symlink_to(outside)
+
+    store.prepare(account)
+
+    assert list(outside.iterdir()) == []
+
+
+def test_running_logins_are_read_from_commands_and_environments(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # A state folder whose path would mean something else as a regular expression.
+    root = tmp_path / "my (state)+ folder"
+    listing = (
+        f"node server.js HOME=/Users/me XDG_CACHE_HOME={root}/accounts/ansuman-7/cache\n"
+        f"python worker.py DS_LOGIN={root}/accounts/ansuman-8\n"
+        f"cat {tmp_path}/other/accounts/ansuman-9/cache/file\n"
+    )
+    monkeypatch.setattr(tool_folders, "PROCESSES", ("/bin/echo", listing))
+
+    assert tool_folders.running_logins(Store(root)) == {"ansuman-7", "ansuman-8"}
+
+
 def test_launch_survives_broken_or_racing_tool_folders(
     store: Store, monkeypatch: pytest.MonkeyPatch
 ) -> None:

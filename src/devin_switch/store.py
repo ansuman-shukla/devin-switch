@@ -327,6 +327,8 @@ class Store:
         base = self.directory(account.name)
         for area in TOOL_AREAS:
             shared = self.tools(area)
+            if (base / area).is_symlink():
+                continue  # Linking through it would write outside this login.
             try:
                 missing = set(os.listdir(shared)) - set(os.listdir(base / area)) - {NATIVE_FOLDER}
             except OSError:

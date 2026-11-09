@@ -3149,14 +3149,21 @@ def test_bridge_prunes_what_is_never_deleted_in_the_background(acp_native):
     for path, age in ((old, week + 3600), (running, 0)):
         path.write_text("native log")
         os.utime(path, (time.time() - age, time.time() - age))
+    # An agent browser copy that is never opened again keeps its last web cache.
+    copy = store.root / "browser/profiles/profile-3/user-data"
+    (copy / "Default/Cache/Cache_Data").mkdir(parents=True)
+    (copy / "Default/Cache/Cache_Data/f_000001").write_text("web cache")
+    (copy / "Default/Cookies").write_text("logins")
 
     async def scenario():
         async with connect(acp_native):
             for _ in range(200):
-                if not old.exists():
+                if not old.exists() and not (copy / "Default/Cache").exists():
                     break
                 await asyncio.sleep(0.05)
             assert not old.exists()
             assert running.read_text() == "native log"
+            assert not (copy / "Default/Cache").exists()
+            assert (copy / "Default/Cookies").read_text() == "logins"
 
     asyncio.run(scenario())

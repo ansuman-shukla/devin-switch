@@ -24,6 +24,7 @@ from pathlib import Path
 from devin_switch import browser, chrome_access, handoff
 from devin_switch.executable import command_prefix
 from devin_switch.native import user_config_home
+from devin_switch.sessions import PRUNE_INTERVAL
 from devin_switch.store import (
     Account,
     Store,
@@ -66,6 +67,7 @@ BROWSER_CACHES = (
     "GrShaderCache",
     "ShaderCache",
 )
+TRIM_MARKER = "browser-trimmed.json"
 LINE_LIMIT = 256 * 1024 * 1024
 LOCAL = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 INSTRUCTIONS = (
@@ -416,6 +418,24 @@ def trim_idle(lease: int, data: Path) -> bool:
         return False
     trim(data)
     return True
+
+
+def sweep(store: Store, *, now: float | None = None) -> int:
+    """Trim every idle profile copy, at most once a day, so unopened ones shrink too.
+
+    The copies themselves stay: making one again needs the macOS permission popup.
+    """
+    now = time.time() if now is None else now
+    if not store.due(TRIM_MARKER, PRUNE_INTERVAL, now):
+        return 0
+    trimmed = 0
+    for data in sorted((store.root / "browser" / "profiles").glob("*/user-data")):
+        lease = os.open(data.parent / "lease.lock", os.O_RDWR | os.O_CREAT, 0o600)
+        try:
+            trimmed += trim_idle(lease, data)
+        finally:
+            os.close(lease)
+    return trimmed
 
 
 def supervise(store: Store, directory: str, headed: bool, token: str) -> None:

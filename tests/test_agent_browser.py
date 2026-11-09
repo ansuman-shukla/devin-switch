@@ -1,3 +1,4 @@
+import fcntl
 import json
 import os
 import queue
@@ -554,3 +555,56 @@ def test_supervisor_trims_the_cache_once_chrome_has_closed(store: Store, fakes: 
     del logins["DevToolsActivePort"]
     assert contents(data) == logins
     assert agent_browser.chrome_pid(data) is None
+
+
+def test_daily_sweep_trims_only_idle_profile_copies(store: Store, fakes: None) -> None:
+    now = time.time()
+    day = 24 * 3600
+    copies = {}
+    for directory in ("Profile 3", "Profile 7", "Profile 8"):
+        agent_browser.clone(store, agent_browser.resolve(store, directory))
+        copies[directory] = agent_browser.folder_for(store, directory) / "user-data"
+        fill(copies[directory], CACHES)
+    idle, leased, open_copy = copies["Profile 3"], copies["Profile 7"], copies["Profile 8"]
+    # A profile that was never copied has nothing to trim.
+    agent_browser.private_folder(store, "Profile 9")
+    expected = {name: contents(data) for name, data in copies.items()}
+    logins = {name: value for name, value in expected["Profile 3"].items() if name not in CACHES}
+
+    # A chat holds the lease shared; a Chrome may also run without any lease left.
+    chat = os.open(leased.parent / "lease.lock", os.O_RDWR | os.O_CREAT, 0o600)
+    fcntl.flock(chat, fcntl.LOCK_SH)
+    running = subprocess.Popen(
+        agent_browser.chrome_command(open_copy, False), stdin=subprocess.DEVNULL
+    )
+    try:
+        wait_until(lambda: agent_browser.chrome_pid(open_copy) == running.pid)
+        wait_until(lambda: (open_copy / "launches").exists())
+        expected["Profile 8"] = contents(open_copy)
+
+        assert agent_browser.sweep(store, now=now) == 1
+
+        assert contents(idle) == logins
+        assert contents(leased) == expected["Profile 7"]
+        assert contents(open_copy) == expected["Profile 8"]
+        # The chat keeps its lease, and the swept copies are free for chats again.
+        for data in (idle, open_copy):
+            probe = os.open(data.parent / "lease.lock", os.O_RDWR)
+            fcntl.flock(probe, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            os.close(probe)
+        assert not (agent_browser.folder_for(store, "Profile 9") / "lease.lock").exists()
+
+        # At most once a day.
+        refilled = fill(idle, CACHES)
+        assert agent_browser.sweep(store, now=now + day - 1) == 0
+        assert contents(idle) == refilled
+    finally:
+        os.close(chat)
+        running.terminate()
+        running.wait(timeout=15)
+
+    assert agent_browser.sweep(store, now=now + day) == 3
+    for data in copies.values():
+        assert not set(contents(data)) & set(CACHES)
+    assert contents(idle) == logins
+    assert contents(leased)["Default/Cookies"] == expected["Profile 7"]["Default/Cookies"]

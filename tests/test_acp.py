@@ -3111,3 +3111,29 @@ def test_gui_chats_without_a_saved_api_login_skip_the_relay(acp_native, tmp_path
             assert "authenticate" not in [call["method"] for call in logged(acp_native)]
 
     asyncio.run(scenario())
+
+
+def test_bridge_shares_idle_logins_tool_folders_in_the_background(acp_native, tmp_path):
+    store = acp_native.store
+    idle = store.directory("ansuman-2") / "cache/uv"
+    idle.mkdir()
+    (idle / "a.whl").write_text("built once")
+    # The bridge's own listing native holds the default login, like any running launch.
+    held = store.directory("ansuman-1") / "cache/pip"
+    held.mkdir()
+
+    async def scenario():
+        async with connect(acp_native) as client:
+            for _ in range(200):
+                if idle.is_symlink():
+                    break
+                await asyncio.sleep(0.05)
+            assert (store.tools("cache") / "uv/a.whl").read_text() == "built once"
+            assert (idle / "a.whl").read_text() == "built once"
+            assert not held.is_symlink() and not (store.tools("cache") / "pip").exists()
+            # The default login was probed, never locked: its chats still open.
+            session_id = await client.new(tmp_path)
+            assert (await client.prompt(session_id, "work"))["result"]["stopReason"] == "end_turn"
+            assert client.agent_replies()[-1]["account"] == "ansuman-1"
+
+    asyncio.run(scenario())

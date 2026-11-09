@@ -110,6 +110,20 @@ def test_other_commands_cannot_switch_during_running_session(store: Store) -> No
             pytest.fail("A second process must not be able to acquire the profile lock")
 
 
+def test_background_upkeep_is_due_once_per_interval(store: Store) -> None:
+    marker = store.root / "upkeep.json"
+    assert store.due("upkeep.json", 100, 1000.0)
+    assert json.loads(marker.read_text()) == 1000.0
+    assert not store.due("upkeep.json", 100, 1099.0)
+    # A run that was not due leaves the last real run recorded.
+    assert json.loads(marker.read_text()) == 1000.0
+    assert store.due("upkeep.json", 100, 1100.0)
+    assert json.loads(marker.read_text()) == 1100.0
+    marker.write_text("not json")
+    assert store.due("upkeep.json", 100, 1101.0)
+    assert json.loads(marker.read_text()) == 1101.0
+
+
 def test_existing_history_is_never_overwritten(store: Store) -> None:
     first = store.account("ansuman-1")
     history = store.directory(first.name) / "data/devin/cli"

@@ -197,6 +197,17 @@ class Store:
                 return True
         return False
 
+    def due(self, marker: str, interval: float, now: float) -> bool:
+        """Whether background upkeep last ran over `interval` ago; a due run is recorded."""
+        path = self.root / marker
+        try:
+            if now - json.loads(path.read_text()) < interval:
+                return False
+        except (OSError, ValueError, TypeError):
+            pass
+        write_json(path, now)
+        return True
+
     def directory(self, name: str) -> Path:
         return self.root / "accounts" / validate_name(name)
 

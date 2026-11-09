@@ -390,16 +390,19 @@ def test_unknown_running_processes_adopt_nothing(
     store: Store, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failure: str
 ) -> None:
     asked = tmp_path / "asked"
-    listing = tmp_path / "ps"
-    listing.write_text(f"#!/bin/sh\necho asked >> {asked}\nexec /bin/sleep 5\n")
-    listing.chmod(0o700)
     commands = {
         "exit status": ("/bin/sh", "-c", f"echo asked >> {asked}; exit 1"),
         "missing": (str(tmp_path / "no-ps"),),
-        "timeout": (str(listing),),
+        "timeout": ("ps-that-hangs",),
     }
     monkeypatch.setattr(tool_folders, "PROCESSES", commands[failure])
-    monkeypatch.setattr(tool_folders, "PROCESSES_TIMEOUT", 0.3)
+    if failure == "timeout":
+        # Raised directly: a real slow process may be killed before it could record the call.
+        def hang(command: tuple[str, ...], **options: object) -> None:
+            asked.write_text("asked\n" if not asked.exists() else asked.read_text() + "asked\n")
+            raise subprocess.TimeoutExpired(command, options["timeout"])
+
+        monkeypatch.setattr(tool_folders.subprocess, "run", hang)
     # Nothing to adopt: the processes are not even listed, and leftovers are still finished.
     leftover = store.tools("adopting") / "cache/uv/ansuman-2-1"
     leftover.mkdir(parents=True)

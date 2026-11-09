@@ -46,6 +46,9 @@ CLONED = (
     "Storage",
     "Preferences",
 )
+# Chrome's web cache is otherwise uncapped: 1.2 GB of a 1.8 GB copy, beside a few MB of logins.
+DISK_CACHE_LIMIT = 100 * 1024 * 1024
+MEDIA_CACHE_LIMIT = 100 * 1024 * 1024
 LINE_LIMIT = 256 * 1024 * 1024
 LOCAL = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 INSTRUCTIONS = (
@@ -318,6 +321,8 @@ def chrome_command(data: Path, headed: bool) -> list[str]:
         "--no-first-run",
         "--no-default-browser-check",
         "--hide-crash-restore-bubble",
+        f"--disk-cache-size={DISK_CACHE_LIMIT}",
+        f"--media-cache-size={MEDIA_CACHE_LIMIT}",
         *window,
         "about:blank",
     ]

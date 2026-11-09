@@ -438,3 +438,12 @@ def test_blocked_lookup_asks_only_for_a_profile_that_was_never_copied(store: Sto
     assert [request["items"] for request in popup.requests] == [["Local State"]]
     with pytest.raises(SwitchError, match="No Chrome profile matches"):
         agent_browser.resolve(store, "nobody@example.invalid")
+
+
+def test_chrome_starts_with_capped_web_and_media_caches(tmp_path: Path) -> None:
+    assert agent_browser.DISK_CACHE_LIMIT == agent_browser.MEDIA_CACHE_LIMIT == 104857600
+    for headed in (False, True):
+        command = agent_browser.chrome_command(tmp_path, headed)
+        assert "--disk-cache-size=104857600" in command
+        assert "--media-cache-size=104857600" in command
+        assert command[-1] == "about:blank" and f"--user-data-dir={tmp_path}" in command

@@ -395,13 +395,16 @@ def terminate(pid: int) -> None:
 
 def trim(data: Path) -> None:
     """Delete the rebuildable caches of a Chrome user-data directory, and nothing else."""
+    root = data.resolve()
     profiles = (*data.glob("Default"), *data.glob("Profile [0-9]*"))
     for cache in (
         *(profile / name for profile in profiles for name in PROFILE_CACHES),
         *(data / name for name in BROWSER_CACHES),
     ):
-        # Missing folders are fine, and rmtree refuses to follow a link.
-        shutil.rmtree(cache, ignore_errors=True)
+        # A linked profile or parent folder leads outside this copy. Missing folders are
+        # fine, and rmtree refuses to follow a link.
+        if cache.parent.resolve().is_relative_to(root):
+            shutil.rmtree(cache, ignore_errors=True)
 
 
 def trim_idle(lease: int, data: Path) -> bool:

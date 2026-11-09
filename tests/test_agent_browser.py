@@ -537,6 +537,23 @@ def test_trim_deletes_only_caches_and_keeps_logins_byte_identical(tmp_path: Path
     assert contents(data) == logins
 
 
+def test_trim_never_leaves_the_copy_through_a_linked_folder(tmp_path: Path) -> None:
+    data = tmp_path / "user-data"
+    data.mkdir()
+    elsewhere = tmp_path / "elsewhere"
+    for folder in ("profile/Cache", "worker/CacheStorage"):
+        (elsewhere / folder).mkdir(parents=True)
+        (elsewhere / folder / "precious").write_text("not this copy's cache")
+    (data / "Default").symlink_to(elsewhere / "profile")
+    (data / "Profile 1").mkdir()
+    (data / "Profile 1/Service Worker").symlink_to(elsewhere / "worker")
+
+    agent_browser.trim(data)
+
+    for folder in ("profile/Cache", "worker/CacheStorage"):
+        assert (elsewhere / folder / "precious").read_text() == "not this copy's cache"
+
+
 def test_supervisor_trims_the_cache_once_chrome_has_closed(store: Store, fakes: None) -> None:
     client = Client(store)
     client.tool("browser_profile", profile="Profile 3")

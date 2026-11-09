@@ -187,7 +187,11 @@ class Store:
             yield handle.fileno()
 
     def account_lock(self, account: Account, *, shared: bool = False):
-        return self.lock(f"account-{validate_name(account.name)}.lock", shared=shared)
+        return self.lock(account_lock_name(validate_name(account.name)), shared=shared)
+
+    def in_use(self, name: str) -> bool:
+        """Whether a launch, or a background process it started, still holds this login."""
+        return self.locked(account_lock_name(name))
 
     def locked(self, filename: str) -> bool:
         try:
@@ -377,6 +381,10 @@ class Store:
                 temporary.replace(self.root / "selected")
             finally:
                 temporary.unlink(missing_ok=True)
+
+
+def account_lock_name(name: str) -> str:
+    return f"account-{name}.lock"
 
 
 def private_opener(path: str, flags: int) -> int:

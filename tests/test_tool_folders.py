@@ -81,18 +81,23 @@ def test_launch_survives_broken_or_racing_tool_folders(
     assert list((base / "cache").iterdir()) == []
     assert (base / "data/uv").is_symlink()
 
-    # A tool creates the same name between the listing and the link.
-    shared_tool(store, "data", "pnpm")
+    # A tool creates one name between the listing and the link: the others still link.
+    for name in ("deno", "pip", "pnpm"):
+        shared_tool(store, "data", name)
+    link = Path.symlink_to
 
-    def taken(self, target, target_is_directory=False):
-        raise FileExistsError(str(self))
+    def racing(self, target, target_is_directory=False):
+        if self.name == "deno":
+            raise FileExistsError(str(self))
+        link(self, target, target_is_directory)
 
-    monkeypatch.setattr(Path, "symlink_to", taken)
+    monkeypatch.setattr(Path, "symlink_to", racing)
     store.prepare(account)
     monkeypatch.undo()
-    assert not os.path.lexists(base / "data/pnpm")
+    assert not os.path.lexists(base / "data/deno")
+    assert (base / "data/pip").is_symlink() and (base / "data/pnpm").is_symlink()
     store.prepare(account)
-    assert (base / "data/pnpm").is_symlink()
+    assert (base / "data/deno").is_symlink()
 
 
 def test_native_environment_keeps_per_login_folders(native: Native) -> None:

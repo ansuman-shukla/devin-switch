@@ -8,7 +8,7 @@ import shutil
 import tempfile
 import time
 from collections.abc import Iterator
-from contextlib import contextmanager
+from contextlib import contextmanager, suppress
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -329,11 +329,12 @@ class Store:
             shared = self.tools(area)
             try:
                 missing = set(os.listdir(shared)) - set(os.listdir(base / area)) - {NATIVE_FOLDER}
-                for name in missing:
-                    (base / area / name).symlink_to(shared.resolve() / name)
             except OSError:
-                # No shared folder yet, or a tool made this name meanwhile: nothing to repair.
-                continue
+                continue  # No shared folder yet.
+            for name in sorted(missing):
+                # A tool that made this name meanwhile keeps it; the other names still link.
+                with suppress(OSError):
+                    (base / area / name).symlink_to(shared.resolve() / name)
 
     def share_mcp(self, account: Account) -> None:
         # MCP servers and their OAuth tokens belong to the user, not to one Devin login.

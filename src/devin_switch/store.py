@@ -14,6 +14,10 @@ from pathlib import Path
 
 NEW_ACCOUNT_CONFIG = {"attribution": False}
 EMPTY_MCP_CONFIG: dict = {"mcpServers": {}}
+# The native CLI has no setting for its own folders, so XDG stays per login and every tool an
+# agent runs (uv, pnpm, pip, ...) inherits it. Their folders in these areas are kept once.
+TOOL_AREAS = ("cache", "data")
+NATIVE_FOLDER = "devin"
 
 
 class SwitchError(Exception):
@@ -305,6 +309,27 @@ class Store:
             else:
                 link.symlink_to(shared.resolve(), target_is_directory=True)
         self.share_mcp(account)
+        self.share_tools(account)
+
+    def tools(self, area: str) -> Path:
+        return self.root / "shared" / "tools" / area
+
+    def share_tools(self, account: Account) -> None:
+        """Link the tool folders other logins already share; a launch never fails over them.
+
+        Only names this login lacks are linked. Its own real folders wait for
+        `tool_folders.adopt`, which runs in the background while the login is idle.
+        """
+        base = self.directory(account.name)
+        for area in TOOL_AREAS:
+            shared = self.tools(area)
+            try:
+                missing = set(os.listdir(shared)) - set(os.listdir(base / area)) - {NATIVE_FOLDER}
+                for name in missing:
+                    (base / area / name).symlink_to(shared.resolve() / name)
+            except OSError:
+                # No shared folder yet, or a tool made this name meanwhile: nothing to repair.
+                continue
 
     def share_mcp(self, account: Account) -> None:
         # MCP servers and their OAuth tokens belong to the user, not to one Devin login.

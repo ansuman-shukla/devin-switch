@@ -25,6 +25,8 @@ STAGING = "adopting"
 # running Apple's own binaries (/bin/sh, /bin/sleep): for them only the command is shown.
 PROCESSES = ("/bin/ps", "-axEww", "-o", "command=")
 PROCESSES_TIMEOUT = 10
+# Data folders merge down to an entry's grandchildren (uv/python/<version>, uv/tools/<tool>).
+MERGE_DEPTH = 2
 
 
 @dataclass(frozen=True)
@@ -81,11 +83,14 @@ def running_logins(store: Store) -> set[str] | None:
     return set(re.findall(rf"(?:{roots})/accounts/([^/\s]+)/", listing.stdout))
 
 
-def fold(source: Path, target: Path) -> None:
-    """Merge a staged data entry into the shared one, never following links.
+def fold(source: Path, target: Path, depth: int = MERGE_DEPTH) -> None:
+    """Merge a staged data entry into the shared one at its top levels, never following links.
 
     Project virtualenvs point at absolute paths inside a login's data folder (uv's Pythons),
-    so the shared folder keeps the union of what every login had; a newer file wins.
+    so the shared folder keeps the union of what every login had, down to `depth` levels:
+    a grandchild only the staged copy has moves in. One both have stays the shared one,
+    whole, so two logins' environments of the same tool are never mixed file by file. A
+    newer plain file or link at those levels wins.
     """
     incoming = source.lstat()
     try:
@@ -94,8 +99,9 @@ def fold(source: Path, target: Path) -> None:
         os.rename(source, target)
         return
     if stat.S_ISDIR(incoming.st_mode) and stat.S_ISDIR(existing.st_mode):
-        for name in os.listdir(source):
-            fold(source / name, target / name)
+        if depth:
+            for name in os.listdir(source):
+                fold(source / name, target / name, depth - 1)
     elif (
         stat.S_IFMT(incoming.st_mode) == stat.S_IFMT(existing.st_mode)
         and incoming.st_mtime_ns > existing.st_mtime_ns

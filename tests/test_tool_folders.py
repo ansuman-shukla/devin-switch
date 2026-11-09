@@ -187,7 +187,9 @@ def test_duplicate_cache_is_dropped_for_the_shared_one(store: Store) -> None:
     assert staged(store, "cache", "uv") == []
 
 
-def test_data_folders_merge_so_every_logins_paths_still_resolve(store: Store) -> None:
+def test_data_folders_merge_at_their_top_levels_so_every_logins_paths_resolve(
+    store: Store,
+) -> None:
     first = own_tool(
         store,
         "ansuman-1",
@@ -195,7 +197,9 @@ def test_data_folders_merge_so_every_logins_paths_still_resolve(store: Store) ->
         "uv",
         {
             "python/cpython-3.11/bin/python3.11": "3.11 of the first login",
-            "tools/ruff/receipt": "older receipt",
+            "python/.lock": "older lock",
+            "tools/ruff/bin/ruff": "ruff 0.4 of the first login",
+            "tools/ruff/lib/ruff-0.4.dist-info/RECORD": "0.4",
             "settings": "newer settings",
             "same-age": "shared copy",
         },
@@ -207,17 +211,25 @@ def test_data_folders_merge_so_every_logins_paths_still_resolve(store: Store) ->
         "uv",
         {
             "python/cpython-3.11/bin/python3.11": "3.11 of the second login",
+            "python/cpython-3.11/lib/extra.py": "only in the second login's 3.11",
             "python/cpython-3.12/bin/python3.12": "only the second login had 3.12",
-            "tools/ruff/receipt": "newer receipt",
+            "python/.lock": "newer lock",
+            "tools/ruff/bin/ruff": "ruff 0.5 of the second login",
+            "tools/ruff/lib/ruff-0.5.dist-info/RECORD": "0.5",
+            "tools/yt-dlp/bin/yt-dlp": "only the second login had yt-dlp",
             "settings": "older settings",
             "same-age": "staged copy",
+            "only-second": "moved in",
         },
     )
-    for folder, receipt, settings in ((first, 1000, 3000), (second, 2000, 1000)):
-        age(folder / "tools/ruff/receipt", receipt)
+    for folder, lock, settings in ((first, 1000, 3000), (second, 2000, 1000)):
+        age(folder / "python/.lock", lock)
         age(folder / "settings", settings)
         age(folder / "same-age", 5000)
-        age(folder / "python/cpython-3.11/bin/python3.11", 5000)
+    # Newer files inside a folder both logins have change nothing: the shared one stays whole.
+    age(first / "tools/ruff/bin/ruff", 1000)
+    age(second / "tools/ruff/bin/ruff", 9000)
+    age(second / "python/cpython-3.11/bin/python3.11", 9000)
 
     assert tool_folders.adopt(store, now=1000.0) == Adopted(moved=1, duplicates=1, in_use=0)
 
@@ -229,14 +241,28 @@ def test_data_folders_merge_so_every_logins_paths_still_resolve(store: Store) ->
     assert (second / "python/cpython-3.12/bin/python3.12").read_text() == (
         "only the second login had 3.12"
     )
-    assert (first / "python/cpython-3.11/bin/python3.11").read_text() == "3.11 of the first login"
-    assert sorted(path.name for path in (shared / "python").iterdir()) == [
-        "cpython-3.11",
-        "cpython-3.12",
+    assert (second / "tools/yt-dlp/bin/yt-dlp").read_text() == "only the second login had yt-dlp"
+    # Two logins' copies of one Python or one tool are never mixed file by file.
+    assert sorted(
+        str(path.relative_to(shared)) for path in shared.rglob("*") if not path.is_dir()
+    ) == [
+        "only-second",
+        "python/.lock",
+        "python/cpython-3.11/bin/python3.11",
+        "python/cpython-3.12/bin/python3.12",
+        "same-age",
+        "settings",
+        "tools/ruff/bin/ruff",
+        "tools/ruff/lib/ruff-0.4.dist-info/RECORD",
+        "tools/yt-dlp/bin/yt-dlp",
     ]
-    assert (shared / "tools/ruff/receipt").read_text() == "newer receipt"
+    assert (shared / "tools/ruff/bin/ruff").read_text() == "ruff 0.4 of the first login"
+    assert (shared / "python/cpython-3.11/bin/python3.11").read_text() == "3.11 of the first login"
+    # Plain files at the top levels: the newer one wins, the shared one on a tie.
+    assert (shared / "python/.lock").read_text() == "newer lock"
     assert (shared / "settings").read_text() == "newer settings"
     assert (shared / "same-age").read_text() == "shared copy"
+    assert (shared / "only-second").read_text() == "moved in"
     assert staged(store, "data", "uv") == []
 
 
@@ -244,13 +270,20 @@ def test_links_inside_tool_folders_are_moved_not_followed(store: Store, tmp_path
     outside = tmp_path / "outside"
     outside.mkdir()
     (outside / "precious").write_text("not a tool's file")
-    first = own_tool(store, "ansuman-1", "data", "uv", {"tools/kept/receipt": "real folder"})
+    first = own_tool(
+        store,
+        "ansuman-1",
+        "data",
+        "uv",
+        {"tools/kept/receipt": "real folder", "python/cpython-3.11": "real folder"},
+    )
     (first / "alias").symlink_to(outside)
     own_tool(store, "ansuman-1", "cache", "uv", {"a.whl": "wheel"})
     second = own_tool(store, "ansuman-2", "data", "uv", {"alias/intruder": "must not land outside"})
     (second / "link").symlink_to(outside)
     (second / "tools").mkdir()
     (second / "tools/kept").symlink_to(outside)
+    (second / "python").symlink_to(outside)
     (own_tool(store, "ansuman-2", "cache", "uv", {"b.whl": "wheel"}) / "link").symlink_to(outside)
     whole = store.directory("ansuman-2") / "cache/gh"
     whole.symlink_to(outside)
@@ -262,6 +295,7 @@ def test_links_inside_tool_folders_are_moved_not_followed(store: Store, tmp_path
     # A link never replaces a real folder, and a real folder never fills a link's target.
     assert not (shared / "tools/kept").is_symlink()
     assert (shared / "tools/kept/receipt").read_text() == "real folder"
+    assert [path.name for path in (shared / "python").iterdir()] == ["cpython-3.11"]
     assert os.readlink(shared / "alias") == str(outside)
     assert os.readlink(whole) == str(outside) and not (store.tools("cache") / "gh").exists()
     assert [path.name for path in outside.iterdir()] == ["precious"]

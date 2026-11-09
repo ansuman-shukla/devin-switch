@@ -1198,10 +1198,10 @@ class Bridge:
     async def upkeep(self):
         """Daily housekeeping, in the background and never during a chat open.
 
-        Old launch records slow every chat open, and tool folders that logins filled
-        privately are moved to the one shared copy.
+        Old launch records slow every chat open, native logs were never deleted, and tool
+        folders that logins filled privately are moved to the one shared copy.
         """
-        for task in (sessions.prune, tool_folders.adopt):
+        for task in (sessions.prune, sessions.prune_logs, tool_folders.adopt):
             with suppress(OSError, SwitchError):
                 await asyncio.to_thread(task, self.native.store)
 

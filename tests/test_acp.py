@@ -3,6 +3,7 @@ import json
 import os
 import sys
 import threading
+import time
 from contextlib import asynccontextmanager, contextmanager
 from pathlib import Path
 
@@ -3135,5 +3136,27 @@ def test_bridge_shares_idle_logins_tool_folders_in_the_background(acp_native, tm
             session_id = await client.new(tmp_path)
             assert (await client.prompt(session_id, "work"))["result"]["stopReason"] == "end_turn"
             assert client.agent_replies()[-1]["account"] == "ansuman-1"
+
+    asyncio.run(scenario())
+
+
+def test_bridge_prunes_what_is_never_deleted_in_the_background(acp_native):
+    store = acp_native.store
+    week = sessions.PRUNE_AGE
+    logs = store.root / "shared/cli/logs"
+    logs.mkdir()
+    old, running = logs / "finished.log", logs / "running.log"
+    for path, age in ((old, week + 3600), (running, 0)):
+        path.write_text("native log")
+        os.utime(path, (time.time() - age, time.time() - age))
+
+    async def scenario():
+        async with connect(acp_native):
+            for _ in range(200):
+                if not old.exists():
+                    break
+                await asyncio.sleep(0.05)
+            assert not old.exists()
+            assert running.read_text() == "native log"
 
     asyncio.run(scenario())

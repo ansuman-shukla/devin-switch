@@ -170,6 +170,28 @@ def prune(store: Store, *, now: float | None = None) -> int:
     return removed
 
 
+def prune_logs(store: Store, *, now: float | None = None) -> int:
+    """Delete native CLI log files not written to for a week, at most once a day.
+
+    Every native writes its own log file and none was ever removed. A running native keeps
+    writing, so its file stays fresh. Only regular files directly inside `shared/cli/logs`
+    go: history, session locks, transcripts and plugins beside it are never touched.
+    """
+    now = time.time() if now is None else now
+    if not store.due("logs-pruned.json", PRUNE_INTERVAL, now):
+        return 0
+    folder = store.root / "shared" / "cli" / "logs"
+    if not folder.is_dir():
+        return 0
+    removed = 0
+    for path in folder.iterdir():
+        if path.is_symlink() or not path.is_file() or now - path.stat().st_mtime < PRUNE_AGE:
+            continue
+        path.unlink()
+        removed += 1
+    return removed
+
+
 def resume_blocker(chat: dict, running: list[dict]) -> str | None:
     if holder(chat, running):
         return "This chat already has an open CLI launch. Close it before resuming again."

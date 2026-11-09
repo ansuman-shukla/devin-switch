@@ -1,5 +1,6 @@
 import os
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -288,6 +289,75 @@ def test_login_in_use_is_left_alone_until_released(store: Store) -> None:
 
     assert tool_folders.adopt(store, now=2 * DAY) == Adopted(moved=1, duplicates=0, in_use=0)
     assert folder.is_symlink() and (folder / "blob").read_text() == "being written"
+
+
+@pytest.mark.parametrize("named", ["as given", "resolved"])
+def test_login_a_running_process_points_into_is_left_alone(
+    store: Store, tmp_path: Path, named: str
+) -> None:
+    # The same state folder reached through a link, as DS_HOME may be.
+    (tmp_path / "linked-state").symlink_to(store.root)
+    linked = Store(tmp_path / "linked-state")
+    root = linked.root if named == "as given" else linked.root.resolve()
+    assert linked.root != linked.root.resolve()
+    idle = own_tool(store, "ansuman-1", "cache", "uv", {"a.whl": "wheel"})
+    used = own_tool(store, "ansuman-2", "cache", "pip", {"http": "being read"})
+    # A server that outlived its launch: it holds no lock, only the login's environment.
+    # Not /bin/sleep: macOS hides the environment of Apple's own binaries from ps.
+    survivor = subprocess.Popen(
+        (sys.executable, "-c", "import time; time.sleep(60)"),
+        env={**os.environ, "XDG_CACHE_HOME": str(root / "accounts/ansuman-2/cache")},
+    )
+    try:
+        assert not store.in_use("ansuman-2")
+        assert tool_folders.adopt(linked, now=0.0) == Adopted(moved=1, duplicates=0, in_use=1)
+        assert idle.is_symlink()
+        assert not used.is_symlink() and (used / "http").read_text() == "being read"
+        assert not (store.tools("cache") / "pip").exists()
+    finally:
+        survivor.kill()
+        survivor.wait()
+
+    assert tool_folders.adopt(linked, now=DAY) == Adopted(moved=1, duplicates=0, in_use=0)
+    assert used.is_symlink() and (used / "http").read_text() == "being read"
+
+
+@pytest.mark.parametrize("failure", ["exit status", "missing", "timeout"])
+def test_unknown_running_processes_adopt_nothing(
+    store: Store, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failure: str
+) -> None:
+    asked = tmp_path / "asked"
+    listing = tmp_path / "ps"
+    listing.write_text(f"#!/bin/sh\necho asked >> {asked}\nexec /bin/sleep 5\n")
+    listing.chmod(0o700)
+    commands = {
+        "exit status": ("/bin/sh", "-c", f"echo asked >> {asked}; exit 1"),
+        "missing": (str(tmp_path / "no-ps"),),
+        "timeout": (str(listing),),
+    }
+    monkeypatch.setattr(tool_folders, "PROCESSES", commands[failure])
+    monkeypatch.setattr(tool_folders, "PROCESSES_TIMEOUT", 0.3)
+    # Nothing to adopt: the processes are not even listed, and leftovers are still finished.
+    leftover = store.tools("adopting") / "cache/uv/ansuman-2-1"
+    leftover.mkdir(parents=True)
+    (store.tools("cache") / "uv").mkdir(parents=True)
+    assert tool_folders.adopt(store, now=0.0) == Adopted(moved=0, duplicates=0, in_use=0)
+    assert not asked.exists() and not leftover.exists()
+
+    folders = [
+        own_tool(store, login, "cache", "pip", {"http": "cached"})
+        for login in ("ansuman-1", "ansuman-2")
+    ]
+    leftover.mkdir()
+    assert tool_folders.adopt(store, now=DAY) == Adopted(moved=0, duplicates=0, in_use=2)
+    assert not any(folder.is_symlink() for folder in folders)
+    assert not (store.tools("cache") / "pip").exists() and not leftover.exists()
+    if failure != "missing":
+        assert asked.read_text() == "asked\n"
+
+    monkeypatch.undo()
+    assert tool_folders.adopt(store, now=2 * DAY) == Adopted(moved=1, duplicates=1, in_use=0)
+    assert all(folder.is_symlink() for folder in folders)
 
 
 def test_adoption_never_locks_a_login_a_chat_may_open(

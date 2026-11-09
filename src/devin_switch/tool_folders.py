@@ -6,8 +6,10 @@ shared folder, and the login keeps a link, so absolute paths into it still resol
 """
 
 import os
+import re
 import shutil
 import stat
+import subprocess
 import time
 from contextlib import ExitStack
 from dataclasses import dataclass
@@ -19,13 +21,17 @@ INTERVAL = 24 * 3600
 MARKER = "tools-adopted.json"
 LOCK = "tools.lock"
 STAGING = "adopting"
+# With -E, macOS ps also prints the environment of the user's own processes, except those
+# running Apple's own binaries (/bin/sh, /bin/sleep): for them only the command is shown.
+PROCESSES = ("/bin/ps", "-axEww", "-o", "command=")
+PROCESSES_TIMEOUT = 10
 
 
 @dataclass(frozen=True)
 class Adopted:
     moved: int  # A login's folder became the shared one.
     duplicates: int  # The shared one existed: folded into it (data) or dropped (cache).
-    in_use: int  # Logins left for a later run: a launch or its background process holds them.
+    in_use: int  # Logins left for a later run: a launch or a running process uses them.
 
 
 def entries(folder: Path) -> list[Path]:
@@ -50,6 +56,29 @@ def private_tools(base: Path) -> list[tuple[str, Path]]:
         for entry in entries(base / area)
         if entry.name != NATIVE_FOLDER and not entry.is_symlink()
     ]
+
+
+def running_logins(store: Store) -> set[str] | None:
+    """Logins that a running process's command or environment points into; None if unknown.
+
+    The account lock alone misses processes that outlived their launch without inheriting
+    it (a docker-sandbox plugin, a node server), and their tool folders must not move.
+    """
+    try:
+        listing = subprocess.run(
+            PROCESSES,
+            capture_output=True,
+            text=True,
+            errors="replace",
+            timeout=PROCESSES_TIMEOUT,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if listing.returncode:
+        return None
+    roots = "|".join(re.escape(str(root)) for root in {store.root, store.root.resolve()})
+    return set(re.findall(rf"(?:{roots})/accounts/([^/\s]+)/", listing.stdout))
 
 
 def fold(source: Path, target: Path) -> None:
@@ -112,12 +141,12 @@ def adopt(store: Store, *, now: float | None = None) -> Adopted | None:
         if not store.due(MARKER, INTERVAL, now):
             return None
         moved = duplicates = in_use = 0
-        for base in logins(store):
-            tools = private_tools(base)
-            if not tools:
-                continue
-            # Probed, not held: a chat opening on this login must never find it locked.
-            if store.in_use(base.name):
+        pending = [(base, tools) for base in logins(store) if (tools := private_tools(base))]
+        running = running_logins(store) if pending else set()
+        for base, tools in pending:
+            # The lock is probed, not held: a chat opening on this login must never find it
+            # locked.
+            if running is None or base.name in running or store.in_use(base.name):
                 in_use += 1
                 continue
             for area, entry in tools:

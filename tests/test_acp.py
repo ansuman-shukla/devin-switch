@@ -2135,7 +2135,7 @@ def test_gui_idle_release_leaves_unsafe_chats_open(acp_native, tmp_path, monkeyp
 
                 monkeypatch.setattr(sessions, "history", unavailable)
             if reason == "permission":
-                bridge.client_requests["pending"] = (backend, 123)
+                bridge.client_requests["pending"] = acp.ClientRequest(backend, 123)
             if reason == "control":
                 chat.controls = set()
             if reason == "switch":

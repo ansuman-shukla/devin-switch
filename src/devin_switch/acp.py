@@ -648,6 +648,14 @@ class Chat:
                 self.backend.last_activity = time.monotonic()
 
 
+@dataclass(frozen=True)
+class ClientRequest:
+    """A request a native sent to Desktop, which knows it by the bridge's own id."""
+
+    backend: Backend
+    original: int | str
+
+
 class Bridge:
     def __init__(self, native: Native, emit, *, account=None, sandbox=False):
         self.native = native
@@ -700,8 +708,8 @@ class Bridge:
 
     async def drop_client_requests(self, backend):
         """A native that exited can't receive answers: clear its cards in Desktop too."""
-        for identifier, (owner, _) in list(self.client_requests.items()):
-            if owner is backend:
+        for identifier, request in list(self.client_requests.items()):
+            if request.backend is backend:
                 self.client_requests.pop(identifier)
                 with suppress(OSError):
                     await self.emit(cancel_request(identifier))
@@ -710,7 +718,7 @@ class Bridge:
         if "id" in message:
             self.sequence += 1
             identifier = f"ds-client-{self.sequence}"
-            self.client_requests[identifier] = (backend, message["id"])
+            self.client_requests[identifier] = ClientRequest(backend, message["id"])
             await self.emit({**message, "id": identifier})
             return
         params = message.get("params")
@@ -723,8 +731,8 @@ class Bridge:
         if message.get("method") == CANCEL_REQUEST:
             # The native cancels with its own id; Desktop knows the card by the bridge's id.
             original = params.get("requestId") if isinstance(params, dict) else None
-            for identifier, owner in list(self.client_requests.items()):
-                if owner == (backend, original):
+            for identifier, request in list(self.client_requests.items()):
+                if request.backend is backend and request.original == original:
                     self.client_requests.pop(identifier)
                     await self.emit(cancel_request(identifier))
             return
@@ -779,9 +787,8 @@ class Bridge:
             if not isinstance(message, dict) or message.get("jsonrpc") != "2.0":
                 raise RpcError("Invalid ACP message.", -32600)
             if "method" not in message:
-                if owner := self.client_requests.pop(identifier, None):
-                    backend, original = owner
-                    await backend.send({**message, "id": original})
+                if request := self.client_requests.pop(identifier, None):
+                    await request.backend.send({**message, "id": request.original})
                 return
             method = message["method"]
             params = message.get("params", {})
@@ -1813,7 +1820,7 @@ class Bridge:
                     or backend.writer.is_closing()
                     or backend.pending
                     or chat.controls is not None
-                    or any(owner is backend for owner, _ in self.client_requests.values())
+                    or any(request.backend is backend for request in self.client_requests.values())
                     or chat.session_id in self.queued
                     or backend.running
                 ):

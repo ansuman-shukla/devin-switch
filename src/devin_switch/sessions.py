@@ -149,13 +149,8 @@ def prune(store: Store, *, now: float | None = None) -> int:
     logins (`acp/sessions`) are never touched.
     """
     now = time.time() if now is None else now
-    marker = store.root / "runs-pruned.json"
-    try:
-        if now - json.loads(marker.read_text()) < PRUNE_INTERVAL:
-            return 0
-    except (OSError, ValueError, TypeError):
-        pass
-    write_json(marker, now)
+    if not store.due("runs-pruned.json", PRUNE_INTERVAL, now):
+        return 0
     removed = 0
     for run in runs(store):
         finished = run["ended_at"] or run["started_at"]

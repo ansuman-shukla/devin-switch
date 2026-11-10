@@ -12,7 +12,7 @@ saved Devin CLI logins, checking reported usage, and reopening shared local conv
 
 ## What it does
 
-- **Separate account profiles.** Keep each saved login, CLI configuration, and cache isolated.
+- **Separate account profiles.** Keep each saved login, CLI configuration, and Devin cache isolated.
 - **A shared local history.** Reopen conversations created through Switch with a chosen account.
 - **A native SwiftUI interface.** Manage profiles, choose a project, and launch chats in Terminal.
 - **Usage at a glance.** Show daily and weekly allowance when the service reports it, including
@@ -551,6 +551,8 @@ accounts/<alias>/data/devin/credentials.toml
 accounts/<alias>/config/
 accounts/<alias>/cache/
 shared/cli/sessions.db
+shared/tools/cache/
+shared/tools/data/
 shared/summaries/
 runs/
 handoffs/
@@ -570,6 +572,10 @@ selected
   Protect this directory and its backups as sensitive data.
 - Each account receives isolated XDG directories. `CHISEL_SESSION_DB` is explicitly pinned
   to shared history, and known authentication environment overrides are removed.
+- Inside an account's cache and data directories only Devin's own `devin` folder is private.
+  The folders of other tools an agent runs (uv, pnpm, pip, …) are links to one copy under
+  `shared/tools/`, so their caches are not duplicated for every account. Folders an account
+  filled earlier are moved there in the background, once a day, while that account is idle.
 - GitHub CLI login is shared across terminal and ACP chats, including account handoffs.
   Switch pins `GH_CONFIG_DIR` before isolating Devin's XDG directories: an explicit
   `GH_CONFIG_DIR` wins, otherwise it uses the incoming user-level `XDG_CONFIG_HOME/gh`

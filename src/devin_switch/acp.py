@@ -9,7 +9,7 @@ from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from devin_switch import acp_state, handoff, relay, sessions, side, subagents
+from devin_switch import acp_state, handoff, relay, sessions, side, subagents, tool_folders
 from devin_switch.native import Native
 from devin_switch.store import Account, SwitchError, write_json
 
@@ -834,7 +834,7 @@ class Bridge:
             }
             self.ready = True
             self.spawn(self.refill())
-            self.spawn(self.prune_runs())
+            self.spawn(self.upkeep())
             self.side_server = side.Server(self)
             await self.side_server.start()
             return result
@@ -1195,10 +1195,15 @@ class Bridge:
         finally:
             self.filling = False
 
-    async def prune_runs(self):
-        """Old launch records slow every chat open; clear them in the background."""
-        with suppress(OSError, SwitchError):
-            await asyncio.to_thread(sessions.prune, self.native.store)
+    async def upkeep(self):
+        """Daily housekeeping, in the background and never during a chat open.
+
+        Old launch records slow every chat open, and tool folders that logins filled
+        privately are moved to the one shared copy.
+        """
+        for task in (sessions.prune, tool_folders.adopt):
+            with suppress(OSError, SwitchError):
+                await asyncio.to_thread(task, self.native.store)
 
     async def drop_spare(self):
         spare, self.spare = self.spare, None

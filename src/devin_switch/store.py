@@ -8,12 +8,16 @@ import shutil
 import tempfile
 import time
 from collections.abc import Iterator
-from contextlib import contextmanager
+from contextlib import contextmanager, suppress
 from dataclasses import dataclass
 from pathlib import Path
 
 NEW_ACCOUNT_CONFIG = {"attribution": False}
 EMPTY_MCP_CONFIG: dict = {"mcpServers": {}}
+# The native CLI has no setting for its own folders, so XDG stays per login and every tool an
+# agent runs (uv, pnpm, pip, ...) inherits it. Their folders in these areas are kept once.
+TOOL_AREAS = ("cache", "data")
+NATIVE_FOLDER = "devin"
 
 
 class SwitchError(Exception):
@@ -183,7 +187,11 @@ class Store:
             yield handle.fileno()
 
     def account_lock(self, account: Account, *, shared: bool = False):
-        return self.lock(f"account-{validate_name(account.name)}.lock", shared=shared)
+        return self.lock(account_lock_name(validate_name(account.name)), shared=shared)
+
+    def in_use(self, name: str) -> bool:
+        """Whether a launch, or a background process it started, still holds this login."""
+        return self.locked(account_lock_name(name))
 
     def locked(self, filename: str) -> bool:
         try:
@@ -196,6 +204,17 @@ class Store:
             except BlockingIOError:
                 return True
         return False
+
+    def due(self, marker: str, interval: float, now: float) -> bool:
+        """Whether background upkeep last ran over `interval` ago; a due run is recorded."""
+        path = self.root / marker
+        try:
+            if now - json.loads(path.read_text()) < interval:
+                return False
+        except (OSError, ValueError, TypeError):
+            pass
+        write_json(path, now)
+        return True
 
     def directory(self, name: str) -> Path:
         return self.root / "accounts" / validate_name(name)
@@ -294,6 +313,30 @@ class Store:
             else:
                 link.symlink_to(shared.resolve(), target_is_directory=True)
         self.share_mcp(account)
+        self.share_tools(account)
+
+    def tools(self, area: str) -> Path:
+        return self.root / "shared" / "tools" / area
+
+    def share_tools(self, account: Account) -> None:
+        """Link the tool folders other logins already share; a launch never fails over them.
+
+        Only names this login lacks are linked. Its own real folders wait for
+        `tool_folders.adopt`, which runs in the background while the login is idle.
+        """
+        base = self.directory(account.name)
+        for area in TOOL_AREAS:
+            shared = self.tools(area)
+            if (base / area).is_symlink():
+                continue  # Linking through it would write outside this login.
+            try:
+                missing = set(os.listdir(shared)) - set(os.listdir(base / area)) - {NATIVE_FOLDER}
+            except OSError:
+                continue  # No shared folder yet.
+            for name in sorted(missing):
+                # A tool that made this name meanwhile keeps it; the other names still link.
+                with suppress(OSError):
+                    (base / area / name).symlink_to(shared.resolve() / name)
 
     def share_mcp(self, account: Account) -> None:
         # MCP servers and their OAuth tokens belong to the user, not to one Devin login.
@@ -341,6 +384,10 @@ class Store:
                 temporary.replace(self.root / "selected")
             finally:
                 temporary.unlink(missing_ok=True)
+
+
+def account_lock_name(name: str) -> str:
+    return f"account-{name}.lock"
 
 
 def private_opener(path: str, flags: int) -> int:

@@ -16,6 +16,7 @@ from devin_switch import (
     relay,
     sessions,
     side,
+    subagent_tab,
     subagents,
     tool_folders,
 )
@@ -601,6 +602,7 @@ class Backend:
             self.pump.cancel()
             with suppress(asyncio.CancelledError):
                 await self.pump
+        self.bridge.stop_subagents(self)
         self.lease.close(ended=True)
         await self.bridge.drop_client_requests(self)
         self.close_pipes()
@@ -672,6 +674,7 @@ class Bridge:
         self.filling = False
         self.side_server = None
         self.side_sinks = {}
+        self.roster = subagent_tab.Roster()
 
     def spawn(self, coroutine):
         task = asyncio.create_task(coroutine)
@@ -758,6 +761,7 @@ class Bridge:
                 backend.commands = update["availableCommands"]
             meta = update.get("_meta")
             if backend.live and backend.session_id and isinstance(meta, dict):
+                self.roster.apply(backend.session_id, update)
                 for key in (subagents.STARTED, subagents.COMPLETED):
                     if isinstance(event := meta.get(key), dict):
                         await self.track_subagent(backend, key, event)
@@ -939,6 +943,7 @@ class Bridge:
                         "The GUI agent is still shutting down; it was not force-killed."
                     )
                 self.chats.pop(session_id)
+                self.roster.forget(session_id)
                 return {}
             if method == "session/prompt":
                 chat.canceled = False
@@ -1271,9 +1276,16 @@ class Bridge:
         except (SwitchError, OSError):
             pass
 
+    def stop_subagents(self, backend):
+        """A native that exited took its subagents along; a newer native's are not its own."""
+        chat = self.chats.get(backend.session_id)
+        if chat is not None and chat.backend is backend:
+            self.roster.interrupt(backend.session_id)
+
     async def go_live(self, backend):
         """Start counting subagent events; ones an earlier process left running are now stopped."""
         backend.live = True
+        self.roster.interrupt(backend.session_id)
         try:
             await asyncio.to_thread(
                 subagents.interrupt_running, self.native.store, backend.session_id

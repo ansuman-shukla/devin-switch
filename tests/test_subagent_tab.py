@@ -1,8 +1,14 @@
+import asyncio
 import json
 import re
 import time
 
-from devin_switch import subagent_tab
+import pytest
+from test_acp import acp_native as acp_native  # noqa: F401 (a fixture)
+from test_acp import in_process, prompt_params, subagent_events, until
+
+from devin_switch import acp, subagent_tab
+from devin_switch.store import SwitchError
 
 AGENT = "acb63708"
 STARTED = "cognition.ai/subagent_started"
@@ -366,3 +372,119 @@ def test_the_page_shell_names_its_chat_token_and_three_files():
         f"/subagents/assets/subagents.js?t={token}",
     ]
     assert 'tok<en>&"x' not in shell and 'chat-1<"&>' not in shell
+
+
+async def new_chat(bridge, folder):
+    created = await bridge.dispatch("session/new", {"cwd": str(folder), "mcpServers": []})
+    return bridge.chats[created["sessionId"]]
+
+
+def delegate(bridge, chat):
+    """Start a turn whose background subagent keeps working until the turn is stopped."""
+    return asyncio.create_task(
+        bridge.dispatch("session/prompt", prompt_params(chat.session_id, "delegate"))
+    )
+
+
+async def stop(bridge, chat, turn):
+    await bridge.dispatch("session/cancel", {"sessionId": chat.session_id}, notification=True)
+    assert await turn == {"stopReason": "cancelled"}
+
+
+def test_live_subagents_become_rows_and_load_replays_add_none(acp_native, tmp_path, monkeypatch):
+    monkeypatch.setenv("FAKE_REPLAY_SUBAGENT", "1")
+
+    async def scenario():
+        async with in_process(acp_native) as (bridge, messages):
+            chat = await new_chat(bridge, tmp_path)
+            session_id, roster = chat.session_id, bridge.roster
+            # Reloading the open chat replays an earlier turn's subagent in the live shapes.
+            await bridge.dispatch("session/load", chat.setup)
+            assert [event["agentId"] for event in subagent_events(messages, STARTED)] == [
+                "9d2e41aa"
+            ]
+            assert rows(roster, session_id) == []
+
+            turn = delegate(bridge, chat)
+            await until(lambda: states(roster, session_id) == {AGENT: "running"})
+            await until(lambda: row(roster, AGENT, session_id)["step"] == "Running command")
+            live = row(roster, AGENT, session_id)
+            assert (live["title"], live["profile"], live["background"]) == (
+                "Sleeper",
+                "General",
+                True,
+            )
+            await stop(bridge, chat, turn)
+            (ended,) = rows(roster, session_id)
+            assert (ended["status"], ended["note"]) == ("failed", "[Error] Canceled by user")
+            assert "Run sleep 30" not in json.dumps(roster.snapshot(session_id))
+
+            # A handoff's new native replays the chat as well, unseen by Desktop.
+            start = len(messages)
+            await bridge.dispatch("session/prompt", prompt_params(session_id, "/switch ansuman-2"))
+            assert chat.backend.account.name == "ansuman-2"
+            assert subagent_events(messages[start:], STARTED) == []
+            assert rows(roster, session_id) == [ended]
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("noticed", ["exit", "replacement"])
+def test_subagents_a_dead_native_left_running_read_stopped(
+    acp_native, tmp_path, monkeypatch, noticed
+):
+    if noticed == "replacement":
+        # Should an exit ever go unnoticed, the native that takes over still knows.
+        monkeypatch.setattr(acp.Bridge, "stop_subagents", lambda self, backend: None)
+
+    async def scenario():
+        async with in_process(acp_native) as (bridge, _):
+            chat = await new_chat(bridge, tmp_path)
+            session_id, roster = chat.session_id, bridge.roster
+            turn = delegate(bridge, chat)
+            await until(lambda: states(roster, session_id) == {AGENT: "running"})
+            chat.backend.process.kill()
+            with pytest.raises(SwitchError):
+                await turn
+            if noticed == "exit":
+                # At once: the tab must not show a dead subagent as running until a reload.
+                await until(lambda: states(roster, session_id) == {AGENT: "stopped"})
+            await bridge.dispatch("session/load", chat.setup)
+            (stopped,) = rows(roster, session_id)
+            assert (stopped["status"], stopped["note"]) == ("stopped", "the agent restarted")
+            assert stopped["started"] <= stopped["ended"] <= time.time()
+
+    asyncio.run(scenario())
+
+
+def test_an_old_natives_late_exit_leaves_its_successors_subagents_alone(acp_native, tmp_path):
+    async def scenario():
+        async with in_process(acp_native) as (bridge, _):
+            chat = await new_chat(bridge, tmp_path)
+            session_id, roster, old = chat.session_id, bridge.roster, chat.backend
+            await bridge.dispatch("session/prompt", prompt_params(session_id, "/switch ansuman-2"))
+            assert chat.backend is not old and old.process.poll() is not None
+            turn = delegate(bridge, chat)
+            await until(lambda: states(roster, session_id) == {AGENT: "running"})
+            # The old native's cleanup can finish late (it waits on Desktop's pipe).
+            bridge.stop_subagents(old)
+            assert states(roster, session_id) == {AGENT: "running"}
+            await stop(bridge, chat, turn)
+            assert states(roster, session_id) == {AGENT: "failed"}
+
+    asyncio.run(scenario())
+
+
+def test_closing_a_chat_forgets_its_subagents(acp_native, tmp_path):
+    async def scenario():
+        async with in_process(acp_native) as (bridge, _):
+            chat, other = await new_chat(bridge, tmp_path), await new_chat(bridge, tmp_path)
+            turn = delegate(bridge, chat)
+            await until(lambda: states(bridge.roster, chat.session_id) == {AGENT: "running"})
+            bridge.roster.apply(other.session_id, started("elsewhere"))
+            await stop(bridge, chat, turn)
+            await bridge.dispatch("session/close", {"sessionId": chat.session_id})
+            assert rows(bridge.roster, chat.session_id) == []
+            assert states(bridge.roster, other.session_id) == {"elsewhere": "running"}
+
+    asyncio.run(scenario())

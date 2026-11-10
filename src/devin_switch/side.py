@@ -145,10 +145,7 @@ class Server:
                 return await respond(writer, 403, "Forbidden")
             route = url.path
             if method == "GET" and route.startswith("/side/assets/"):
-                name = route.removeprefix("/side/assets/")
-                if name not in ASSETS:
-                    return await respond(writer, 404, "Not found")
-                return await respond(writer, 200, (PAGE / name).read_bytes(), ASSETS[name])
+                return await asset(writer, PAGE, ASSETS, route.removeprefix("/side/assets/"))
             if method == "GET" and route == "/side/events":
                 return await self.events(reader, writer, query.get("session", ""))
             if method == "POST" and route == "/side/ask":
@@ -188,31 +185,9 @@ class Server:
         for text in self.waiting.pop(session_id, []):
             queue.put_nowait(text)
         self.listeners.setdefault(session_id, set()).add(queue)
-
-        async def watch() -> None:
-            # A closed tab must stop counting as open at once, so the next /btw reopens it.
-            with suppress(OSError):
-                await reader.read()
-            queue.put_nowait(None)
-
-        watcher = asyncio.create_task(watch())
         try:
-            writer.write(head(200, "text/event-stream"))
-            await writer.drain()
-            while True:
-                try:
-                    text = await asyncio.wait_for(queue.get(), KEEPALIVE)
-                except TimeoutError:
-                    writer.write(b": keepalive\n\n")
-                else:
-                    if text is None:
-                        return
-                    writer.write(f"data: {json.dumps({'text': text})}\n\n".encode())
-                await writer.drain()
-        except OSError:
-            pass
+            await stream(reader, writer, queue, lambda text: {"text": text})
         finally:
-            watcher.cancel()
             self.listeners[session_id].discard(queue)
             if not self.listeners[session_id]:
                 del self.listeners[session_id]
@@ -278,3 +253,43 @@ async def respond(
 ) -> None:
     writer.write(head(status, kind) + (body.encode() if isinstance(body, str) else body))
     await writer.drain()
+
+
+async def asset(
+    writer: asyncio.StreamWriter, folder: Path, kinds: dict[str, str], name: str
+) -> None:
+    """One of a page's own files; only the names listed in `kinds` are served."""
+    if name not in kinds:
+        return await respond(writer, 404, "Not found")
+    await respond(writer, 200, (folder / name).read_bytes(), kinds[name])
+
+
+async def stream(
+    reader: asyncio.StreamReader, writer: asyncio.StreamWriter, queue: asyncio.Queue, event
+) -> None:
+    """Send what a page's queue yields as server-sent events, until None or the tab closes."""
+
+    async def watch() -> None:
+        # A closed tab must stop counting as open at once, so the next command reopens it.
+        with suppress(OSError):
+            await reader.read()
+        queue.put_nowait(None)
+
+    watcher = asyncio.create_task(watch())
+    try:
+        writer.write(head(200, "text/event-stream"))
+        await writer.drain()
+        while True:
+            try:
+                item = await asyncio.wait_for(queue.get(), KEEPALIVE)
+            except TimeoutError:
+                writer.write(b": keepalive\n\n")
+            else:
+                if item is None:
+                    return
+                writer.write(f"data: {json.dumps(event(item))}\n\n".encode())
+            await writer.drain()
+    except OSError:
+        pass
+    finally:
+        watcher.cancel()

@@ -586,6 +586,10 @@ def test_the_subagents_page_streams_a_chats_rows_as_they_change(acp_native, tmp_
             writer.close()
             await until(lambda: not roster.showing(session_id), side.KEEPALIVE / 3)
             assert roster.showing("another-chat")
+            # A closing bridge ends the streams still open.
+            await server.close()
+            await asyncio.wait_for(idle.read(), 5)
+            assert not roster.showing("another-chat")
 
     asyncio.run(scenario())
 

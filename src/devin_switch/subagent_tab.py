@@ -27,6 +27,7 @@ ASSETS = {
 }
 ACTIVE = ("running", "paused")
 RESTARTED = "the agent restarted"
+RELOADED = "the chat was reloaded"
 MAX_ROWS = 200
 TEXT_LIMIT = 200
 
@@ -119,12 +120,12 @@ class Roster:
         if changed:
             self.notify(session_id)
 
-    def interrupt(self, session_id: str) -> None:
-        """The chat's native is gone, and with it every subagent it was still running."""
+    def interrupt(self, session_id: str, reason: str = RESTARTED) -> None:
+        """The chat's native dropped every subagent it was still running, for `reason`."""
         rows, now = self.rows.get(session_id, {}), time.time()
         active = [row for row in rows.values() if row["status"] in ACTIVE]
         for row in active:
-            row.update(status="stopped", note=RESTARTED, ended=now)
+            row.update(status="stopped", note=reason, ended=now)
         if active:
             self.notify(session_id)
 

@@ -228,12 +228,17 @@ def test_interrupt_stops_only_the_rows_still_active():
     assert [row(roster, agent) for agent in ("done", "failed")] == finished
     assert states(roster, "other-chat") == {"elsewhere": "running"}
 
-    # Stopped is final: nothing a later event says changes it.
+    # Stopped is final: nothing a later event (or interrupt, whatever its reason) changes it.
     before = rows(roster)
-    roster.interrupt("chat")
+    roster.interrupt("chat", "the chat was reloaded")
     roster.apply("chat", completed("running"))
     roster.apply("chat", paused("paused", False))
     assert rows(roster) == before
+
+    # The note says why they stopped.
+    roster.interrupt("other-chat", subagent_tab.RELOADED)
+    elsewhere = row(roster, "elsewhere", "other-chat")
+    assert (elsewhere["status"], elsewhere["note"]) == ("stopped", "the chat was reloaded")
 
 
 def test_forget_drops_only_that_chats_rows():

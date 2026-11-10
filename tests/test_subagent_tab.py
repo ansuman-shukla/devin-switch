@@ -447,7 +447,7 @@ def test_subagents_a_dead_native_left_running_read_stopped(
 ):
     if noticed == "replacement":
         # Should an exit ever go unnoticed, the native that takes over still knows.
-        monkeypatch.setattr(acp.Bridge, "stop_subagents", lambda self, backend: None)
+        monkeypatch.setattr(acp.Bridge, "interrupt_subagents", lambda self, backend: None)
 
     async def scenario():
         async with in_process(acp_native) as (bridge, _):
@@ -479,7 +479,7 @@ def test_an_old_natives_late_exit_leaves_its_successors_subagents_alone(acp_nati
             turn = delegate(bridge, chat)
             await until(lambda: states(roster, session_id) == {AGENT: "running"})
             # The old native's cleanup can finish late (it waits on Desktop's pipe).
-            bridge.stop_subagents(old)
+            bridge.interrupt_subagents(old)
             assert states(roster, session_id) == {AGENT: "running"}
             await stop(bridge, chat, turn)
             assert states(roster, session_id) == {AGENT: "failed"}

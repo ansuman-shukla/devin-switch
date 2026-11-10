@@ -606,7 +606,7 @@ class Backend:
             self.pump.cancel()
             with suppress(asyncio.CancelledError):
                 await self.pump
-        self.bridge.stop_subagents(self)
+        self.bridge.interrupt_subagents(self)
         self.lease.close(ended=True)
         await self.bridge.drop_client_requests(self)
         self.close_pipes()
@@ -1295,7 +1295,7 @@ class Bridge:
         except (SwitchError, OSError):
             pass
 
-    def stop_subagents(self, backend):
+    def interrupt_subagents(self, backend):
         """A native that exited took its subagents along; a newer native's are not its own."""
         chat = self.chats.get(backend.session_id)
         if chat is not None and chat.backend is backend:

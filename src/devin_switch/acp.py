@@ -58,6 +58,10 @@ LOCAL_COMMANDS = [
         "description": "Ask on the side in a Side chat tab; this chat keeps working",
         "input": {"hint": "question"},
     },
+    {
+        "name": "subagents",
+        "description": "Show this chat's subagents live in a tab; this chat keeps working",
+    },
 ]
 LOCAL_NAMES = {"/" + command["name"] for command in LOCAL_COMMANDS}
 AGENT_STOPPED = "_cognition.ai/agent_stopped"
@@ -890,6 +894,9 @@ class Bridge:
         ):
             # Answered on the chat's side page, so it never waits for (or joins) the turn.
             return await self.side_question(chat, question)
+        if method == "session/prompt" and prompt_command(params)[2] == "/subagents":
+            # A view beside the chat: like /btw it never waits for (or joins) the turn.
+            return await self.show_subagents(chat)
         if method in SIDE_REQUESTS and chat.suspended and await self.held_elsewhere(session_id):
             # The native answers this for a chat it hasn't loaded; Desktop ignores it quietly.
             raise RpcError("Session not found: this chat is open in another window.", -32602)
@@ -1096,6 +1103,18 @@ class Bridge:
         if not showing:
             async with chat.backend.emitting:
                 await self.emit({"jsonrpc": "2.0", **server.opened(chat.session_id)})
+        return {"stopReason": "end_turn"}
+
+    async def show_subagents(self, chat):
+        """A /subagents typed in the chat: its live Subagents page opens as a Browser tab of it.
+
+        Desktop opens a new tab for every notice, so a chat whose page is connected gets none.
+        Nothing reaches the chat's agent or waits for its turn.
+        """
+        if not self.roster.showing(chat.session_id):
+            notice = self.side_server.opened(chat.session_id, "subagents")
+            async with chat.backend.emitting:
+                await self.emit({"jsonrpc": "2.0", **notice})
         return {"stopReason": "end_turn"}
 
     async def side_cancel(self, session_id):

@@ -2,12 +2,22 @@ import asyncio
 import json
 import re
 import time
-from urllib.parse import quote
+from urllib.parse import quote, urlsplit
 
 import pytest
 from test_acp import acp_native as acp_native  # noqa: F401 (a fixture)
-from test_acp import in_process, prompt_params, subagent_events, until
-from test_side import lines, request
+from test_acp import (
+    connect,
+    in_process,
+    logged,
+    prompt_params,
+    replayed,
+    replayed_texts,
+    subagent_events,
+    until,
+    wait_for_text,
+)
+from test_side import lines, opened, request
 
 from devin_switch import acp, side, subagent_tab
 from devin_switch.store import SwitchError
@@ -625,5 +635,90 @@ def test_the_subagents_page_needs_its_token_and_a_loopback_host(acp_native, tmp_
             for name in ("notes.js", "../outside.js", "side.js", "", "subagents.js/x"):
                 assert (await get(port, f"/subagents/assets/{name}?t={token}"))[0] == 404
             assert (await get(port, f"/side/assets/subagents.js?t={token}"))[0] == 404
+
+    asyncio.run(scenario())
+
+
+def test_subagents_command_opens_the_tab_without_waiting_for_the_turn(acp_native, tmp_path):
+    async def scenario():
+        async with connect(acp_native) as client:
+            session_id = await client.new(tmp_path)
+            turn = asyncio.create_task(client.prompt(session_id, "delegate"))
+            await wait_for_text(client, "live progress")
+
+            start = len(client.messages)
+            asked = await asyncio.wait_for(client.prompt(session_id, " /subagents"), 5)
+            assert asked["result"] == {"stopReason": "end_turn"} and not turn.done()
+            (preview,) = opened(client.messages[start:])
+            assert set(preview) == {"sessionId", "previewUrl"}
+            assert preview["sessionId"] == session_id
+            url = urlsplit(preview["previewUrl"])
+            assert (url.scheme, url.hostname) == ("http", "127.0.0.1")
+            assert url.path == f"/subagents/{quote(session_id, safe='')}"
+            assert url.query.startswith("t=") and len(url.query) > 20
+            # The chat itself shows nothing of it.
+            assert replayed(client.messages[start:], "agent_message_chunk") == []
+
+            # The tab loads the page, whose event stream shows the turn's subagent.
+            status, _, body = await get(url.port, f"{url.path}?{url.query}")
+            assert status == 200 and f'data-session="{session_id}"' in body
+            events = f"/subagents/events?session={quote(session_id, safe='')}&{url.query}"
+            status, reader, stream = await request(url.port, "GET", events)
+            assert status == 200
+            async with asyncio.timeout(10):
+                while not (shown := (await lines(reader, 1))[0]["subagents"]):
+                    pass
+            assert [(item["id"], item["status"]) for item in shown] == [(AGENT, "running")]
+
+            # Desktop opens a new tab per notice: a chat whose page is connected gets none.
+            start = len(client.messages)
+            again = await asyncio.wait_for(client.prompt(session_id, "/subagents"), 5)
+            assert again["result"] == {"stopReason": "end_turn"}
+            assert opened(client.messages[start:]) == []
+            # Closing the tab is noticed at once, so the next /subagents opens it again.
+            stream.close()
+            async with asyncio.timeout(side.KEEPALIVE / 3):
+                while not opened(client.messages[start:]):
+                    await asyncio.sleep(0.05)
+                    await asyncio.wait_for(client.prompt(session_id, "/subagents"), 5)
+            assert len(opened(client.messages[start:])) == 1
+
+            # A reload mid-turn replays the chat: neither the command nor a tab to reopen.
+            start = len(client.messages)
+            params = {"sessionId": session_id, "cwd": str(tmp_path), "mcpServers": []}
+            await asyncio.wait_for(client.request("session/load", params), 5)
+            replay = client.messages[start:]
+            assert replayed_texts(replay, "user_message_chunk") == ["delegate"]
+            assert opened(replay) == []
+            assert not turn.done()
+            await client.send({"method": "session/cancel", "params": {"sessionId": session_id}})
+            assert (await turn)["result"]["stopReason"] == "cancelled"
+
+        prompts = [call["text"] for call in logged(acp_native) if call["text"] is not None]
+        assert prompts == ["delegate"]
+        assert not any("subagents" in text for text in client.texts())
+        (*_, latest) = replayed(client.messages, "available_commands_update")
+        names = [item["name"] for item in latest["availableCommands"]]
+        assert names.count("subagents") == 1 and {"help", "btw"} <= set(names)
+
+    asyncio.run(scenario())
+
+
+def test_subagents_command_does_not_wake_a_chat_released_for_idleness(acp_native, tmp_path):
+    async def scenario():
+        async with in_process(acp_native) as (bridge, messages):
+            chat = await new_chat(bridge, tmp_path)
+            chat.backend.last_activity -= acp.IDLE_TIMEOUT + 1
+            assert await bridge.release_idle(chat)
+            calls = [call for call in logged(acp_native) if call["sessionId"] == chat.session_id]
+            reply = await bridge.dispatch(
+                "session/prompt", prompt_params(chat.session_id, "/subagents")
+            )
+            assert reply == {"stopReason": "end_turn"} and chat.suspended
+            (preview,) = opened(messages)
+            assert f"/subagents/{chat.session_id}?t=" in preview["previewUrl"]
+            assert calls == [
+                call for call in logged(acp_native) if call["sessionId"] == chat.session_id
+            ]
 
     asyncio.run(scenario())

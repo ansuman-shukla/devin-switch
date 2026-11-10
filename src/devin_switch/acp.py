@@ -9,7 +9,16 @@ from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from devin_switch import acp_state, handoff, relay, sessions, side, subagents, tool_folders
+from devin_switch import (
+    acp_state,
+    agent_browser,
+    handoff,
+    relay,
+    sessions,
+    side,
+    subagents,
+    tool_folders,
+)
 from devin_switch.native import Native
 from devin_switch.store import Account, SwitchError, write_json
 
@@ -1198,11 +1207,13 @@ class Bridge:
     async def upkeep(self):
         """Daily housekeeping, in the background and never during a chat open.
 
-        Old launch records slow every chat open, and tool folders that logins filled
-        privately are moved to the one shared copy.
+        Old launch records slow every chat open, native logs and agent-browser caches were
+        never deleted, and tool folders that logins filled privately are moved to the one
+        shared copy.
         """
-        for task in (sessions.prune, tool_folders.adopt):
-            with suppress(OSError, SwitchError):
+        for task in (sessions.prune, sessions.prune_logs, agent_browser.sweep, tool_folders.adopt):
+            # The sweep asks `ps` which Chrome is running.
+            with suppress(OSError, SwitchError, subprocess.SubprocessError):
                 await asyncio.to_thread(task, self.native.store)
 
     async def drop_spare(self):

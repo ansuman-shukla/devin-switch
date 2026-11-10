@@ -1,3 +1,4 @@
+import fcntl
 import json
 import os
 import queue
@@ -438,3 +439,189 @@ def test_blocked_lookup_asks_only_for_a_profile_that_was_never_copied(store: Sto
     assert [request["items"] for request in popup.requests] == [["Local State"]]
     with pytest.raises(SwitchError, match="No Chrome profile matches"):
         agent_browser.resolve(store, "nobody@example.invalid")
+
+
+CACHES = (
+    "Default/Cache/Cache_Data/f_000001",
+    "Default/Code Cache/js/index",
+    "Default/GPUCache/data_1",
+    "Default/Service Worker/CacheStorage/origin/cache",
+    "Default/Service Worker/ScriptCache/index",
+    "Profile 2/Cache/Cache_Data/f_000002",
+    "Profile 2/Code Cache/wasm/index",
+    "component_crx_cache/component",
+    "extensions_crx_cache/extension",
+    "GraphiteDawnCache/data_1",
+    "GPUPersistentCache/data_1",
+    "GrShaderCache/data_1",
+    "ShaderCache/data_1",
+)
+LOGINS = (
+    "Default/Cookies",
+    "Default/Cookies-journal",
+    "Default/Network/Cookies",
+    "Default/Local Storage/leveldb/000003.log",
+    "Default/IndexedDB/https_site.invalid_0.indexeddb.leveldb/000004.log",
+    "Default/Session Storage/000005.log",
+    "Default/Service Worker/Database/000006.log",
+    "Default/WebStorage/QuotaManager",
+    "Default/Preferences",
+    "Default/Extensions/extension-id/1.0/manifest.json",
+    # The same names anywhere else are not Chrome's caches.
+    "Default/Extensions/extension-id/1.0/Cache/asset",
+    "Default/Local Storage/GPUCache/entry",
+    "Profile 2/Cookies",
+    "Guest Profile/Cache/kept",
+    "Local State",
+    "First Run",
+)
+
+
+def fill(data: Path, names: tuple[str, ...]) -> dict[str, bytes]:
+    for name in names:
+        (data / name).parent.mkdir(parents=True, exist_ok=True)
+        (data / name).write_bytes(os.urandom(64))
+    return contents(data)
+
+
+def contents(data: Path) -> dict[str, bytes]:
+    return {
+        str(path.relative_to(data)): path.read_bytes()
+        for path in sorted(data.rglob("*"))
+        if path.is_file() and not path.is_symlink()
+    }
+
+
+def test_chrome_starts_with_capped_web_and_media_caches(tmp_path: Path) -> None:
+    assert agent_browser.DISK_CACHE_LIMIT == agent_browser.MEDIA_CACHE_LIMIT == 104857600
+    for headed in (False, True):
+        command = agent_browser.chrome_command(tmp_path, headed)
+        assert "--disk-cache-size=104857600" in command
+        assert "--media-cache-size=104857600" in command
+        assert command[-1] == "about:blank" and f"--user-data-dir={tmp_path}" in command
+
+
+def test_trim_deletes_only_caches_and_keeps_logins_byte_identical(tmp_path: Path) -> None:
+    data = tmp_path / "user-data"
+    logins = fill(data, LOGINS)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "precious").write_text("not a cache")
+    (data / "Profile 2/GPUCache").symlink_to(outside)
+    assert set(fill(data, CACHES)) == set(logins) | set(CACHES)
+
+    agent_browser.trim(data)
+
+    assert contents(data) == logins
+    for folder in (
+        "Default/Cache",
+        "Default/Code Cache",
+        "Default/GPUCache",
+        "Default/Service Worker/CacheStorage",
+        "Default/Service Worker/ScriptCache",
+        "Profile 2/Cache",
+        "Profile 2/Code Cache",
+        "component_crx_cache",
+        "extensions_crx_cache",
+        "GraphiteDawnCache",
+        "GPUPersistentCache",
+        "GrShaderCache",
+        "ShaderCache",
+    ):
+        assert not (data / folder).exists()
+    assert (data / "Profile 2/GPUCache").is_symlink()
+    assert (outside / "precious").read_text() == "not a cache"
+    # Nothing left to trim is fine, as is a copy that was never opened.
+    agent_browser.trim(data)
+    agent_browser.trim(tmp_path / "missing")
+    assert contents(data) == logins
+
+
+def test_trim_never_leaves_the_copy_through_a_linked_folder(tmp_path: Path) -> None:
+    data = tmp_path / "user-data"
+    data.mkdir()
+    elsewhere = tmp_path / "elsewhere"
+    for folder in ("profile/Cache", "worker/CacheStorage"):
+        (elsewhere / folder).mkdir(parents=True)
+        (elsewhere / folder / "precious").write_text("not this copy's cache")
+    (data / "Default").symlink_to(elsewhere / "profile")
+    (data / "Profile 1").mkdir()
+    (data / "Profile 1/Service Worker").symlink_to(elsewhere / "worker")
+
+    agent_browser.trim(data)
+
+    for folder in ("profile/Cache", "worker/CacheStorage"):
+        assert (elsewhere / folder / "precious").read_text() == "not this copy's cache"
+
+
+def test_supervisor_trims_the_cache_once_chrome_has_closed(store: Store, fakes: None) -> None:
+    client = Client(store)
+    client.tool("browser_profile", profile="Profile 3")
+    data = agent_browser.folder_for(store, "Profile 3") / "user-data"
+    supervisor = agent_browser.state(store, "Profile 3")["supervisor"]
+    logins = contents(data)
+    assert {"Default/Cookies", "launches", "DevToolsActivePort"} <= set(logins)
+    filled = fill(data, CACHES)
+    time.sleep(1)
+    # Never while Chrome runs on this copy.
+    assert agent_browser.running(store, "Profile 3") and contents(data) == filled
+
+    client.close()
+
+    wait_until(lambda: not agent_browser.alive(supervisor))
+    del logins["DevToolsActivePort"]
+    assert contents(data) == logins
+    assert agent_browser.chrome_pid(data) is None
+
+
+def test_daily_sweep_trims_only_idle_profile_copies(store: Store, fakes: None) -> None:
+    now = time.time()
+    day = 24 * 3600
+    copies = {}
+    for directory in ("Profile 3", "Profile 7", "Profile 8"):
+        agent_browser.clone(store, agent_browser.resolve(store, directory))
+        copies[directory] = agent_browser.folder_for(store, directory) / "user-data"
+        fill(copies[directory], CACHES)
+    idle, leased, open_copy = copies["Profile 3"], copies["Profile 7"], copies["Profile 8"]
+    # A profile that was never copied has nothing to trim.
+    agent_browser.private_folder(store, "Profile 9")
+    expected = {name: contents(data) for name, data in copies.items()}
+    logins = {name: value for name, value in expected["Profile 3"].items() if name not in CACHES}
+
+    # A chat holds the lease shared; a Chrome may also run without any lease left.
+    chat = os.open(leased.parent / "lease.lock", os.O_RDWR | os.O_CREAT, 0o600)
+    fcntl.flock(chat, fcntl.LOCK_SH)
+    running = subprocess.Popen(
+        agent_browser.chrome_command(open_copy, False), stdin=subprocess.DEVNULL
+    )
+    try:
+        wait_until(lambda: agent_browser.chrome_pid(open_copy) == running.pid)
+        wait_until(lambda: (open_copy / "launches").exists())
+        expected["Profile 8"] = contents(open_copy)
+
+        assert agent_browser.sweep(store, now=now) == 1
+
+        assert contents(idle) == logins
+        assert contents(leased) == expected["Profile 7"]
+        assert contents(open_copy) == expected["Profile 8"]
+        # The chat keeps its lease, and the swept copies are free for chats again.
+        for data in (idle, open_copy):
+            probe = os.open(data.parent / "lease.lock", os.O_RDWR)
+            fcntl.flock(probe, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            os.close(probe)
+        assert not (agent_browser.folder_for(store, "Profile 9") / "lease.lock").exists()
+
+        # At most once a day.
+        refilled = fill(idle, CACHES)
+        assert agent_browser.sweep(store, now=now + day - 1) == 0
+        assert contents(idle) == refilled
+    finally:
+        os.close(chat)
+        running.terminate()
+        running.wait(timeout=15)
+
+    assert agent_browser.sweep(store, now=now + day) == 3
+    for data in copies.values():
+        assert not set(contents(data)) & set(CACHES)
+    assert contents(idle) == logins
+    assert contents(leased)["Default/Cookies"] == expected["Profile 7"]["Default/Cookies"]

@@ -502,6 +502,58 @@ def test_prune_removes_only_old_finished_launch_records(store, tmp_path):
     assert sessions.prune(store, now=now + day + 1) == 2
 
 
+def test_prune_logs_removes_only_native_logs_not_written_for_a_week(store, tmp_path):
+    from devin_switch import sessions
+
+    now = time.time()
+    day = 24 * 3600
+    cli_folder = store.root / "shared/cli"
+    logs = cli_folder / "logs"
+    # Nothing to do before any native has logged; that still counts as the day's run.
+    assert not logs.exists()
+    assert sessions.prune_logs(store, now=now - 2 * day) == 0
+    assert not logs.exists()
+
+    def aged(path, days, text="log"):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(text)
+        os.utime(path, (now - days * day, now - days * day))
+        return path
+
+    old = [aged(logs / "old-1.log", 8), aged(logs / "old-2.log", 7.001)]
+    # A long-running native keeps writing its log, so it stays fresh.
+    kept = [
+        aged(logs / "running.log", 0),
+        aged(logs / "recent.log", 6.999),
+        aged(logs / "archive/old-nested.log", 30),
+        aged(cli_folder / "sessions.db", 30, "history"),
+        aged(cli_folder / "session_locks/chat.lock", 30),
+        aged(cli_folder / "transcripts/chat.jsonl", 30, "transcript"),
+        aged(cli_folder / "plugins/plugin.json", 30, "{}"),
+        aged(store.root / "shared/summaries/old.md", 30),
+    ]
+    outside = aged(tmp_path / "outside.log", 30, "not a native log")
+    (logs / "linked.log").symlink_to(outside)
+    os.utime(logs / "archive", (now - 30 * day, now - 30 * day))
+
+    assert sessions.prune_logs(store, now=now) == 2
+
+    assert not any(path.exists() for path in old)
+    assert all(path.exists() for path in kept)
+    assert (logs / "linked.log").is_symlink() and outside.read_text() == "not a native log"
+    assert (cli_folder / "sessions.db").read_text() == "history"
+    # At most once a day.
+    late = aged(logs / "old-3.log", 9)
+    assert sessions.prune_logs(store, now=now + day - 1) == 0
+    assert late.exists()
+    assert sessions.prune_logs(store, now=now + day) == 2
+    assert not late.exists() and not (logs / "recent.log").exists()
+    assert (logs / "running.log").exists()
+    # Launch records keep their own daily marker.
+    assert json.loads((store.root / "logs-pruned.json").read_text()) == now + day
+    assert not (store.root / "runs-pruned.json").exists()
+
+
 def test_distinct_saved_chats_can_resume_in_same_repository(signed_in, tmp_path, monkeypatch):
     from devin_switch import sessions
 

@@ -24,6 +24,7 @@ from pathlib import Path
 from devin_switch import browser, chrome_access, handoff
 from devin_switch.executable import command_prefix
 from devin_switch.native import user_config_home
+from devin_switch.sessions import PRUNE_INTERVAL
 from devin_switch.store import (
     Account,
     Store,
@@ -46,6 +47,27 @@ CLONED = (
     "Storage",
     "Preferences",
 )
+# Chrome's web cache is otherwise uncapped: 1.2 GB of a 1.8 GB copy, beside a few MB of logins.
+DISK_CACHE_LIMIT = 100 * 1024 * 1024
+MEDIA_CACHE_LIMIT = 100 * 1024 * 1024
+# Rebuildable folders only. Cookies and site data (Cookies, Local Storage, IndexedDB, Session
+# Storage, Service Worker/Database, Preferences, Local State, Extensions) are never listed.
+PROFILE_CACHES = (
+    "Cache",
+    "Code Cache",
+    "GPUCache",
+    "Service Worker/CacheStorage",
+    "Service Worker/ScriptCache",
+)
+BROWSER_CACHES = (
+    "component_crx_cache",
+    "extensions_crx_cache",
+    "GraphiteDawnCache",
+    "GPUPersistentCache",
+    "GrShaderCache",
+    "ShaderCache",
+)
+TRIM_MARKER = "browser-trimmed.json"
 LINE_LIMIT = 256 * 1024 * 1024
 LOCAL = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 INSTRUCTIONS = (
@@ -318,6 +340,8 @@ def chrome_command(data: Path, headed: bool) -> list[str]:
         "--no-first-run",
         "--no-default-browser-check",
         "--hide-crash-restore-bubble",
+        f"--disk-cache-size={DISK_CACHE_LIMIT}",
+        f"--media-cache-size={MEDIA_CACHE_LIMIT}",
         *window,
         "about:blank",
     ]
@@ -369,6 +393,54 @@ def terminate(pid: int) -> None:
             time.sleep(0.1)
 
 
+def trim(data: Path) -> None:
+    """Delete the rebuildable caches of a Chrome user-data directory, and nothing else."""
+    root = data.resolve()
+    profiles = (*data.glob("Default"), *data.glob("Profile [0-9]*"))
+    for cache in (
+        *(profile / name for profile in profiles for name in PROFILE_CACHES),
+        *(data / name for name in BROWSER_CACHES),
+    ):
+        # A linked profile or parent folder leads outside this copy. Missing folders are
+        # fine, and rmtree refuses to follow a link.
+        if cache.parent.resolve().is_relative_to(root):
+            shutil.rmtree(cache, ignore_errors=True)
+
+
+def trim_idle(lease: int, data: Path) -> bool:
+    """Trim a profile copy no chat holds and no Chrome runs on.
+
+    The exclusive lease is what chats hold shared, so none can start Chrome meanwhile; the
+    caller releases it by closing the descriptor.
+    """
+    try:
+        fcntl.flock(lease, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        return False
+    if chrome_pid(data) is not None:
+        return False
+    trim(data)
+    return True
+
+
+def sweep(store: Store, *, now: float | None = None) -> int:
+    """Trim every idle profile copy, at most once a day, so unopened ones shrink too.
+
+    The copies themselves stay: making one again needs the macOS permission popup.
+    """
+    now = time.time() if now is None else now
+    if not store.due(TRIM_MARKER, PRUNE_INTERVAL, now):
+        return 0
+    trimmed = 0
+    for data in sorted((store.root / "browser" / "profiles").glob("*/user-data")):
+        lease = os.open(data.parent / "lease.lock", os.O_RDWR | os.O_CREAT, 0o600)
+        try:
+            trimmed += trim_idle(lease, data)
+        finally:
+            os.close(lease)
+    return trimmed
+
+
 def supervise(store: Store, directory: str, headed: bool, token: str) -> None:
     if os.fork():
         os._exit(0)
@@ -408,6 +480,9 @@ def supervise(store: Store, directory: str, headed: bool, token: str) -> None:
                 (folder / "state.json").unlink()
         except (OSError, ValueError):
             pass
+        # Last, still under the lease: a chat that restarts or refreshes this browser holds
+        # the lease itself, and then the copy is left as it is.
+        trim_idle(lease, data)
 
 
 def start_supervisor(store: Store, profile: browser.ChromeProfile, headed: bool) -> dict:

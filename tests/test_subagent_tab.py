@@ -11,6 +11,7 @@ from test_acp import (
     in_process,
     logged,
     prompt_params,
+    prompts,
     replayed,
     replayed_texts,
     subagent_events,
@@ -797,5 +798,35 @@ def test_subagents_command_does_not_wake_a_chat_released_for_idleness(acp_native
             assert calls == [
                 call for call in logged(acp_native) if call["sessionId"] == chat.session_id
             ]
+
+    asyncio.run(scenario())
+
+
+def test_subagents_command_ignores_what_follows_it_but_is_a_whole_word(acp_native, tmp_path):
+    async def scenario():
+        async with in_process(acp_native) as (bridge, messages):
+            chat = await new_chat(bridge, tmp_path)
+            image = {"type": "image", "data": "aGk=", "mimeType": "image/png"}
+            for blocks in (
+                [{"type": "text", "text": "/subagents extra words"}],
+                [{"type": "text", "text": "/subagents"}, image],
+            ):
+                start = len(messages)
+                reply = await bridge.dispatch(
+                    "session/prompt", {"sessionId": chat.session_id, "prompt": blocks}
+                )
+                assert reply == {"stopReason": "end_turn"}
+                (preview,) = opened(messages[start:])
+                assert f"/subagents/{chat.session_id}?t=" in preview["previewUrl"]
+            assert prompts(acp_native) == []
+
+            # A longer first word is not this command: the agent gets it as typed.
+            start = len(messages)
+            reply = await bridge.dispatch(
+                "session/prompt", prompt_params(chat.session_id, "/subagents-foo")
+            )
+            assert reply == {"stopReason": "end_turn"}
+            assert opened(messages[start:]) == []
+            assert prompts(acp_native) == [("ansuman-1", "/subagents-foo")]
 
     asyncio.run(scenario())

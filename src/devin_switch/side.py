@@ -11,6 +11,9 @@ the `browserPreview/opened` notice the native's own previews use, and Desktop lo
 A `browser_preview` tool call would not do: Desktop loads such named port previews through a
 cloud access link, which a local chat never gets. Nor would an editor panel: Desktop switches
 the agents view to IDE mode for any editor tab.
+
+The same server, port and token serve the chat's Subagents page (`subagent_tab.py`) under
+`/subagents/`, opened by `/subagents` the same way.
 """
 
 import asyncio
@@ -22,6 +25,7 @@ from contextlib import suppress
 from pathlib import Path
 from urllib.parse import parse_qs, quote, unquote, urlsplit
 
+from devin_switch import subagent_tab
 from devin_switch.store import SwitchError
 
 CHAIN = "cognition.ai/chain"
@@ -89,7 +93,7 @@ def btw_question(text: str) -> str | None:
 
 
 class Server:
-    """Each chat's side page, for Desktop's in-chat preview: loopback HTTP behind a token."""
+    """Each chat's side and Subagents pages, for Desktop's preview: loopback HTTP behind a token."""
 
     def __init__(self, bridge):
         self.bridge = bridge
@@ -113,13 +117,17 @@ class Server:
         for queues in self.listeners.values():
             for queue in queues:
                 queue.put_nowait(None)
+        self.bridge.roster.close()
 
-    def path(self, session_id: str) -> str:
-        return f"/side/{quote(session_id, safe='')}?t={self.token}"
+    def path(self, session_id: str, page: str = "side") -> str:
+        return f"/{page}/{quote(session_id, safe='')}?t={self.token}"
 
-    def opened(self, session_id: str) -> dict:
-        """The notice that makes Desktop open the chat's side page as a new Browser tab of it."""
-        url = f"http://127.0.0.1:{self.port}{self.path(session_id)}"
+    def opened(self, session_id: str, page: str = "side") -> dict:
+        """The notice that makes Desktop open one of the chat's pages as a new Browser tab of it.
+
+        `page` is "side" or "subagents".
+        """
+        url = f"http://127.0.0.1:{self.port}{self.path(session_id, page)}"
         return {"method": OPENED, "params": {"sessionId": session_id, "previewUrl": url}}
 
     def showing(self, session_id: str) -> bool:
@@ -155,6 +163,14 @@ class Server:
                 return await respond(writer, 200, "{}", "application/json")
             if method == "GET" and route.startswith("/side/") and route.count("/") == 2:
                 return await respond(writer, 200, self.page(unquote(route[6:])), "text/html")
+            if method == "GET" and route.startswith("/subagents/assets/"):
+                name = route.removeprefix("/subagents/assets/")
+                return await asset(writer, subagent_tab.PAGE, subagent_tab.ASSETS, name)
+            if method == "GET" and route == "/subagents/events":
+                return await self.subagent_events(reader, writer, query.get("session", ""))
+            if method == "GET" and route.startswith("/subagents/") and route.count("/") == 2:
+                shell = subagent_tab.page(unquote(route.removeprefix("/subagents/")), self.token)
+                return await respond(writer, 200, shell, "text/html")
             await respond(writer, 404, "Not found")
         except (ValueError, AttributeError, OSError, asyncio.IncompleteReadError):
             with suppress(OSError):
@@ -191,6 +207,14 @@ class Server:
             self.listeners[session_id].discard(queue)
             if not self.listeners[session_id]:
                 del self.listeners[session_id]
+
+    async def subagent_events(
+        self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter, session_id: str
+    ) -> None:
+        """Server-sent snapshots of one chat's subagents: on connecting, then on each change."""
+        roster = self.bridge.roster
+        with roster.listen(session_id) as queue:
+            await stream(reader, writer, queue, lambda _: roster.snapshot(session_id))
 
     async def answer(
         self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter, request: dict

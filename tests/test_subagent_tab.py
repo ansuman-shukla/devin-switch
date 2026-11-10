@@ -2,12 +2,14 @@ import asyncio
 import json
 import re
 import time
+from urllib.parse import quote
 
 import pytest
 from test_acp import acp_native as acp_native  # noqa: F401 (a fixture)
 from test_acp import in_process, prompt_params, subagent_events, until
+from test_side import lines, request
 
-from devin_switch import acp, subagent_tab
+from devin_switch import acp, side, subagent_tab
 from devin_switch.store import SwitchError
 
 AGENT = "acb63708"
@@ -486,5 +488,142 @@ def test_closing_a_chat_forgets_its_subagents(acp_native, tmp_path):
             await bridge.dispatch("session/close", {"sessionId": chat.session_id})
             assert rows(bridge.roster, chat.session_id) == []
             assert states(bridge.roster, other.session_id) == {"elsewhere": "running"}
+
+    asyncio.run(scenario())
+
+
+async def get(port, target, host=None):
+    """Status, headers and body of a request the server answers and closes."""
+    reader, writer = await asyncio.open_connection("127.0.0.1", port)
+    writer.write(f"GET {target} HTTP/1.1\r\nHost: {host or f'127.0.0.1:{port}'}\r\n\r\n".encode())
+    await writer.drain()
+    head, _, body = (await asyncio.wait_for(reader.read(), 10)).decode().partition("\r\n\r\n")
+    writer.close()
+    status, *fields = head.split("\r\n")
+    return int(status.split()[1]), dict(field.split(": ", 1) for field in fields), body
+
+
+async def quiet(reader):
+    """Whether an event stream stays open without sending anything for a moment."""
+    try:
+        async with asyncio.timeout(0.3):
+            while line := await reader.readline():
+                if line.startswith(b"data:"):
+                    return False
+    except TimeoutError:
+        return True
+    return False
+
+
+def events_url(server, session_id):
+    return f"/subagents/events?session={quote(session_id, safe='')}&t={server.token}"
+
+
+def test_the_subagents_page_streams_a_chats_rows_as_they_change(acp_native, tmp_path, monkeypatch):
+    gate = tmp_path / "next-step"
+    monkeypatch.setenv("FAKE_SUBAGENT_GATE", str(gate))
+
+    async def scenario():
+        async with in_process(acp_native) as (bridge, _):
+            chat = await new_chat(bridge, tmp_path)
+            session_id, roster, server = chat.session_id, bridge.roster, bridge.side_server
+            turn = delegate(bridge, chat)
+            await until(lambda: states(roster, session_id) == {AGENT: "running"})
+            await until(lambda: row(roster, AGENT, session_id)["step"] == "Running command")
+            assert not roster.showing(session_id)
+
+            status, reader, writer = await request(
+                server.port, "GET", events_url(server, session_id)
+            )
+            assert status == 200
+            _, idle, _ = await request(server.port, "GET", events_url(server, "another-chat"))
+            # The rows as they are, right after connecting.
+            (first,) = await lines(reader, 1)
+            assert first == roster.snapshot(session_id)
+            (running,) = first["subagents"]
+            assert set(running) == {
+                "id",
+                "title",
+                "profile",
+                "background",
+                "status",
+                "started",
+                "ended",
+                "step",
+                "note",
+            }
+            assert (running["id"], running["status"], running["step"]) == (
+                AGENT,
+                "running",
+                "Running command",
+            )
+            assert await lines(idle, 1) == [{"subagents": []}]
+            assert roster.showing(session_id)
+
+            gate.touch()
+            (second,) = await lines(reader, 1)
+            assert second == {"subagents": [{**running, "step": "Ran sleep"}]}
+
+            await stop(bridge, chat, turn)
+            (third,) = await lines(reader, 1)
+            (ended,) = third["subagents"]
+            assert (ended["status"], ended["note"]) == ("failed", "[Error] Canceled by user")
+            assert ended["ended"] >= ended["started"] and ended["step"] == "Ran sleep"
+            # Another chat's page heard nothing of it.
+            assert await quiet(idle)
+
+            # Closing the tab is noticed at once, well before the keepalive.
+            writer.close()
+            await until(lambda: not roster.showing(session_id), side.KEEPALIVE / 3)
+            assert roster.showing("another-chat")
+
+    asyncio.run(scenario())
+
+
+def test_the_subagents_page_needs_its_token_and_a_loopback_host(acp_native, tmp_path, monkeypatch):
+    # The real page files are not this test's business: serve stand-ins.
+    folder = tmp_path / "page"
+    folder.mkdir()
+    kinds = {
+        "subagents.css": "text/css",
+        "subagents-view.js": "text/javascript",
+        "subagents.js": "text/javascript",
+    }
+    for name in (*kinds, "notes.js"):
+        (folder / name).write_text(f"/* stand-in {name} */")
+    (tmp_path / "outside.js").write_text("/* outside */")
+    monkeypatch.setattr(subagent_tab, "PAGE", folder)
+
+    async def scenario():
+        async with in_process(acp_native) as (bridge, _):
+            server = bridge.side_server
+            port, token = server.port, server.token
+            page = server.path('chat-1<"&>', "subagents")
+            assert page == f"/subagents/chat-1%3C%22%26%3E?t={token}"
+            routes = (page, f"/subagents/assets/subagents.js?t={token}", events_url(server, "c"))
+            for route in routes:
+                assert (await get(port, route.replace(token, "wrong")))[0] == 403
+                assert (await get(port, route.replace(f"t={token}", "")))[0] == 403
+                assert (await get(port, route, host="evil.example"))[0] == 403
+            assert not bridge.roster.showing("c")
+
+            for host in (None, f"localhost:{port}"):
+                status, headers, shell = await get(port, page, host)
+                assert status == 200 and headers["Content-Type"].startswith("text/html")
+                assert (
+                    f'<body data-session="chat-1&lt;&quot;&amp;&gt;" data-token="{token}">' in shell
+                )
+                assert [f"/subagents/assets/{name}?t={token}" in shell for name in kinds] == [
+                    True
+                ] * 3
+
+            for name, kind in kinds.items():
+                status, headers, body = await get(port, f"/subagents/assets/{name}?t={token}")
+                assert (status, body) == (200, f"/* stand-in {name} */")
+                assert headers["Content-Type"] == f"{kind}; charset=utf-8"
+            # Only the page's three files, whatever else its folder (or the side page) holds.
+            for name in ("notes.js", "../outside.js", "side.js", "", "subagents.js/x"):
+                assert (await get(port, f"/subagents/assets/{name}?t={token}"))[0] == 404
+            assert (await get(port, f"/side/assets/subagents.js?t={token}"))[0] == 404
 
     asyncio.run(scenario())

@@ -648,6 +648,74 @@ def test_the_subagents_page_needs_its_token_and_a_loopback_host(acp_native, tmp_
     asyncio.run(scenario())
 
 
+def native_loads(native):
+    return [call["pid"] for call in logged(native) if call["method"] == "session/load"]
+
+
+@pytest.mark.parametrize("method", ["session/load", "session/resume"])
+def test_reloading_an_idle_chat_stops_the_rows_its_native_wiped(acp_native, tmp_path, method):
+    async def scenario():
+        async with in_process(acp_native) as (bridge, _):
+            chat, other = await new_chat(bridge, tmp_path), await new_chat(bridge, tmp_path)
+            session_id, roster, server = chat.session_id, bridge.roster, bridge.side_server
+            native = chat.backend
+
+            # A reload during a turn is answered from the bridge's own record: nothing is wiped.
+            turn = delegate(bridge, chat)
+            await until(lambda: states(roster, session_id) == {AGENT: "running"})
+            await bridge.dispatch(method, chat.setup)
+            assert states(roster, session_id) == {AGENT: "running"}
+            assert native_loads(acp_native) == []
+            await stop(bridge, chat, turn)
+            (failed,) = rows(roster, session_id)
+            assert failed["status"] == "failed"
+
+            # The fake's delegate turn keeps its prompt open, so an idle chat's rows are fed in.
+            for agent in ("b2", "c3"):
+                roster.apply(session_id, started(agent))
+            roster.apply(session_id, paused("c3", True))
+            roster.apply(other.session_id, started("elsewhere"))
+            _, reader, writer = await request(server.port, "GET", events_url(server, session_id))
+            await lines(reader, 1)
+
+            await bridge.dispatch(method, chat.setup)
+            assert chat.backend is native and native_loads(acp_native) == [native.process.pid]
+            assert rows(roster, session_id)[0] == failed
+            for agent in ("b2", "c3"):
+                stopped = row(roster, agent, session_id)
+                assert (stopped["status"], stopped["note"]) == ("stopped", "the chat was reloaded")
+                assert stopped["started"] <= stopped["ended"] <= time.time()
+            assert await lines(reader, 1) == [roster.snapshot(session_id)]
+            assert states(roster, other.session_id) == {"elsewhere": "running"}
+            writer.close()
+
+    asyncio.run(scenario())
+
+
+def test_a_reload_that_fails_leaves_the_rows_as_they_were(acp_native, tmp_path, monkeypatch):
+    monkeypatch.setenv("FAKE_FAIL_LOAD_ACCOUNT", "ansuman-1")
+
+    async def scenario():
+        async with in_process(acp_native) as (bridge, _):
+            chat = await new_chat(bridge, tmp_path)
+            session_id, roster, server = chat.session_id, bridge.roster, bridge.side_server
+            native = chat.backend
+            # The fake's delegate turn keeps its prompt open, so an idle chat's row is fed in.
+            roster.apply(session_id, started())
+            before = rows(roster, session_id)
+            _, reader, writer = await request(server.port, "GET", events_url(server, session_id))
+            await lines(reader, 1)
+
+            with pytest.raises(acp.RpcError):
+                await bridge.dispatch("session/load", chat.setup)
+            assert chat.backend is native and native_loads(acp_native) == [native.process.pid]
+            assert rows(roster, session_id) == before and before[0]["status"] == "running"
+            assert await quiet(reader)
+            writer.close()
+
+    asyncio.run(scenario())
+
+
 def test_subagents_command_opens_the_tab_without_waiting_for_the_turn(acp_native, tmp_path):
     async def scenario():
         async with connect(acp_native) as client:

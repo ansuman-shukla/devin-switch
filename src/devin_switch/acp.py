@@ -1408,6 +1408,8 @@ class Bridge:
                                 "session/load", setup, LIFECYCLE_TIMEOUT
                             )
                             chat.setup = setup
+                            # A native's own reload wipes its subagents, like a restart.
+                            self.roster.interrupt(session_id, subagent_tab.RELOADED)
                             return result
                         finally:
                             chat.backend.suppress_replay = False

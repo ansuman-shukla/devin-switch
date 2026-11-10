@@ -79,7 +79,7 @@ class Roster:
             return
         if agent := named(event := meta.get(STARTED)):
             rows = self.rows.setdefault(session_id, {})
-            # Started again (resumed): it counts, and sorts, from the new start.
+            # The same ID started again counts, and sorts, from its new start.
             rows.pop(agent, None)
             rows[agent] = {
                 "id": agent,

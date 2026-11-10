@@ -121,7 +121,7 @@ def test_a_started_subagent_is_a_running_row_that_never_carries_its_task():
         (AGENT, "Sleeper", True),
         ("b2", "Second", False),
     ]
-    # Started again (the native resumes a subagent under its ID): one row, from the new start.
+    # The same ID started again is still one row, counted from its new start.
     roster.apply("chat", completed())
     roster.apply("chat", started(title="Sleeper again"))
     assert [(item["id"], item["status"], item["ended"]) for item in rows(roster)] == [

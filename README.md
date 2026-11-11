@@ -372,6 +372,14 @@ shows what is going on: it cannot stop or change a subagent. It covers subagents
 the chat was opened in this window, so it starts empty after the window reloads. Closed the tab?
 Type `/subagents` again. The page is served the same way as the Side chat tab.
 
+What a subagent says, usually its final report, is read in this tab too: click **Show reply** on
+its row. Switch keeps those messages out of the chat itself, because Devin Desktop would show
+them there as if the chat's own agent had written them; the agent's own summary of a report
+still appears in the chat as usual. Replies are kept only while the window's Switch agent runs
+(the newest 50,000 characters per subagent). After a window reload the tab starts empty and
+earlier replies are no longer shown anywhere in Desktop; they stay in the chat's saved history
+and in what the chat's agent already read.
+
 ### Keep a whiteboard per chat
 
 Switch gives chats `WHITEBOARD_CHAT_COMMAND="ds chat id"` (unless you set it), so a chat keeps

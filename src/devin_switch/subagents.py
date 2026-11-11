@@ -29,6 +29,7 @@ PROGRESS_LIMIT = 2000
 PROGRESS_STEPS = 6
 MAPS = ("running", "interrupted", "finished", "closed")
 FINISHED_LIMIT = 100
+NOTE_LIMIT = 20
 
 
 def path(store: Store, session_id: str) -> Path:
@@ -130,6 +131,26 @@ def forget(store: Store, session_id: str, agents, kind: str = "interrupted") -> 
 
 def forget_closed(store: Store, session_id: str, agents) -> None:
     forget(store, session_id, agents, "closed")
+
+
+def closed_note(agents: dict) -> str:
+    """Tell the parent agent which finished subagents it can no longer read or resume."""
+    listed = list(agents.items())[-NOTE_LIMIT:]
+    lines = [
+        "[Note from Devin Switch, not typed by the user] The agent process that ran these "
+        "subagents has ended:"
+    ]
+    for agent, info in listed:
+        title = info.get("title") or info.get("profile") or "subagent"
+        lines.append(f'- "{title}" ({agent})')
+    if len(agents) > len(listed):
+        lines.append(f"- and {len(agents) - len(listed)} more")
+    lines.append(
+        "Their results were already delivered earlier in this conversation. read_subagent and "
+        'run_subagent with resume no longer work for these IDs (they return "No subagent '
+        'found"). If more work is wanted, start a new subagent with the context it needs.'
+    )
+    return "\n".join(lines)
 
 
 def summarize(message: dict) -> str:

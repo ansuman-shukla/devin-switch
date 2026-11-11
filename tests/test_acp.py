@@ -3121,6 +3121,35 @@ def test_closed_subagents_are_kept_until_they_are_forgotten(store):
     assert not target.exists()
 
 
+def test_closed_subagents_note_names_them_and_says_what_no_longer_works():
+    note = subagents.closed_note(
+        {
+            "a1": {"title": "Fix tests", "profile": "coder"},
+            "b2": {"title": "", "profile": "reviewer"},
+            "c3": {"title": "", "profile": ""},
+        }
+    )
+    assert note.startswith("[Note from Devin Switch, not typed by the user] ")
+    lines = note.splitlines()
+    assert lines[1:-1] == ['- "Fix tests" (a1)', '- "reviewer" (b2)', '- "subagent" (c3)']
+    assert "agent process that ran these subagents has ended" in lines[0]
+    for fact in (
+        "results were already delivered earlier in this conversation",
+        "read_subagent and run_subagent with resume no longer work for these IDs",
+        '"No subagent found"',
+        "start a new subagent with the context it needs",
+    ):
+        assert fact in lines[-1]
+    assert "#" not in note and len(f"{lines[0]} {lines[-1]}".split()) < 90
+    many = {f"id-{n}": {"title": f"Task {n}"} for n in range(23)}
+    assert subagents.closed_note(many).splitlines()[1:-1] == [
+        *(f'- "Task {n}" (id-{n})' for n in range(3, 23)),
+        "- and 3 more",
+    ]
+    exact = dict(list(many.items())[:20])
+    assert len(subagents.closed_note(exact).splitlines()) == 22
+
+
 @pytest.mark.parametrize("case", ["auto-switch-off", "no-login-left"])
 def test_gui_relay_returns_quota_unchanged_when_it_cannot_rotate(
     acp_native, relayed, tmp_path, monkeypatch, case

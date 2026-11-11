@@ -515,7 +515,7 @@ async def handle(message):
             emit({"id": 101, "method": "elicitation/create", "params": {"sessionId": loaded}})
             await asyncio.sleep(0.2)
             emit({"method": "$/cancel_request", "params": {"requestId": 101}})
-        if text in {"permission", "question"}:
+        if text in {"permission", "question", "abandoned"}:
             future = asyncio.get_running_loop().create_future()
             replies[100] = future
             request = {
@@ -582,8 +582,33 @@ async def handle(message):
                         "type": "object",
                         "properties": {"approach": {"type": "string", "enum": ["one", "two"]}},
                     },
+                    "_meta": {"cognition.ai/toolCallId": "ask_user_question:0#test"},
                 }
             emit(request)
+            if text == "abandoned":
+                # As captured from CLI 3000.12.43: a steering prompt (or Stop) fails the tool
+                # call of an unanswered question card, and its request is never withdrawn.
+                emit(
+                    {
+                        "id": "question",
+                        "method": "elicitation/create",
+                        "params": {
+                            "sessionId": loaded,
+                            "mode": "form",
+                            "message": "Pick a color",
+                            "_meta": {"cognition.ai/toolCallId": "ask_user_question:0#test"},
+                        },
+                    }
+                )
+                update(
+                    loaded,
+                    {
+                        "sessionUpdate": "tool_call_update",
+                        "toolCallId": "ask_user_question:0#test",
+                        "status": "failed",
+                        "_meta": {"cognition.ai/canceled": True},
+                    },
+                )
             response = await future
             assert response["id"] == 100
             decision = {"decision": response}

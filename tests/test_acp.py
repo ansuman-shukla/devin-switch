@@ -1591,6 +1591,63 @@ def test_gui_native_withdrawn_request_clears_the_desktop_card(acp_native, tmp_pa
     asyncio.run(scenario())
 
 
+def test_gui_native_abandoned_question_clears_only_its_desktop_card(acp_native, tmp_path):
+    async def scenario():
+        async with in_process(acp_native) as (bridge, messages):
+            abandoned, asked = [
+                (await bridge.dispatch("session/new", {"cwd": str(tmp_path), "mcpServers": []}))[
+                    "sessionId"
+                ]
+                for _ in range(2)
+            ]
+
+            def cards(method):
+                return {
+                    message["params"]["sessionId"]: message["id"]
+                    for message in messages
+                    if message.get("method") == method
+                }
+
+            # Another chat's question, for a tool call with the same id, stays open throughout.
+            turns = [
+                asyncio.create_task(
+                    bridge.dispatch("session/prompt", prompt_params(asked, "question"))
+                )
+            ]
+            async with asyncio.timeout(5):
+                while asked not in cards("elicitation/create"):
+                    await asyncio.sleep(0.02)
+            turns.append(
+                asyncio.create_task(
+                    bridge.dispatch("session/prompt", prompt_params(abandoned, "abandoned"))
+                )
+            )
+            async with asyncio.timeout(5):
+                while not cancelled_cards(messages):
+                    await asyncio.sleep(0.02)
+            questions, approvals = cards("elicitation/create"), cards("session/request_permission")
+            # Desktop shows "awaiting instructions" for as long as a question card is unanswered.
+            assert cancelled_cards(messages) == [questions[abandoned]]
+            (failed,) = [
+                message
+                for message in messages
+                if message.get("params", {}).get("update", {}).get("status") == "failed"
+            ]
+            assert messages.index(failed) < messages.index(acp.cancel_request(questions[abandoned]))
+            # That chat's approval and the other chat's question are still the user's to answer.
+            assert set(bridge.client_requests) == {approvals[abandoned], questions[asked]}
+            for card, result in (
+                (approvals[abandoned], {"outcome": {"outcome": "selected", "optionId": "allow"}}),
+                (questions[asked], {"action": "accept", "content": {"approach": "one"}}),
+            ):
+                await bridge.handle({"jsonrpc": "2.0", "id": card, "result": result})
+            await asyncio.wait_for(asyncio.gather(*turns), 5)
+            assert cancelled_cards(messages) == [questions[abandoned]]
+            assert bridge.client_requests == {}
+
+    asyncio.run(scenario())
+
+
 def test_gui_native_exit_clears_its_open_desktop_cards(acp_native, tmp_path):
     async def scenario():
         async with in_process(acp_native) as (bridge, messages):
@@ -2135,7 +2192,7 @@ def test_gui_idle_release_leaves_unsafe_chats_open(acp_native, tmp_path, monkeyp
 
                 monkeypatch.setattr(sessions, "history", unavailable)
             if reason == "permission":
-                bridge.client_requests["pending"] = (backend, 123)
+                bridge.client_requests["pending"] = acp.ClientRequest(backend, 123)
             if reason == "control":
                 chat.controls = set()
             if reason == "switch":

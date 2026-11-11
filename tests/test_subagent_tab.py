@@ -610,7 +610,7 @@ def test_a_growing_reply_alone_tells_the_page_once_a_second(clock):
         assert roster.reply("chat", AGENT) == "a" * 24 + "\n\naa"
 
 
-def test_the_page_shell_names_its_chat_token_and_three_files():
+def test_the_page_shell_names_its_chat_token_and_files():
     shell = subagent_tab.page('chat-1<"&>', 'tok<en>&"x')
     token = "tok&lt;en&gt;&amp;&quot;x"
     assert "<title>Subagents</title>" in shell
@@ -618,10 +618,13 @@ def test_the_page_shell_names_its_chat_token_and_three_files():
     assert re.findall(r'<link rel="stylesheet" href="([^"]*)">', shell) == [
         f"/subagents/assets/subagents.css?t={token}"
     ]
+    # The side page's Markdown renderer comes first: the page's scripts show replies with it.
     assert re.findall(r'<script src="([^"]*)"></script>', shell) == [
+        f"/side/assets/markdown.js?t={token}",
         f"/subagents/assets/subagents-view.js?t={token}",
         f"/subagents/assets/subagents.js?t={token}",
     ]
+    assert shell.count("<script") == 3 and shell.endswith("</script></body></html>")
     assert 'tok<en>&"x' not in shell and 'chat-1<"&>' not in shell
 
 
@@ -982,6 +985,15 @@ def test_the_subagents_page_needs_its_token_and_a_loopback_host(acp_native, tmp_
                 assert [f"/subagents/assets/{name}?t={token}" in shell for name in kinds] == [
                     True
                 ] * 3
+                # Every script the shell names is one this server serves.
+                scripts = re.findall(r'<script src="([^"]*)"></script>', shell)
+                assert len(scripts) == 3
+                for source in scripts:
+                    status, headers, _ = await get(port, source, host)
+                    assert status == 200
+                    assert headers["Content-Type"] == "text/javascript; charset=utf-8"
+            status, _, renderer = await get(port, scripts[0])
+            assert "SideMarkdown" in renderer and "stand-in" not in renderer
 
             for name, kind in kinds.items():
                 status, headers, body = await get(port, f"/subagents/assets/{name}?t={token}")

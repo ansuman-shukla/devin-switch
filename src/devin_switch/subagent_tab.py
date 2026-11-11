@@ -28,6 +28,8 @@ ASSETS = {
     "subagents-view.js": "text/javascript",
     "subagents.js": "text/javascript",
 }
+# The side page's Markdown renderer (`window.SideMarkdown`), which `side.Server` serves as well.
+MARKDOWN = "/side/assets/markdown.js"
 ACTIVE = ("running", "paused")
 RESTARTED = "the agent restarted"
 RELOADED = "the chat was reloaded"
@@ -224,11 +226,13 @@ def page(session_id: str, token: str) -> str:
     """The page shell: its scripts read the chat and token from <body>."""
     token = html.escape(token)
     links = {name: f"/subagents/assets/{name}?t={token}" for name in ASSETS}
+    # A reply is shown as Markdown, so the renderer loads before the page's own scripts.
+    scripts = (f"{MARKDOWN}?t={token}", links["subagents-view.js"], links["subagents.js"])
     return (
         '<!doctype html><html><head><meta charset="utf-8"><title>Subagents</title>'
         '<meta name="viewport" content="width=device-width, initial-scale=1">'
         f'<link rel="stylesheet" href="{links["subagents.css"]}"></head>'
         f'<body data-session="{html.escape(session_id)}" data-token="{token}">'
-        f'<script src="{links["subagents-view.js"]}"></script>'
-        f'<script src="{links["subagents.js"]}"></script></body></html>'
+        + "".join(f'<script src="{source}"></script>' for source in scripts)
+        + "</body></html>"
     )

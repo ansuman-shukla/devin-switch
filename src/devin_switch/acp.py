@@ -1337,7 +1337,8 @@ class Bridge:
             return params, {}
         if not closed:
             return params, {}
-        note = {"type": "text", "text": subagents.closed_note(closed)}
+        # The native joins a prompt's text blocks as they are when it replays them.
+        note = {"type": "text", "text": "\n\n" + subagents.closed_note(closed)}
         return {**params, "prompt": [*blocks, note]}, closed
 
     async def claim(self, session_id):

@@ -3250,11 +3250,14 @@ def test_gui_first_prompt_to_a_replacement_process_names_the_closed_subagents(
     async def scenario():
         async with in_process(acp_native) as (bridge, _):
             session_id = await chat_with_finished_subagents(bridge, tmp_path, replaced)
+            ended = subagents.load_ended(acp_native.store, session_id)
             params = prompt_params(session_id, "next")
             await bridge.dispatch("session/prompt", params)
             assert params == prompt_params(session_id, "next")
             text, note = prompt_texts(acp_native)[-1]
-            assert text == "next" and note.startswith("[Note from Devin Switch")
+            # A reload shows a prompt's blocks joined as they are: the note needs its own lines.
+            assert text == "next" and note.startswith("\n\n[Note from Devin Switch, not typed")
+            assert note[2:] == subagents.closed_note({**ended["closed"], **ended["finished"]})
             assert '"Title f1" (f1)' in note and '"Title f2" (f2)' in note
             assert subagents.closed(acp_native.store, session_id) == {}
             await bridge.dispatch("session/prompt", prompt_params(session_id, "again"))

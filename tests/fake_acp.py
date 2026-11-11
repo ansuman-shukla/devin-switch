@@ -7,6 +7,7 @@ import subprocess
 import sys
 import urllib.request
 import uuid
+from datetime import UTC, datetime
 from pathlib import Path
 
 account = Path(os.environ["XDG_DATA_HOME"]).parent.name
@@ -110,8 +111,20 @@ def chunk(kind, text):
     return {"sessionUpdate": kind, "content": {"type": "text", "text": text}}
 
 
+def stamp():
+    return {"cognition.ai/timestamp": datetime.now(UTC).isoformat()}
+
+
+def streaming(message_id):
+    """What CLI 3000.12.43 adds to each live chunk of one message or thought."""
+    return {"cognition.ai/streamingMessageId": message_id, **stamp()}
+
+
 def produced(agent_id, change, **meta):
-    """As CLI 3000.12.43 does, name the agent an update comes from ("root": the chat's own)."""
+    """As CLI 3000.12.43 does, name the subagent an update is the work of.
+
+    The chat's own agent names itself ("root") on its usage updates alone.
+    """
     context = {"cognition.ai/subagent_context": {"parentAgentId": agent_id}}
     return {**change, "_meta": {**context, **meta}}
 
@@ -119,7 +132,7 @@ def produced(agent_id, change, **meta):
 def lifecycle(agent_id, status, key, **details):
     """A subagent's start or end, as CLI 3000.12.43 reports it on the launching tool call."""
     change = {"sessionUpdate": "tool_call_update", "toolCallId": agent_id, "status": status}
-    return produced("root", change, **{key: {"agentId": agent_id, **details, "depth": 1}})
+    return {**change, "_meta": {key: {"agentId": agent_id, **details, "depth": 1}}}
 
 
 def launched(agent_id, background):
@@ -142,12 +155,26 @@ def finished(agent_id, success, summary):
 
 
 async def delegate(request_id):
-    """A turn whose background subagent works until Stop, which ends it unsuccessfully."""
+    """A turn whose background subagent speaks, then works until Stop, which fails it."""
     agent_id, command = "acb63708", {"toolCallId": "call_ab18"}
+    usage = {"sessionUpdate": "usage_update", "used": 1, "size": 10}
     canceled.clear()
-    update(loaded, produced("root", chunk("agent_message_chunk", "live progress")))
+    progress = chunk("agent_message_chunk", "live progress")
+    update(loaded, {**progress, "_meta": streaming(str(uuid.uuid4()))})
+    update(loaded, produced("root", usage))
     update(loaded, launched(agent_id, True))
-    update(loaded, produced(agent_id, chunk("agent_thought_chunk", "…")))
+    thought = chunk("agent_thought_chunk", "…")
+    update(loaded, produced(agent_id, thought, **streaming(str(uuid.uuid4()))))
+    update(loaded, produced(agent_id, usage))
+    # Its own messages: the chunks of one share a streaming ID.
+    first, second = str(uuid.uuid4()), str(uuid.uuid4())
+    for text, message_id in (
+        ("I'll run the command.", first),
+        ("## Plan\n", second),
+        ("Sleep, then **report**.", second),
+    ):
+        said = chunk("agent_message_chunk", text)
+        update(loaded, produced(agent_id, said, **streaming(message_id)))
     running = {"sessionUpdate": "tool_call", "title": "Running command", "kind": "execute"}
     update(loaded, produced(agent_id, {**running, **command}))
     # A test opens the gate to let the subagent take its next step.
@@ -329,10 +356,14 @@ async def handle(message):
                 },
             )
             if os.environ.get("FAKE_REPLAY_SUBAGENT"):
-                # The native replays a saved chat's foreground subagents in the live shapes.
+                # The native replays a saved chat's foreground subagents in the live shapes,
+                # but each message whole, named by its saved event.
                 read = {"sessionUpdate": "tool_call", "toolCallId": "call_77", "kind": "read"}
+                report = chunk("agent_message_chunk", "The notes say hello.")
+                saved = {"cognition.ai/eventId": "45", **stamp()}
                 update(session_id, launched("9d2e41aa", False))
                 update(session_id, produced("9d2e41aa", {**read, "title": "Read notes.md"}))
+                update(session_id, produced("9d2e41aa", report, **saved))
                 update(session_id, finished("9d2e41aa", True, "Read the notes."))
         elif not os.environ.get("FAKE_SAVE_ON_PROMPT"):
             connection.execute(

@@ -2,6 +2,7 @@ import asyncio
 import json
 import re
 import time
+import types
 from urllib.parse import quote, urlsplit
 
 import pytest
@@ -18,17 +19,34 @@ from test_acp import (
     until,
     wait_for_text,
 )
-from test_side import lines, opened, request
+from test_side import fetch, lines, opened, request
 
 from devin_switch import acp, side, subagent_tab
 from devin_switch.store import SwitchError
 
 AGENT = "acb63708"
+# The foreground subagent of an earlier turn that the fake replays on a load.
+PAST = "9d2e41aa"
+# What the fake's delegate subagent says, in two messages, before its first command.
+REPLY = "I'll run the command.\n\n## Plan\nSleep, then **report**."
 STARTED = "cognition.ai/subagent_started"
 COMPLETED = "cognition.ai/subagent_completed"
 PAUSED = "cognition.ai/subagent_paused"
 CONTEXT = "cognition.ai/subagent_context"
-ROOT = {CONTEXT: {"parentAgentId": "root"}}
+STREAM = "cognition.ai/streamingMessageId"
+STAMP = {"cognition.ai/timestamp": "2026-11-11T07:22:21.637022+00:00"}
+LISTED = {
+    "id",
+    "title",
+    "profile",
+    "background",
+    "status",
+    "started",
+    "ended",
+    "step",
+    "note",
+    "reply_chars",
+}
 # A subagent's steps, as captured from CLI 3000.12.43.
 TOOL = {
     "sessionUpdate": "tool_call",
@@ -57,7 +75,7 @@ def started(agent=AGENT, **details):
         "sessionUpdate": "tool_call_update",
         "toolCallId": agent,
         "status": "in_progress",
-        "_meta": {**ROOT, STARTED: event},
+        "_meta": {STARTED: event},
     }
 
 
@@ -67,7 +85,7 @@ def completed(agent=AGENT, success=True, summary="Slept for 30 seconds."):
         "sessionUpdate": "tool_call_update",
         "toolCallId": agent,
         "status": "completed",
-        "_meta": {**ROOT, COMPLETED: event},
+        "_meta": {COMPLETED: event},
     }
 
 
@@ -75,13 +93,19 @@ def paused(agent, value):
     return {
         "sessionUpdate": "tool_call_update",
         "toolCallId": agent,
-        "_meta": {**ROOT, PAUSED: {"agentId": agent, "paused": value}},
+        "_meta": {PAUSED: {"agentId": agent, "paused": value}},
     }
 
 
 def by(agent, change):
-    """An update produced by `agent` ("root" is the chat's own agent)."""
+    """An update produced by `agent` ("root": the chat's own agent, on its usage updates)."""
     return {**change, "_meta": {CONTEXT: {"parentAgentId": agent}}}
+
+
+def said(text, stream="m1", agent=AGENT):
+    """One live chunk of a subagent's own message, as captured from CLI 3000.12.43."""
+    meta = {STREAM: stream, CONTEXT: {"parentAgentId": agent}, **STAMP}
+    return {**MESSAGE, "content": {"type": "text", "text": text}, "_meta": meta}
 
 
 def rows(roster, session_id="chat"):
@@ -113,6 +137,7 @@ def test_a_started_subagent_is_a_running_row_that_never_carries_its_task():
         "ended": None,
         "step": "",
         "note": "",
+        "reply_chars": 0,
     }
     assert "secret plan" not in json.dumps(roster.snapshot("chat"))
     assert rows(roster, "other-chat") == []
@@ -377,7 +402,215 @@ def test_every_page_of_a_chat_is_told_and_closing_ends_their_streams():
     assert not roster.showing("chat")
 
 
-def test_the_page_shell_names_its_chat_token_and_three_files():
+def test_a_row_keeps_what_its_subagent_said_and_lists_only_how_much():
+    roster = subagent_tab.Roster()
+    assert roster.reply("chat", AGENT) is None
+    roster.apply("chat", started())
+    roster.apply("chat", started("b2"))
+    assert roster.reply("chat", AGENT) == "" and row(roster)["reply_chars"] == 0
+
+    # A message arrives in chunks; a later message of the same subagent has another ID.
+    roster.apply("chat", said("Looking ", "m1"))
+    roster.apply("chat", said("into it.", "m1"))
+    assert roster.reply("chat", AGENT) == "Looking into it."
+    # Its other work is not something it said.
+    for change in (THOUGHT, TOOL, RAN, USAGE):
+        roster.apply("chat", by(AGENT, change))
+    for text, stream in (("## Report\n", "m2"), ("All **good**.", "m2"), ("Bye", "m3")):
+        roster.apply("chat", said(text, stream))
+    reply = "Looking into it.\n\n## Report\nAll **good**.\n\nBye"
+    assert roster.reply("chat", AGENT) == reply
+    assert row(roster)["reply_chars"] == len(reply) == 46
+    assert row(roster)["step"] == "Writing"
+
+    # Each subagent has its own, and the list never holds the text itself.
+    roster.apply("chat", said("Second's own.", "m1", "b2"))
+    assert roster.reply("chat", "b2") == "Second's own." and roster.reply("chat", AGENT) == reply
+    assert [item["reply_chars"] for item in rows(roster)] == [46, 13]
+    listed = roster.snapshot("chat")
+    assert [set(item) for item in listed["subagents"]] == [LISTED, LISTED]
+    assert not any(word in json.dumps(listed) for word in ("Looking", "Report", "Bye", "own"))
+    assert roster.reply("chat", "gone") is None and roster.reply("other-chat", AGENT) is None
+
+
+def test_only_the_text_of_a_subagents_own_messages_joins_its_reply():
+    roster = subagent_tab.Roster()
+    roster.apply("chat", started())
+    roster.apply("chat", said("Kept."))
+    before = rows(roster)
+    image = {"type": "image", "data": "aGk=", "mimeType": "image/png"}
+    with roster.listen("chat") as queue:
+        queue.get_nowait()
+        for content in (
+            None,
+            "text",
+            ["text"],
+            {},
+            image,
+            {"text": "No type"},
+            {"type": "resource_link", "text": "Not text"},
+            {"type": "text"},
+            *({"type": "text", "text": odd} for odd in (None, "", 7, ["x"], {"text": "x"})),
+        ):
+            roster.apply("chat", {**said("x"), "content": content})
+        roster.apply("chat", by(AGENT, {"sessionUpdate": "agent_message_chunk"}))
+        # The chat's own agent, unknown agents and other chats add nothing.
+        roster.apply("chat", said("Root's", agent="root"))
+        roster.apply("chat", said("Nobody's", agent="gone"))
+        roster.apply("chat", {**MESSAGE, "_meta": {STREAM: "m1", **STAMP}})
+        roster.apply("chat", MESSAGE)
+        roster.apply("other-chat", said("Elsewhere"))
+        for context in (None, "root", [AGENT], {}, {"parentAgentId": None}):
+            roster.apply("chat", {**MESSAGE, "_meta": {CONTEXT: context}})
+        assert roster.reply("chat", AGENT) == "Kept." and rows(roster) == before
+        assert queue.empty()
+
+    # An odd message ID still keeps the text.
+    for odd in (None, 7, ["m"], {"m": 1}):
+        roster.apply("chat", said("!", odd))
+    assert roster.reply("chat", AGENT).replace("\n", "") == "Kept.!!!!"
+    roster.apply("chat", {**said("?"), "_meta": {CONTEXT: {"parentAgentId": AGENT}}})
+    assert roster.reply("chat", AGENT).endswith("?")
+
+
+def test_a_long_reply_keeps_its_newest_text():
+    roster, limit = subagent_tab.Roster(), subagent_tab.REPLY_LIMIT
+    assert limit == 50_000
+    roster.apply("chat", started())
+    roster.apply("chat", said("START" + "a" * limit))
+    assert roster.reply("chat", AGENT) == "a" * limit
+    roster.apply("chat", said("b" * 10 + "END"))
+    reply = roster.reply("chat", AGENT)
+    assert reply == "a" * (limit - 13) + "b" * 10 + "END"
+    assert len(reply) == limit == row(roster)["reply_chars"]
+    # A later message counts its blank line too.
+    roster.apply("chat", said("NEXT", "m2"))
+    assert roster.reply("chat", AGENT) == "a" * (limit - 19) + "b" * 10 + "END\n\nNEXT"
+    assert row(roster)["reply_chars"] == limit
+
+
+def test_a_reply_goes_when_its_row_does():
+    roster, cap = subagent_tab.Roster(), subagent_tab.MAX_ROWS
+    roster.apply("chat", started())
+    roster.apply("chat", said("First run."))
+    roster.apply("chat", completed())
+    assert roster.reply("chat", AGENT) == "First run."
+    # The same ID started again has said nothing yet.
+    roster.apply("chat", started())
+    assert roster.reply("chat", AGENT) == "" and row(roster)["reply_chars"] == 0
+    roster.apply("chat", said("Second run."))
+    assert roster.reply("chat", AGENT) == "Second run."
+
+    roster.apply("other-chat", started("elsewhere"))
+    roster.apply("other-chat", said("Stays.", agent="elsewhere"))
+    roster.forget("chat")
+    assert roster.reply("chat", AGENT) is None
+    assert roster.reply("other-chat", "elsewhere") == "Stays."
+
+    # A row the cap drops takes its reply along.
+    roster.apply("chat", started("first"))
+    roster.apply("chat", said("An old report.", agent="first"))
+    roster.apply("chat", completed("first"))
+    for number in range(cap):
+        roster.apply("chat", started(f"job-{number}"))
+        roster.apply("chat", said(f"Report {number}", agent=f"job-{number}"))
+        roster.apply("chat", completed(f"job-{number}"))
+    assert roster.reply("chat", "first") is None and len(rows(roster)) == cap
+    assert roster.reply("chat", "job-0") == "Report 0"
+
+
+def test_only_a_subagents_own_message_is_told_from_the_chats_own():
+    own = subagent_tab.own_message
+    # Live, the chunks of one message share a streaming ID; a load replays it whole, by event.
+    assert own(said("Report")) and own(said("", "m2", "never-started"))
+    saved = {"cognition.ai/eventId": "45", **STAMP, CONTEXT: {"parentAgentId": AGENT}}
+    assert own({**MESSAGE, "_meta": saved})
+    assert own(by(AGENT, {"sessionUpdate": "agent_message_chunk"}))
+
+    # The chat's own agent's messages are not, nor is a subagent's other work.
+    assert not own(MESSAGE)
+    assert not own({**MESSAGE, "_meta": {STREAM: "m1", **STAMP}})
+    assert not own({**MESSAGE, "_meta": {"cognition.ai/eventId": "72", **STAMP}})
+    assert not own(by("root", MESSAGE))
+    for change in (THOUGHT, TOOL, RAN, USAGE, {"title": "No kind"}):
+        assert not own(by(AGENT, change))
+    for change in (started(), completed(), paused(AGENT, True)):
+        assert not own(change)
+
+    # Whatever else a native sends is not one either, and never raises.
+    for odd in (None, "", "text", 7, ["agent_message_chunk"], {}):
+        assert not own(odd)
+        assert not own({**MESSAGE, "_meta": odd})
+        assert not own({**MESSAGE, "_meta": {CONTEXT: odd}})
+    for odd in (None, "", 7, [AGENT], {"id": AGENT}):
+        assert not own(by(odd, MESSAGE))
+        assert not own(by(AGENT, {"sessionUpdate": odd}))
+
+
+@pytest.fixture
+def clock(monkeypatch):
+    """The roster's monotonic clock, moved by hand."""
+    now = [5000.0]
+    stand_in = types.SimpleNamespace(time=time.time, monotonic=lambda: now[0])
+    monkeypatch.setattr(subagent_tab, "time", stand_in)
+    return now
+
+
+def test_a_growing_reply_alone_tells_the_page_once_a_second(clock):
+    roster = subagent_tab.Roster()
+    roster.apply("chat", started())
+    roster.apply("chat", started("b2"))
+    with roster.listen("chat") as queue:
+        queue.get_nowait()
+
+        def told():
+            return not queue.empty() and queue.get_nowait() is True and queue.empty()
+
+        # Its first words are a new step, told at once.
+        roster.apply("chat", said("a"))
+        assert told()
+        # Chunks arrive many times a second: the page is not told of each.
+        for _ in range(20):
+            clock[0] += 0.04
+            roster.apply("chat", said("a"))
+        clock[0] = 5000.99
+        roster.apply("chat", said("a"))
+        assert not told()
+        # The list read meanwhile is current all the same.
+        assert row(roster)["reply_chars"] == 22
+        clock[0] = 5001.0
+        roster.apply("chat", said("a"))
+        assert told()
+        clock[0] = 5001.5
+        roster.apply("chat", said("a"))
+        assert not told()
+
+        # Each row waits for itself.
+        roster.apply("chat", {**said("", agent="b2"), "content": {"type": "image"}})
+        assert told() and row(roster, "b2")["step"] == "Writing"
+        roster.apply("chat", said("b", agent="b2"))
+        assert told()
+        clock[0] = 5001.6
+        roster.apply("chat", said("b", agent="b2"))
+        assert not told()
+
+        # A new step or the end is told at once, with the reply's length as it is by then.
+        roster.apply("chat", by(AGENT, TOOL))
+        assert told()
+        clock[0] = 5001.7
+        roster.apply("chat", said("a", "m2"))
+        assert told() and row(roster)["reply_chars"] == 27
+        clock[0] = 5001.8
+        roster.apply("chat", said("a", "m2"))
+        assert not told()
+        roster.apply("chat", completed())
+        assert told()
+        (ended, _) = rows(roster)
+        assert (ended["status"], ended["reply_chars"]) == ("done", 28)
+        assert roster.reply("chat", AGENT) == "a" * 24 + "\n\naa"
+
+
+def test_the_page_shell_names_its_chat_token_and_files():
     shell = subagent_tab.page('chat-1<"&>', 'tok<en>&"x')
     token = "tok&lt;en&gt;&amp;&quot;x"
     assert "<title>Subagents</title>" in shell
@@ -385,10 +618,13 @@ def test_the_page_shell_names_its_chat_token_and_three_files():
     assert re.findall(r'<link rel="stylesheet" href="([^"]*)">', shell) == [
         f"/subagents/assets/subagents.css?t={token}"
     ]
+    # The side page's Markdown renderer comes first: the page's scripts show replies with it.
     assert re.findall(r'<script src="([^"]*)"></script>', shell) == [
+        f"/side/assets/markdown.js?t={token}",
         f"/subagents/assets/subagents-view.js?t={token}",
         f"/subagents/assets/subagents.js?t={token}",
     ]
+    assert shell.count("<script") == 3 and shell.endswith("</script></body></html>")
     assert 'tok<en>&"x' not in shell and 'chat-1<"&>' not in shell
 
 
@@ -508,6 +744,119 @@ def test_closing_a_chat_forgets_its_subagents(acp_native, tmp_path):
     asyncio.run(scenario())
 
 
+def authored(messages, agent):
+    """The updates Desktop was sent that name `agent` as the one whose work they are."""
+    return [
+        update
+        for message in messages
+        if message.get("method") == "session/update"
+        and ((update := message["params"]["update"]).get("_meta") or {}).get(CONTEXT)
+        == {"parentAgentId": agent}
+    ]
+
+
+def kinds(updates):
+    return [update["sessionUpdate"] for update in updates]
+
+
+def test_what_a_subagent_says_reaches_its_row_but_never_the_chat(acp_native, tmp_path):
+    async def scenario():
+        async with in_process(acp_native) as (bridge, messages):
+            chat = await new_chat(bridge, tmp_path)
+            session_id, roster = chat.session_id, bridge.roster
+            turn = delegate(bridge, chat)
+            await until(lambda: states(roster, session_id) == {AGENT: "running"})
+            await until(lambda: row(roster, AGENT, session_id)["step"] == "Running command")
+
+            # Desktop got the chat's own message as sent, and the subagent's card and steps...
+            (progress,) = replayed(messages, "agent_message_chunk")
+            assert progress["content"] == {"type": "text", "text": "live progress"}
+            assert set(progress["_meta"]) == {STREAM, "cognition.ai/timestamp"}
+            assert [event["agentId"] for event in subagent_events(messages, STARTED)] == [AGENT]
+            assert kinds(authored(messages, AGENT)) == [
+                "agent_thought_chunk",
+                "usage_update",
+                "tool_call",
+            ]
+            assert kinds(authored(messages, "root")) == ["usage_update"]
+            # ...but nothing of what the subagent said: that is its row's to show.
+            assert not any(words in json.dumps(messages) for words in ("I'll run", "## Plan"))
+            assert roster.reply(session_id, AGENT) == REPLY
+            assert row(roster, AGENT, session_id)["reply_chars"] == len(REPLY)
+
+            # A reload during the turn replays the bridge's own record, which never held it.
+            start = len(messages)
+            await bridge.dispatch("session/load", chat.setup)
+            replay = messages[start:]
+            assert native_loads(acp_native) == []
+            assert replayed_texts(replay, "user_message_chunk") == ["delegate"]
+            assert replayed_texts(replay, "agent_message_chunk") == ["live progress"]
+            assert [event["agentId"] for event in subagent_events(replay, STARTED)] == [AGENT]
+            assert kinds(authored(replay, AGENT)) == [
+                "agent_thought_chunk",
+                "tool_call",
+                "usage_update",
+            ]
+
+            await stop(bridge, chat, turn)
+            assert states(roster, session_id) == {AGENT: "failed"}
+            assert roster.reply(session_id, AGENT) == REPLY
+            assert replayed_texts(messages, "agent_message_chunk") == ["live progress"] * 2
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("method", ["session/load", "session/resume"])
+def test_a_reopened_chat_shows_a_past_subagents_steps_but_not_what_it_said(
+    acp_native, tmp_path, monkeypatch, method
+):
+    monkeypatch.setenv("FAKE_REPLAY_SUBAGENT", "1")
+
+    async def scenario():
+        async with in_process(acp_native) as (bridge, messages):
+            chat = await new_chat(bridge, tmp_path)
+            session_id, roster = chat.session_id, bridge.roster
+            start = len(messages)
+            assert "configOptions" in await bridge.dispatch(method, chat.setup)
+            assert native_loads(acp_native) == [chat.backend.process.pid]
+            shown = messages[start:]
+            if method == "session/load":
+                assert replayed_texts(shown, "agent_message_chunk") == ["historical replay"]
+                assert [update["title"] for update in authored(shown, PAST)] == ["Read notes.md"]
+                assert [event["agentId"] for event in subagent_events(shown, STARTED)] == [PAST]
+                ended = subagent_events(shown, COMPLETED)
+                assert [event["summary"] for event in ended] == ["Read the notes."]
+            else:
+                # A resume asks for no replay at all.
+                assert replayed(shown, "agent_message_chunk") == []
+                assert authored(shown, PAST) == [] and subagent_events(shown, STARTED) == []
+            assert rows(roster, session_id) == [] and roster.reply(session_id, PAST) is None
+
+            # Either way the bridge recorded that load for a reload during a later turn.
+            turn = delegate(bridge, chat)
+            await until(lambda: states(roster, session_id) == {AGENT: "running"})
+            await until(lambda: row(roster, AGENT, session_id)["step"] == "Running command")
+            start = len(messages)
+            await bridge.dispatch("session/load", chat.setup)
+            replay = messages[start:]
+            assert replayed_texts(replay, "agent_message_chunk") == [
+                "historical replay",
+                "live progress",
+            ]
+            assert [update["title"] for update in authored(replay, PAST)] == ["Read notes.md"]
+            assert [event["agentId"] for event in subagent_events(replay, STARTED)] == [
+                PAST,
+                AGENT,
+            ]
+            sent = json.dumps(messages)
+            assert not any(words in sent for words in ("notes say hello", "I'll run", "## Plan"))
+            assert list(states(roster, session_id)) == [AGENT]
+            assert roster.reply(session_id, AGENT) == REPLY
+            await stop(bridge, chat, turn)
+
+    asyncio.run(scenario())
+
+
 async def get(port, target, host=None):
     """Status, headers and body of a request the server answers and closes."""
     reader, writer = await asyncio.open_connection("127.0.0.1", port)
@@ -535,6 +884,11 @@ def events_url(server, session_id):
     return f"/subagents/events?session={quote(session_id, safe='')}&t={server.token}"
 
 
+def reply_url(server, session_id, agent):
+    chat, row = quote(session_id, safe=""), quote(agent, safe="")
+    return f"/subagents/reply?session={chat}&agent={row}&t={server.token}"
+
+
 def test_the_subagents_page_streams_a_chats_rows_as_they_change(acp_native, tmp_path, monkeypatch):
     gate = tmp_path / "next-step"
     monkeypatch.setenv("FAKE_SUBAGENT_GATE", str(gate))
@@ -557,17 +911,7 @@ def test_the_subagents_page_streams_a_chats_rows_as_they_change(acp_native, tmp_
             (first,) = await lines(reader, 1)
             assert first == roster.snapshot(session_id)
             (running,) = first["subagents"]
-            assert set(running) == {
-                "id",
-                "title",
-                "profile",
-                "background",
-                "status",
-                "started",
-                "ended",
-                "step",
-                "note",
-            }
+            assert set(running) == LISTED
             assert (running["id"], running["status"], running["step"]) == (
                 AGENT,
                 "running",
@@ -620,7 +964,12 @@ def test_the_subagents_page_needs_its_token_and_a_loopback_host(acp_native, tmp_
             port, token = server.port, server.token
             page = server.path('chat-1<"&>', "subagents")
             assert page == f"/subagents/chat-1%3C%22%26%3E?t={token}"
-            routes = (page, f"/subagents/assets/subagents.js?t={token}", events_url(server, "c"))
+            routes = (
+                page,
+                f"/subagents/assets/subagents.js?t={token}",
+                events_url(server, "c"),
+                reply_url(server, "c", AGENT),
+            )
             for route in routes:
                 assert (await get(port, route.replace(token, "wrong")))[0] == 403
                 assert (await get(port, route.replace(f"t={token}", "")))[0] == 403
@@ -636,6 +985,15 @@ def test_the_subagents_page_needs_its_token_and_a_loopback_host(acp_native, tmp_
                 assert [f"/subagents/assets/{name}?t={token}" in shell for name in kinds] == [
                     True
                 ] * 3
+                # Every script the shell names is one this server serves.
+                scripts = re.findall(r'<script src="([^"]*)"></script>', shell)
+                assert len(scripts) == 3
+                for source in scripts:
+                    status, headers, _ = await get(port, source, host)
+                    assert status == 200
+                    assert headers["Content-Type"] == "text/javascript; charset=utf-8"
+            status, _, renderer = await get(port, scripts[0])
+            assert "SideMarkdown" in renderer and "stand-in" not in renderer
 
             for name, kind in kinds.items():
                 status, headers, body = await get(port, f"/subagents/assets/{name}?t={token}")
@@ -645,6 +1003,59 @@ def test_the_subagents_page_needs_its_token_and_a_loopback_host(acp_native, tmp_
             for name in ("notes.js", "../outside.js", "side.js", "", "subagents.js/x"):
                 assert (await get(port, f"/subagents/assets/{name}?t={token}"))[0] == 404
             assert (await get(port, f"/side/assets/subagents.js?t={token}"))[0] == 404
+
+    asyncio.run(scenario())
+
+
+def test_the_subagents_page_fetches_what_a_subagent_said(acp_native, tmp_path):
+    async def scenario():
+        async with in_process(acp_native) as (bridge, _):
+            chat = await new_chat(bridge, tmp_path)
+            session_id, roster, server = chat.session_id, bridge.roster, bridge.side_server
+            port, url = server.port, reply_url(server, session_id, AGENT)
+            assert (await get(port, url))[0] == 404
+            turn = delegate(bridge, chat)
+            await until(lambda: states(roster, session_id) == {AGENT: "running"})
+            await until(lambda: row(roster, AGENT, session_id)["step"] == "Running command")
+
+            for host in (None, f"localhost:{port}"):
+                status, headers, body = await get(port, url, host)
+                assert status == 200
+                assert headers["Content-Type"] == "application/json; charset=utf-8"
+                # The text itself: not the page of a chat that happens to be named "reply".
+                assert json.loads(body) == {"reply": REPLY}
+            # Only with the token, from a loopback page.
+            for refused in (
+                get(port, url.replace(server.token, "wrong")),
+                get(port, url.replace(f"&t={server.token}", "")),
+                get(port, url, "evil.example"),
+            ):
+                status, _, body = await refused
+                assert status == 403 and "Plan" not in body
+            # Only a row this chat has, and only by GET.
+            for target in (
+                reply_url(server, "another-chat", AGENT),
+                reply_url(server, session_id, "gone"),
+                reply_url(server, session_id, ""),
+                f"/subagents/reply?agent={AGENT}&t={server.token}",
+                f"/subagents/reply?t={server.token}",
+                f"/subagents/reply/{session_id}?agent={AGENT}&t={server.token}",
+            ):
+                assert (await get(port, target))[::2] == (404, "Not found")
+            assert await fetch(port, "POST", url, {}) == (404, "Not found")
+
+            # A row that said nothing has an empty reply; any text comes back as it was said.
+            roster.apply(session_id, started("b2"))
+            other = reply_url(server, session_id, "b2")
+            assert json.loads((await get(port, other))[2]) == {"reply": ""}
+            roster.apply(session_id, said('Fertig ✓ – "quoted" <b>\n', agent="b2"))
+            assert json.loads((await get(port, other))[2]) == {"reply": 'Fertig ✓ – "quoted" <b>\n'}
+
+            # It outlives the subagent, and goes with the chat.
+            await stop(bridge, chat, turn)
+            assert json.loads((await get(port, url))[2]) == {"reply": REPLY}
+            await bridge.dispatch("session/close", {"sessionId": session_id})
+            assert (await get(port, url))[0] == 404
 
     asyncio.run(scenario())
 

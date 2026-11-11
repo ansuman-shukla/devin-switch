@@ -247,6 +247,12 @@ restart needed. If the setting file is unreadable, automatic switching stays off
 Only the literal `continue` message is sent. The original prompt is never replayed.
 `ds switch --session ID` handoffs queued from another terminal never send a prompt.
 
+One short note can ride along with your next message, or with that `continue`. When a chat's
+agent process has been replaced (a switch, 15 quiet minutes, a window reload), subagents that
+had already finished can no longer be read or resumed. Switch tells the agent once which ones
+are gone, so it does not spend a turn asking for them. If you reload the chat later, the note
+shows under that message, marked `[Note from Devin Switch, not typed by the user]`.
+
 ### Switch accounts and resume from the shell
 
 First exit any CLI already running the conversation you want to resume. From its project directory:

@@ -28,7 +28,6 @@ STARTED = "cognition.ai/subagent_started"
 COMPLETED = "cognition.ai/subagent_completed"
 PAUSED = "cognition.ai/subagent_paused"
 CONTEXT = "cognition.ai/subagent_context"
-ROOT = {CONTEXT: {"parentAgentId": "root"}}
 # A subagent's steps, as captured from CLI 3000.12.43.
 TOOL = {
     "sessionUpdate": "tool_call",
@@ -57,7 +56,7 @@ def started(agent=AGENT, **details):
         "sessionUpdate": "tool_call_update",
         "toolCallId": agent,
         "status": "in_progress",
-        "_meta": {**ROOT, STARTED: event},
+        "_meta": {STARTED: event},
     }
 
 
@@ -67,7 +66,7 @@ def completed(agent=AGENT, success=True, summary="Slept for 30 seconds."):
         "sessionUpdate": "tool_call_update",
         "toolCallId": agent,
         "status": "completed",
-        "_meta": {**ROOT, COMPLETED: event},
+        "_meta": {COMPLETED: event},
     }
 
 
@@ -75,12 +74,12 @@ def paused(agent, value):
     return {
         "sessionUpdate": "tool_call_update",
         "toolCallId": agent,
-        "_meta": {**ROOT, PAUSED: {"agentId": agent, "paused": value}},
+        "_meta": {PAUSED: {"agentId": agent, "paused": value}},
     }
 
 
 def by(agent, change):
-    """An update produced by `agent` ("root" is the chat's own agent)."""
+    """An update produced by `agent` ("root": the chat's own agent, on its usage updates)."""
     return {**change, "_meta": {CONTEXT: {"parentAgentId": agent}}}
 
 

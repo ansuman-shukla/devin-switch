@@ -19,7 +19,7 @@ from test_acp import (
     until,
     wait_for_text,
 )
-from test_side import lines, opened, request
+from test_side import fetch, lines, opened, request
 
 from devin_switch import acp, side, subagent_tab
 from devin_switch.store import SwitchError
@@ -881,6 +881,11 @@ def events_url(server, session_id):
     return f"/subagents/events?session={quote(session_id, safe='')}&t={server.token}"
 
 
+def reply_url(server, session_id, agent):
+    chat, row = quote(session_id, safe=""), quote(agent, safe="")
+    return f"/subagents/reply?session={chat}&agent={row}&t={server.token}"
+
+
 def test_the_subagents_page_streams_a_chats_rows_as_they_change(acp_native, tmp_path, monkeypatch):
     gate = tmp_path / "next-step"
     monkeypatch.setenv("FAKE_SUBAGENT_GATE", str(gate))
@@ -956,7 +961,12 @@ def test_the_subagents_page_needs_its_token_and_a_loopback_host(acp_native, tmp_
             port, token = server.port, server.token
             page = server.path('chat-1<"&>', "subagents")
             assert page == f"/subagents/chat-1%3C%22%26%3E?t={token}"
-            routes = (page, f"/subagents/assets/subagents.js?t={token}", events_url(server, "c"))
+            routes = (
+                page,
+                f"/subagents/assets/subagents.js?t={token}",
+                events_url(server, "c"),
+                reply_url(server, "c", AGENT),
+            )
             for route in routes:
                 assert (await get(port, route.replace(token, "wrong")))[0] == 403
                 assert (await get(port, route.replace(f"t={token}", "")))[0] == 403
@@ -981,6 +991,59 @@ def test_the_subagents_page_needs_its_token_and_a_loopback_host(acp_native, tmp_
             for name in ("notes.js", "../outside.js", "side.js", "", "subagents.js/x"):
                 assert (await get(port, f"/subagents/assets/{name}?t={token}"))[0] == 404
             assert (await get(port, f"/side/assets/subagents.js?t={token}"))[0] == 404
+
+    asyncio.run(scenario())
+
+
+def test_the_subagents_page_fetches_what_a_subagent_said(acp_native, tmp_path):
+    async def scenario():
+        async with in_process(acp_native) as (bridge, _):
+            chat = await new_chat(bridge, tmp_path)
+            session_id, roster, server = chat.session_id, bridge.roster, bridge.side_server
+            port, url = server.port, reply_url(server, session_id, AGENT)
+            assert (await get(port, url))[0] == 404
+            turn = delegate(bridge, chat)
+            await until(lambda: states(roster, session_id) == {AGENT: "running"})
+            await until(lambda: row(roster, AGENT, session_id)["step"] == "Running command")
+
+            for host in (None, f"localhost:{port}"):
+                status, headers, body = await get(port, url, host)
+                assert status == 200
+                assert headers["Content-Type"] == "application/json; charset=utf-8"
+                # The text itself: not the page of a chat that happens to be named "reply".
+                assert json.loads(body) == {"reply": REPLY}
+            # Only with the token, from a loopback page.
+            for refused in (
+                get(port, url.replace(server.token, "wrong")),
+                get(port, url.replace(f"&t={server.token}", "")),
+                get(port, url, "evil.example"),
+            ):
+                status, _, body = await refused
+                assert status == 403 and "Plan" not in body
+            # Only a row this chat has, and only by GET.
+            for target in (
+                reply_url(server, "another-chat", AGENT),
+                reply_url(server, session_id, "gone"),
+                reply_url(server, session_id, ""),
+                f"/subagents/reply?agent={AGENT}&t={server.token}",
+                f"/subagents/reply?t={server.token}",
+                f"/subagents/reply/{session_id}?agent={AGENT}&t={server.token}",
+            ):
+                assert (await get(port, target))[::2] == (404, "Not found")
+            assert await fetch(port, "POST", url, {}) == (404, "Not found")
+
+            # A row that said nothing has an empty reply; any text comes back as it was said.
+            roster.apply(session_id, started("b2"))
+            other = reply_url(server, session_id, "b2")
+            assert json.loads((await get(port, other))[2]) == {"reply": ""}
+            roster.apply(session_id, said('Fertig ✓ – "quoted" <b>\n', agent="b2"))
+            assert json.loads((await get(port, other))[2]) == {"reply": 'Fertig ✓ – "quoted" <b>\n'}
+
+            # It outlives the subagent, and goes with the chat.
+            await stop(bridge, chat, turn)
+            assert json.loads((await get(port, url))[2]) == {"reply": REPLY}
+            await bridge.dispatch("session/close", {"sessionId": session_id})
+            assert (await get(port, url))[0] == 404
 
     asyncio.run(scenario())
 

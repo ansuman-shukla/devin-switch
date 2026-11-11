@@ -168,6 +168,12 @@ class Server:
                 return await asset(writer, subagent_tab.PAGE, subagent_tab.ASSETS, name)
             if method == "GET" and route == "/subagents/events":
                 return await self.subagent_events(reader, writer, query.get("session", ""))
+            if method == "GET" and route == "/subagents/reply":
+                roster = self.bridge.roster
+                said = roster.reply(query.get("session", ""), query.get("agent", ""))
+                if said is None:
+                    return await respond(writer, 404, "Not found")
+                return await respond(writer, 200, json.dumps({"reply": said}), "application/json")
             if method == "GET" and route.startswith("/subagents/") and route.count("/") == 2:
                 shell = subagent_tab.page(unquote(route.removeprefix("/subagents/")), self.token)
                 return await respond(writer, 200, shell, "text/html")

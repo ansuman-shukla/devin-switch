@@ -3150,6 +3150,172 @@ def test_closed_subagents_note_names_them_and_says_what_no_longer_works():
     assert len(subagents.closed_note(exact).splitlines()) == 22
 
 
+def prompt_texts(native):
+    """Every text block of each prompt the native agents received."""
+    return [call["texts"] for call in logged(native) if call["method"] == "session/prompt"]
+
+
+def recorded_prompts(backend):
+    """The prompts a reload during a turn would replay."""
+    updates = [json.loads(text)["params"]["update"] for text in backend.transcript]
+    return [
+        update["content"]["text"]
+        for update in updates
+        if update["sessionUpdate"] == "user_message_chunk"
+    ]
+
+
+async def chat_with_finished_subagents(bridge, tmp_path, replaced=None):
+    """Open a chat, finish subagents f1 and f2 in it, then replace its agent process."""
+    created = await bridge.dispatch("session/new", {"cwd": str(tmp_path), "mcpServers": []})
+    session_id = created["sessionId"]
+    chat = bridge.chats[session_id]
+    await bridge.dispatch("session/prompt", prompt_params(session_id, "finished-subagents"))
+    if replaced == "idle":
+        # The next prompt reconnects the chat on a new process.
+        chat.backend.last_activity -= acp.IDLE_TIMEOUT + 1
+        assert await bridge.release_idle(chat)
+    elif replaced == "switch":
+        await bridge.dispatch("session/prompt", prompt_params(session_id, "/switch ansuman-2"))
+    elif replaced == "killed":
+        chat.backend.process.kill()
+        await until(lambda: chat.backend.process.poll() is not None)
+        await bridge.dispatch("session/load", chat.setup)
+    return session_id
+
+
+@pytest.mark.parametrize("replaced", ["idle", "switch", "killed"])
+def test_gui_first_prompt_to_a_replacement_process_names_the_closed_subagents(
+    acp_native, tmp_path, replaced
+):
+    async def scenario():
+        async with in_process(acp_native) as (bridge, _):
+            session_id = await chat_with_finished_subagents(bridge, tmp_path, replaced)
+            params = prompt_params(session_id, "next")
+            await bridge.dispatch("session/prompt", params)
+            assert params == prompt_params(session_id, "next")
+            text, note = prompt_texts(acp_native)[-1]
+            assert text == "next" and note.startswith("[Note from Devin Switch")
+            assert '"Title f1" (f1)' in note and '"Title f2" (f2)' in note
+            assert subagents.closed(acp_native.store, session_id) == {}
+            await bridge.dispatch("session/prompt", prompt_params(session_id, "again"))
+            assert prompt_texts(acp_native)[-1] == ["again"]
+            assert recorded_prompts(bridge.chats[session_id].backend) == ["next", "again"]
+
+    asyncio.run(scenario())
+
+
+def test_gui_finished_subagents_stay_usable_in_their_own_process(acp_native, tmp_path):
+    async def scenario():
+        async with in_process(acp_native) as (bridge, _):
+            session_id = await chat_with_finished_subagents(bridge, tmp_path)
+            await bridge.dispatch("session/prompt", prompt_params(session_id, "next"))
+            # Desktop reloading the open chat keeps its process, and with it the subagents.
+            await bridge.dispatch("session/load", bridge.chats[session_id].setup)
+            await bridge.dispatch("session/prompt", prompt_params(session_id, "again"))
+            assert prompt_texts(acp_native) == [["finished-subagents"], ["next"], ["again"]]
+            calls = [call for call in logged(acp_native) if call["sessionId"] == session_id]
+            assert len({call["pid"] for call in calls}) == 1
+            state = subagents.load(acp_native.store, session_id)
+            assert list(state["finished"]) == ["f1", "f2"] and state["closed"] == {}
+
+    asyncio.run(scenario())
+
+
+def test_gui_slash_command_is_forwarded_as_typed_and_leaves_the_subagents_note_for_later(
+    acp_native, tmp_path
+):
+    async def scenario():
+        async with in_process(acp_native) as (bridge, _):
+            session_id = await chat_with_finished_subagents(bridge, tmp_path, "idle")
+            await bridge.dispatch("session/prompt", prompt_params(session_id, "/help topics"))
+            assert prompt_texts(acp_native)[-1] == ["/help topics"]
+            assert list(subagents.closed(acp_native.store, session_id)) == ["f1", "f2"]
+            await bridge.dispatch("session/prompt", prompt_params(session_id, "next"))
+            text, note = prompt_texts(acp_native)[-1]
+            assert text == "next" and '"Title f1" (f1)' in note and '"Title f2" (f2)' in note
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("ending", ["failed", "cancelled"])
+def test_gui_closed_subagents_note_is_repeated_until_a_prompt_gets_through(
+    acp_native, tmp_path, ending
+):
+    async def scenario():
+        async with in_process(acp_native) as (bridge, _):
+            session_id = await chat_with_finished_subagents(bridge, tmp_path, "idle")
+            if ending == "failed":
+                with pytest.raises(acp.RpcError):
+                    await bridge.dispatch("session/prompt", prompt_params(session_id, "infer"))
+            else:
+                turn = asyncio.create_task(
+                    bridge.dispatch("session/prompt", prompt_params(session_id, "wait"))
+                )
+                await until(lambda: prompt_texts(acp_native)[-1][0] == "wait")
+                await bridge.dispatch(
+                    "session/cancel", {"sessionId": session_id}, notification=True
+                )
+                assert await turn == {"stopReason": "cancelled"}
+            _, note = prompt_texts(acp_native)[-1]
+            assert '"Title f1" (f1)' in note and '"Title f2" (f2)' in note
+            await bridge.dispatch("session/prompt", prompt_params(session_id, "next"))
+            assert prompt_texts(acp_native)[-1] == ["next", note]
+            await bridge.dispatch("session/prompt", prompt_params(session_id, "again"))
+            assert prompt_texts(acp_native)[-1] == ["again"]
+
+    asyncio.run(scenario())
+
+
+def test_gui_auto_switch_continue_repeats_the_subagents_note_its_failed_prompt_carried(
+    acp_native, tmp_path, monkeypatch
+):
+    monkeypatch.setattr(usage, "refresh_account", fresh_usage())
+    monkeypatch.setenv("FAKE_QUOTA_ACCOUNTS", "ansuman-2")
+
+    async def scenario():
+        async with in_process(acp_native) as (bridge, _):
+            session_id = await chat_with_finished_subagents(bridge, tmp_path, "switch")
+            result = await bridge.dispatch("session/prompt", prompt_params(session_id, "next"))
+            assert result == {"stopReason": "end_turn"}
+            accounts = [account for account, _ in prompts(acp_native)[-2:]]
+            assert accounts == ["ansuman-2", "ansuman-1"]
+            failed, continued = prompt_texts(acp_native)[-2:]
+            assert failed[0] == "next" and continued == ["continue", failed[1]]
+            assert '"Title f1" (f1)' in failed[1] and '"Title f2" (f2)' in failed[1]
+            await bridge.dispatch("session/prompt", prompt_params(session_id, "again"))
+            assert prompt_texts(acp_native)[-1] == ["again"]
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize(
+    ("failing", "error", "blocks"),
+    [("closed", OSError("unreadable"), 1), ("forget_closed", SwitchError("locked"), 2)],
+    ids=["reading", "forgetting"],
+)
+def test_gui_prompt_is_sent_when_the_closed_subagents_record_fails(
+    acp_native, tmp_path, monkeypatch, failing, error, blocks
+):
+    def broken(*_):
+        raise error
+
+    async def scenario():
+        async with in_process(acp_native) as (bridge, _):
+            session_id = await chat_with_finished_subagents(bridge, tmp_path, "idle")
+            with monkeypatch.context() as patch:
+                patch.setattr(subagents, failing, broken)
+                result = await bridge.dispatch("session/prompt", prompt_params(session_id, "next"))
+            assert result == {"stopReason": "end_turn"}
+            assert len(prompt_texts(acp_native)[-1]) == blocks
+            # Nothing was forgotten, so the next prompt still says it.
+            await bridge.dispatch("session/prompt", prompt_params(session_id, "again"))
+            text, note = prompt_texts(acp_native)[-1]
+            assert text == "again" and '"Title f1" (f1)' in note
+
+    asyncio.run(scenario())
+
+
 @pytest.mark.parametrize("case", ["auto-switch-off", "no-login-left"])
 def test_gui_relay_returns_quota_unchanged_when_it_cannot_rotate(
     acp_native, relayed, tmp_path, monkeypatch, case

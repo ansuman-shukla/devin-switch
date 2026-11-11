@@ -23,6 +23,8 @@ QUOTA_FAILURE = re.compile(r"usage quota has been exhausted|quota exhausted", re
 TASK_LIMIT = 4000
 PROGRESS_LIMIT = 2000
 PROGRESS_STEPS = 6
+MAPS = ("running", "interrupted", "finished")
+FINISHED_LIMIT = 100
 
 
 def path(store: Store, session_id: str) -> Path:
@@ -30,24 +32,20 @@ def path(store: Store, session_id: str) -> Path:
 
 
 def load(store: Store, session_id: str) -> dict:
+    state = {"session_id": session_id, **{name: {} for name in MAPS}}
     try:
         value = json.loads(path(store, session_id).read_text())
         if value.get("session_id") != session_id:
             raise ValueError
-        return {
-            "session_id": session_id,
-            "running": dict(value.get("running") or {}),
-            "interrupted": dict(value.get("interrupted") or {}),
-        }
-    except FileNotFoundError:
-        return {"session_id": session_id, "running": {}, "interrupted": {}}
-    except (ValueError, TypeError, AttributeError):
-        return {"session_id": session_id, "running": {}, "interrupted": {}}
+        # Files written before finished subagents were recorded have only the first two maps.
+        return state | {name: dict(value.get(name) or {}) for name in MAPS}
+    except (FileNotFoundError, ValueError, TypeError, AttributeError):
+        return state
 
 
 def save(store: Store, state: dict) -> None:
     target = path(store, state["session_id"])
-    if not state["running"] and not state["interrupted"]:
+    if not any(state[name] for name in MAPS):
         target.unlink(missing_ok=True)
         return
     private_directory(target.parent)
@@ -64,6 +62,12 @@ def describe(event: dict) -> dict:
     }
 
 
+def newest(agents: dict) -> dict:
+    """The FINISHED_LIMIT subagents that ended last, oldest first."""
+    ordered = sorted(agents.items(), key=lambda item: item[1].get("ended_at", 0))
+    return dict(ordered[-FINISHED_LIMIT:])
+
+
 def record(store: Store, session_id: str, key: str, event: dict) -> None:
     """Apply one live subagent event: started, finished, or failed because usage ran out."""
     agent = event.get("agentId")
@@ -73,11 +77,15 @@ def record(store: Store, session_id: str, key: str, event: dict) -> None:
         state = load(store, session_id)
         if key == STARTED:
             state["running"][agent] = describe(event)
-        elif key == COMPLETED:
-            info = state["running"].pop(agent, None)
+            state["finished"].pop(agent, None)
+        elif key == COMPLETED and (info := state["running"].pop(agent, None)) is not None:
             summary = str(event.get("summary") or "")
-            if info is not None and event.get("success") is False and QUOTA_FAILURE.search(summary):
+            if event.get("success") is False and QUOTA_FAILURE.search(summary):
                 state["interrupted"][agent] = {**info, "reason": "usage ran out"}
+            else:
+                kept = {name: info.get(name) for name in ("title", "profile", "background")}
+                state["finished"][agent] = {**kept, "ended_at": time.time()}
+                state["finished"] = newest(state["finished"])
         save(store, state)
 
 

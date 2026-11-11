@@ -3015,6 +3015,64 @@ def test_subagents_that_fail_on_quota_are_offered_for_resume(store):
     assert "Fix it" in text and "Test it" not in text
 
 
+def finish(store, session_id, agent, *, success=True, summary="done", **started):
+    subagents.record(store, session_id, subagents.STARTED, {"agentId": agent, **started})
+    subagents.record(
+        store,
+        session_id,
+        subagents.COMPLETED,
+        {"agentId": agent, "success": success, "summary": summary},
+    )
+
+
+def test_subagents_that_finish_are_remembered_while_their_process_lives(store):
+    session_id = "chat-finished"
+    before = time.time()
+    finish(store, session_id, "ok", title="Review", profile="reviewer", isBackground=True, task="x")
+    finish(store, session_id, "failed", success=False, summary="[Error] Canceled by user")
+    quota = "[Error] weekly usage quota has been exhausted"
+    finish(store, session_id, "quota", success=False, summary=quota)
+    # A completion whose start this process never reported is not one of its subagents.
+    subagents.record(store, session_id, subagents.COMPLETED, {"agentId": "unseen", "success": True})
+    state = subagents.load(store, session_id)
+    assert list(state["finished"]) == ["ok", "failed"]
+    assert before <= state["finished"]["ok"].pop("ended_at") <= time.time()
+    assert state["finished"]["ok"] == {"title": "Review", "profile": "reviewer", "background": True}
+    assert list(state["interrupted"]) == ["quota"]
+    assert state["running"] == {}
+    # Resumed in the same process, it runs again.
+    subagents.record(store, session_id, subagents.STARTED, {"agentId": "ok", "title": "Review"})
+    state = subagents.load(store, session_id)
+    assert list(state["finished"]) == ["failed"] and list(state["running"]) == ["ok"]
+
+
+def test_only_the_latest_finished_subagents_are_kept(store):
+    session_id = "chat-many"
+    limit = subagents.FINISHED_LIMIT
+    # Saved in the reverse of the order they ended in, so age decides and not position.
+    old = {f"old-{n}": {"title": f"Old {n}", "ended_at": float(limit - n)} for n in range(limit)}
+    subagents.save(store, {**subagents.load(store, session_id), "finished": old})
+    finish(store, session_id, "new")
+    finished = subagents.load(store, session_id)["finished"]
+    assert set(finished) == {"new", *(f"old-{n}" for n in range(limit - 1))}
+
+
+def test_subagent_record_saved_before_finished_ones_were_kept_still_loads(store):
+    session_id = "chat-legacy"
+    legacy = {
+        "session_id": session_id,
+        "running": {"a": {"title": "A", "task": "Do A", "profile": "", "background": False}},
+        "interrupted": {"b": {"title": "B", "task": "Do B", "reason": "usage ran out"}},
+    }
+    target = subagents.path(store, session_id)
+    target.parent.mkdir(parents=True)
+    target.write_text(json.dumps(legacy))
+    assert subagents.load(store, session_id) == {**legacy, "finished": {}}
+    subagents.record(store, session_id, subagents.COMPLETED, {"agentId": "a", "success": True})
+    state = subagents.load(store, session_id)
+    assert list(state["finished"]) == ["a"] and state["interrupted"] == legacy["interrupted"]
+
+
 @pytest.mark.parametrize("case", ["auto-switch-off", "no-login-left"])
 def test_gui_relay_returns_quota_unchanged_when_it_cannot_rotate(
     acp_native, relayed, tmp_path, monkeypatch, case

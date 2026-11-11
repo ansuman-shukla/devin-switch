@@ -45,6 +45,11 @@ turns = {}
 # open, and a Stop with steering pending only interrupts the subagent wait: the turn keeps working
 # on the steering and ends (answering every open prompt "cancelled") only on another cancel.
 foreground = None
+# With FAKE_FOREGROUND_SUBAGENT that turn reports its subagent as CLI 3000.12.43 does: started,
+# then parked by a Stop. A parked one outlives a session/load in this process, and the next
+# prompt un-pauses it; it finishes once FAKE_SUBAGENT_GATE (when set) opens.
+WORKER = "5e1f0c2a"
+parked = False
 INFERENCE = "/exa.api_server_pb.ApiServerService/GetChatMessage"
 STATUS = "/exa.seat_management_pb.SeatManagementService/GetUserStatus"
 
@@ -152,6 +157,13 @@ def finished(agent_id, success, summary):
     return lifecycle(
         agent_id, "completed", "cognition.ai/subagent_completed", success=success, summary=summary
     )
+
+
+def parking(agent_id, paused):
+    """A subagent parked by a Stop, or carrying on, as CLI 3000.12.43 reports it."""
+    change = {"sessionUpdate": "tool_call_update", "toolCallId": agent_id}
+    event = {"agentId": agent_id, "paused": paused}
+    return {**change, "_meta": {"cognition.ai/subagent_paused": event}}
 
 
 async def delegate(request_id):
@@ -267,7 +279,7 @@ def whiteboard_chat(params):
 
 
 async def handle(message):
-    global loaded, project, host, chains, foreground
+    global loaded, project, host, chains, foreground, parked
     method, params = message["method"], message.get("params", {})
     if path := os.environ.get("FAKE_ACP_LOG"):
         with open(path, "a") as handle:
@@ -427,6 +439,14 @@ async def handle(message):
                 }
             )
             return
+        if parked:
+            # The next prompt un-pauses a parked subagent, which then finishes.
+            parked = False
+            update(loaded, parking(WORKER, False))
+            gate = os.environ.get("FAKE_SUBAGENT_GATE")
+            while gate and not Path(gate).exists():
+                await asyncio.sleep(0.02)
+            update(loaded, finished(WORKER, True, "Slept."))
         if text in {"infer", "subagents"}:
             try:
                 upstream = await asyncio.to_thread(infer)
@@ -473,6 +493,7 @@ async def handle(message):
             return
         if text == "foreground":
             foreground = {"steering": [], "stops": asyncio.Queue()}
+            reported = bool(os.environ.get("FAKE_FOREGROUND_SUBAGENT"))
             update(
                 loaded,
                 {
@@ -480,7 +501,13 @@ async def handle(message):
                     "content": {"type": "text", "text": "live progress"},
                 },
             )
+            if reported:
+                update(loaded, launched(WORKER, False))
             await foreground["stops"].get()
+            if reported:
+                # A Stop parks a foreground subagent; it does not end it.
+                update(loaded, parking(WORKER, True))
+                parked = True
             if foreground["steering"]:
                 update(
                     loaded,

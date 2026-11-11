@@ -2,6 +2,7 @@ import asyncio
 import json
 import re
 import time
+import types
 from urllib.parse import quote, urlsplit
 
 import pytest
@@ -28,6 +29,20 @@ STARTED = "cognition.ai/subagent_started"
 COMPLETED = "cognition.ai/subagent_completed"
 PAUSED = "cognition.ai/subagent_paused"
 CONTEXT = "cognition.ai/subagent_context"
+STREAM = "cognition.ai/streamingMessageId"
+STAMP = {"cognition.ai/timestamp": "2026-11-11T07:22:21.637022+00:00"}
+LISTED = {
+    "id",
+    "title",
+    "profile",
+    "background",
+    "status",
+    "started",
+    "ended",
+    "step",
+    "note",
+    "reply_chars",
+}
 # A subagent's steps, as captured from CLI 3000.12.43.
 TOOL = {
     "sessionUpdate": "tool_call",
@@ -83,6 +98,12 @@ def by(agent, change):
     return {**change, "_meta": {CONTEXT: {"parentAgentId": agent}}}
 
 
+def said(text, stream="m1", agent=AGENT):
+    """One live chunk of a subagent's own message, as captured from CLI 3000.12.43."""
+    meta = {STREAM: stream, CONTEXT: {"parentAgentId": agent}, **STAMP}
+    return {**MESSAGE, "content": {"type": "text", "text": text}, "_meta": meta}
+
+
 def rows(roster, session_id="chat"):
     return roster.snapshot(session_id)["subagents"]
 
@@ -112,6 +133,7 @@ def test_a_started_subagent_is_a_running_row_that_never_carries_its_task():
         "ended": None,
         "step": "",
         "note": "",
+        "reply_chars": 0,
     }
     assert "secret plan" not in json.dumps(roster.snapshot("chat"))
     assert rows(roster, "other-chat") == []
@@ -376,6 +398,186 @@ def test_every_page_of_a_chat_is_told_and_closing_ends_their_streams():
     assert not roster.showing("chat")
 
 
+def test_a_row_keeps_what_its_subagent_said_and_lists_only_how_much():
+    roster = subagent_tab.Roster()
+    assert roster.reply("chat", AGENT) is None
+    roster.apply("chat", started())
+    roster.apply("chat", started("b2"))
+    assert roster.reply("chat", AGENT) == "" and row(roster)["reply_chars"] == 0
+
+    # A message arrives in chunks; a later message of the same subagent has another ID.
+    roster.apply("chat", said("Looking ", "m1"))
+    roster.apply("chat", said("into it.", "m1"))
+    assert roster.reply("chat", AGENT) == "Looking into it."
+    # Its other work is not something it said.
+    for change in (THOUGHT, TOOL, RAN, USAGE):
+        roster.apply("chat", by(AGENT, change))
+    for text, stream in (("## Report\n", "m2"), ("All **good**.", "m2"), ("Bye", "m3")):
+        roster.apply("chat", said(text, stream))
+    reply = "Looking into it.\n\n## Report\nAll **good**.\n\nBye"
+    assert roster.reply("chat", AGENT) == reply
+    assert row(roster)["reply_chars"] == len(reply) == 46
+    assert row(roster)["step"] == "Writing"
+
+    # Each subagent has its own, and the list never holds the text itself.
+    roster.apply("chat", said("Second's own.", "m1", "b2"))
+    assert roster.reply("chat", "b2") == "Second's own." and roster.reply("chat", AGENT) == reply
+    assert [item["reply_chars"] for item in rows(roster)] == [46, 13]
+    listed = roster.snapshot("chat")
+    assert [set(item) for item in listed["subagents"]] == [LISTED, LISTED]
+    assert not any(word in json.dumps(listed) for word in ("Looking", "Report", "Bye", "own"))
+    assert roster.reply("chat", "gone") is None and roster.reply("other-chat", AGENT) is None
+
+
+def test_only_the_text_of_a_subagents_own_messages_joins_its_reply():
+    roster = subagent_tab.Roster()
+    roster.apply("chat", started())
+    roster.apply("chat", said("Kept."))
+    before = rows(roster)
+    image = {"type": "image", "data": "aGk=", "mimeType": "image/png"}
+    with roster.listen("chat") as queue:
+        queue.get_nowait()
+        for content in (
+            None,
+            "text",
+            ["text"],
+            {},
+            image,
+            {"text": "No type"},
+            {"type": "resource_link", "text": "Not text"},
+            {"type": "text"},
+            *({"type": "text", "text": odd} for odd in (None, "", 7, ["x"], {"text": "x"})),
+        ):
+            roster.apply("chat", {**said("x"), "content": content})
+        roster.apply("chat", by(AGENT, {"sessionUpdate": "agent_message_chunk"}))
+        # The chat's own agent, unknown agents and other chats add nothing.
+        roster.apply("chat", said("Root's", agent="root"))
+        roster.apply("chat", said("Nobody's", agent="gone"))
+        roster.apply("chat", {**MESSAGE, "_meta": {STREAM: "m1", **STAMP}})
+        roster.apply("chat", MESSAGE)
+        roster.apply("other-chat", said("Elsewhere"))
+        for context in (None, "root", [AGENT], {}, {"parentAgentId": None}):
+            roster.apply("chat", {**MESSAGE, "_meta": {CONTEXT: context}})
+        assert roster.reply("chat", AGENT) == "Kept." and rows(roster) == before
+        assert queue.empty()
+
+    # An odd message ID still keeps the text.
+    for odd in (None, 7, ["m"], {"m": 1}):
+        roster.apply("chat", said("!", odd))
+    assert roster.reply("chat", AGENT).replace("\n", "") == "Kept.!!!!"
+    roster.apply("chat", {**said("?"), "_meta": {CONTEXT: {"parentAgentId": AGENT}}})
+    assert roster.reply("chat", AGENT).endswith("?")
+
+
+def test_a_long_reply_keeps_its_newest_text():
+    roster, limit = subagent_tab.Roster(), subagent_tab.REPLY_LIMIT
+    assert limit == 50_000
+    roster.apply("chat", started())
+    roster.apply("chat", said("START" + "a" * limit))
+    assert roster.reply("chat", AGENT) == "a" * limit
+    roster.apply("chat", said("b" * 10 + "END"))
+    reply = roster.reply("chat", AGENT)
+    assert reply == "a" * (limit - 13) + "b" * 10 + "END"
+    assert len(reply) == limit == row(roster)["reply_chars"]
+    # A later message counts its blank line too.
+    roster.apply("chat", said("NEXT", "m2"))
+    assert roster.reply("chat", AGENT) == "a" * (limit - 19) + "b" * 10 + "END\n\nNEXT"
+    assert row(roster)["reply_chars"] == limit
+
+
+def test_a_reply_goes_when_its_row_does():
+    roster, cap = subagent_tab.Roster(), subagent_tab.MAX_ROWS
+    roster.apply("chat", started())
+    roster.apply("chat", said("First run."))
+    roster.apply("chat", completed())
+    assert roster.reply("chat", AGENT) == "First run."
+    # The same ID started again has said nothing yet.
+    roster.apply("chat", started())
+    assert roster.reply("chat", AGENT) == "" and row(roster)["reply_chars"] == 0
+    roster.apply("chat", said("Second run."))
+    assert roster.reply("chat", AGENT) == "Second run."
+
+    roster.apply("other-chat", started("elsewhere"))
+    roster.apply("other-chat", said("Stays.", agent="elsewhere"))
+    roster.forget("chat")
+    assert roster.reply("chat", AGENT) is None
+    assert roster.reply("other-chat", "elsewhere") == "Stays."
+
+    # A row the cap drops takes its reply along.
+    roster.apply("chat", started("first"))
+    roster.apply("chat", said("An old report.", agent="first"))
+    roster.apply("chat", completed("first"))
+    for number in range(cap):
+        roster.apply("chat", started(f"job-{number}"))
+        roster.apply("chat", said(f"Report {number}", agent=f"job-{number}"))
+        roster.apply("chat", completed(f"job-{number}"))
+    assert roster.reply("chat", "first") is None and len(rows(roster)) == cap
+    assert roster.reply("chat", "job-0") == "Report 0"
+
+
+@pytest.fixture
+def clock(monkeypatch):
+    """The roster's monotonic clock, moved by hand."""
+    now = [5000.0]
+    stand_in = types.SimpleNamespace(time=time.time, monotonic=lambda: now[0])
+    monkeypatch.setattr(subagent_tab, "time", stand_in)
+    return now
+
+
+def test_a_growing_reply_alone_tells_the_page_once_a_second(clock):
+    roster = subagent_tab.Roster()
+    roster.apply("chat", started())
+    roster.apply("chat", started("b2"))
+    with roster.listen("chat") as queue:
+        queue.get_nowait()
+
+        def told():
+            return not queue.empty() and queue.get_nowait() is True and queue.empty()
+
+        # Its first words are a new step, told at once.
+        roster.apply("chat", said("a"))
+        assert told()
+        # Chunks arrive many times a second: the page is not told of each.
+        for _ in range(20):
+            clock[0] += 0.04
+            roster.apply("chat", said("a"))
+        clock[0] = 5000.99
+        roster.apply("chat", said("a"))
+        assert not told()
+        # The list read meanwhile is current all the same.
+        assert row(roster)["reply_chars"] == 22
+        clock[0] = 5001.0
+        roster.apply("chat", said("a"))
+        assert told()
+        clock[0] = 5001.5
+        roster.apply("chat", said("a"))
+        assert not told()
+
+        # Each row waits for itself.
+        roster.apply("chat", {**said("", agent="b2"), "content": {"type": "image"}})
+        assert told() and row(roster, "b2")["step"] == "Writing"
+        roster.apply("chat", said("b", agent="b2"))
+        assert told()
+        clock[0] = 5001.6
+        roster.apply("chat", said("b", agent="b2"))
+        assert not told()
+
+        # A new step or the end is told at once, with the reply's length as it is by then.
+        roster.apply("chat", by(AGENT, TOOL))
+        assert told()
+        clock[0] = 5001.7
+        roster.apply("chat", said("a", "m2"))
+        assert told() and row(roster)["reply_chars"] == 27
+        clock[0] = 5001.8
+        roster.apply("chat", said("a", "m2"))
+        assert not told()
+        roster.apply("chat", completed())
+        assert told()
+        (ended, _) = rows(roster)
+        assert (ended["status"], ended["reply_chars"]) == ("done", 28)
+        assert roster.reply("chat", AGENT) == "a" * 24 + "\n\naa"
+
+
 def test_the_page_shell_names_its_chat_token_and_three_files():
     shell = subagent_tab.page('chat-1<"&>', 'tok<en>&"x')
     token = "tok&lt;en&gt;&amp;&quot;x"
@@ -556,17 +758,7 @@ def test_the_subagents_page_streams_a_chats_rows_as_they_change(acp_native, tmp_
             (first,) = await lines(reader, 1)
             assert first == roster.snapshot(session_id)
             (running,) = first["subagents"]
-            assert set(running) == {
-                "id",
-                "title",
-                "profile",
-                "background",
-                "status",
-                "started",
-                "ended",
-                "step",
-                "note",
-            }
+            assert set(running) == LISTED
             assert (running["id"], running["status"], running["step"]) == (
                 AGENT,
                 "running",

@@ -3,9 +3,10 @@
 The native reports subagents in `session/update` metadata: `cognition.ai/subagent_started`,
 `_completed` and `_paused` events, and on a subagent's own updates `cognition.ai/subagent_context`,
 whose `parentAgentId` is that subagent's ID (the chat's own agent sends it only on usage updates,
-as "root"). The bridge feeds each live update to a `Roster`, kept only in memory. `/subagents`
-typed in a chat opens the page that shows it, served by `side.Server` like the side page. It is
-a view: nothing here reaches the agent or the chat's transcript.
+as "root"). The bridge feeds each live update to a `Roster`, kept only in memory, which also
+keeps what each subagent said. `/subagents` typed in a chat opens the page that shows it, served
+by `side.Server` like the side page. It is a view: nothing here reaches the agent or the chat's
+transcript.
 """
 
 import asyncio
@@ -19,6 +20,7 @@ from devin_switch.subagents import COMPLETED, STARTED
 
 PAUSED = "cognition.ai/subagent_paused"
 CONTEXT = "cognition.ai/subagent_context"
+STREAM = "cognition.ai/streamingMessageId"
 PAGE = Path(__file__).parent / "subagent_page"
 ASSETS = {
     "subagents.css": "text/css",
@@ -30,12 +32,23 @@ RESTARTED = "the agent restarted"
 RELOADED = "the chat was reloaded"
 MAX_ROWS = 200
 TEXT_LIMIT = 200
+REPLY_LIMIT = 50_000
+REPLY_PAUSE = 1
+SHOWN = ("id", "title", "profile", "background", "status", "started", "ended", "step", "note")
 
 
 def named(event: object) -> str | None:
     """The subagent an event is about, when it names one."""
     agent = event.get("agentId") if isinstance(event, dict) else None
     return agent if isinstance(agent, str) and agent else None
+
+
+def author(update: object) -> str | None:
+    """The subagent an update is the own work of (None: the chat's own agent, or unsaid)."""
+    meta = update.get("_meta") if isinstance(update, dict) else None
+    context = meta.get(CONTEXT) if isinstance(meta, dict) else None
+    parent = context.get("parentAgentId") if isinstance(context, dict) else None
+    return parent if isinstance(parent, str) and parent and parent != "root" else None
 
 
 def line(value: object) -> str:
@@ -52,6 +65,15 @@ def step(update: dict) -> str:
     if kind == "agent_thought_chunk":
         return "Thinking"
     return "Writing" if kind == "agent_message_chunk" else ""
+
+
+def said(update: dict) -> str:
+    """The text of a message chunk ("": it is not one, or holds something else)."""
+    content = update.get("content")
+    if update.get("sessionUpdate") != "agent_message_chunk" or not isinstance(content, dict):
+        return ""
+    text = content.get("text")
+    return text if content.get("type") == "text" and isinstance(text, str) else ""
 
 
 def trim(rows: dict[str, dict]) -> None:
@@ -92,6 +114,9 @@ class Roster:
                 "ended": None,
                 "step": "",
                 "note": "",
+                "reply": "",
+                "stream": None,
+                "told": float("-inf"),
             }
             trim(rows)
             changed = True
@@ -110,13 +135,20 @@ class Roster:
         if row and row["status"] in ACTIVE and isinstance(event.get("paused"), bool):
             status = "paused" if event["paused"] else "running"
             changed, row["status"] = changed or status != row["status"], status
-        context = meta.get(CONTEXT)
-        parent = context.get("parentAgentId") if isinstance(context, dict) else None
-        row = rows.get(parent) if isinstance(parent, str) else None
+        row = rows.get(author(update))
         # Thought and message chunks arrive many times a second: only a new step is a change.
         if row and (doing := step(update)) and doing != row["step"]:
             row["step"] = doing
             changed = True
+        if row and (text := said(update)):
+            stream, now = meta.get(STREAM), time.monotonic()
+            # A message after an earlier one starts a new paragraph.
+            gap = "\n\n" if row["reply"] and stream != row["stream"] else ""
+            row["reply"], row["stream"] = (row["reply"] + gap + text)[-REPLY_LIMIT:], stream
+            # Chunks arrive many times a second: a longer reply alone is told once in a while.
+            changed = changed or now - row["told"] >= REPLY_PAUSE
+            if changed:
+                row["told"] = now
         if changed:
             self.notify(session_id)
 
@@ -134,8 +166,20 @@ class Roster:
             self.notify(session_id)
 
     def snapshot(self, session_id: str) -> dict:
-        """What the page shows; never a subagent's task, which can hold prompt content."""
-        return {"subagents": [dict(row) for row in self.rows.get(session_id, {}).values()]}
+        """What the page lists: never a subagent's task, which can hold prompt content, and of
+        its reply only the length."""
+        rows = self.rows.get(session_id, {}).values()
+        return {
+            "subagents": [
+                {**{key: row[key] for key in SHOWN}, "reply_chars": len(row["reply"])}
+                for row in rows
+            ]
+        }
+
+    def reply(self, session_id: str, agent: str) -> str | None:
+        """Everything a subagent said so far, newest `REPLY_LIMIT` characters (None: no row)."""
+        row = self.rows.get(session_id, {}).get(agent)
+        return row["reply"] if row else None
 
     def showing(self, session_id: str) -> bool:
         return bool(self.listeners.get(session_id))

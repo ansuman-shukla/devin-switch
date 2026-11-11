@@ -149,3 +149,108 @@ test('active rows show their latest step and only failed or stopped rows show th
   assert.equal(view.detailOf(row({ status: 'failed', step: 'Ran sleep' })), '');
   assert.equal(view.detailOf(row({ status: 'running', step: '  ' })), '');
 });
+
+test('only a positive whole reply_chars is a reply', () => {
+  for (const chars of [1, 2, 999, 15_639, 50_000]) {
+    assert.equal(view.hasReply(row({ reply_chars: chars })), true, `hasReply(${chars})`);
+    assert.equal(view.replyChars(row({ reply_chars: chars })), chars, `replyChars(${chars})`);
+  }
+  const fresh = { open: true, asked: null, waiting: false };
+  // A row without the field, as an older bridge sends it.
+  assert.equal(view.hasReply(row({})), false);
+  assert.equal(view.replyChars(row({})), 0);
+  assert.equal(view.replySize(row({})), '');
+  assert.equal(view.needsReply(row({}), fresh), false);
+  for (const chars of [0, -1, -500, NaN, Infinity, 2.5, '12', '', null, undefined, true, [3], {}]) {
+    const odd = row({ reply_chars: chars });
+    assert.equal(view.hasReply(odd), false, `hasReply(${String(chars)})`);
+    assert.equal(view.replyChars(odd), 0, `replyChars(${String(chars)})`);
+    assert.equal(view.replySize(odd), '', `replySize(${String(chars)})`);
+    assert.equal(view.needsReply(odd, fresh), false, `needsReply(${String(chars)})`);
+  }
+});
+
+test('the reply toggle says show or hide, and "so far" while the row is still active', () => {
+  const cases = [
+    ['running', false, 'Show reply so far'],
+    ['running', true, 'Hide reply so far'],
+    ['paused', false, 'Show reply so far'],
+    ['paused', true, 'Hide reply so far'],
+    ['done', false, 'Show reply'],
+    ['done', true, 'Hide reply'],
+    ['failed', false, 'Show reply'],
+    ['failed', true, 'Hide reply'],
+    ['stopped', false, 'Show reply'],
+    ['stopped', true, 'Hide reply'],
+  ];
+  for (const [status, expanded, text] of cases) assert.equal(view.replyLabel(row({ status, reply_chars: 3712 }), expanded), text, `${status}, expanded ${expanded}`);
+});
+
+test('the size hint counts characters, and thousands to one decimal from 1,000 on', () => {
+  const cases = [
+    [0, ''],
+    [1, '1 character'],
+    [2, '2 characters'],
+    [999, '999 characters'],
+    [1000, '1k characters'],
+    [1049, '1k characters'],
+    [1050, '1.1k characters'],
+    [3712, '3.7k characters'],
+    [9949, '9.9k characters'],
+    [9950, '10k characters'],
+    [15_639, '15.6k characters'],
+    [50_000, '50k characters'],
+  ];
+  for (const [chars, text] of cases) assert.equal(view.replySize(row({ reply_chars: chars })), text, `replySize(${chars})`);
+  // The hint is about the text, not the row's state.
+  assert.equal(view.replySize(row({ status: 'done', reply_chars: 3712 })), '3.7k characters');
+});
+
+test('an expanded row asks for its reply, then again only when reply_chars has moved on', () => {
+  const needs = (chars, state) => view.needsReply(row({ reply_chars: chars }), { open: true, asked: null, waiting: false, ...state });
+  assert.equal(needs(120, {}), true, 'just expanded: nothing was asked yet');
+  assert.equal(needs(120, { asked: 120 }), false, 'the same count again');
+  assert.equal(needs(300, { asked: 120 }), true, 'it grew');
+  assert.equal(needs(40, { asked: 120 }), true, 'a different count, even a smaller one');
+  // A finished row's reply is asked for the same way.
+  assert.equal(view.needsReply(row({ status: 'done', ended: 1100, reply_chars: 120 }), { open: true, asked: null, waiting: false }), true);
+  // A collapsed row asks for nothing, whatever changed.
+  assert.equal(needs(120, { open: false }), false);
+  assert.equal(needs(300, { open: false, asked: 120 }), false);
+});
+
+test('a row has one request at a time, and a change during it is asked for once it returns', () => {
+  const needs = (chars, state) => view.needsReply(row({ reply_chars: chars }), state);
+  const flying = { open: true, asked: 120, waiting: true };
+  assert.equal(needs(120, flying), false);
+  assert.equal(needs(300, flying), false, 'changed while the request is in flight');
+  assert.equal(needs(900, flying), false, 'changed again while it is in flight');
+  const back = { ...flying, waiting: false };
+  assert.equal(needs(900, back), true, 'the request returned and the count had moved on');
+  assert.equal(needs(120, back), false, 'the request returned and nothing had changed');
+
+  // The page's loop: every snapshot and every returned request asks this question.
+  const state = { open: true, asked: null, waiting: false };
+  const requests = [];
+  const see = (chars) => {
+    if (!needs(chars, state)) return;
+    Object.assign(state, { asked: chars, waiting: true });
+    requests.push(chars);
+  };
+  const returned = (chars) => {
+    state.waiting = false;
+    see(chars);
+  };
+  see(100);
+  see(200);
+  see(300);
+  assert.deepEqual(requests, [100]);
+  returned(300);
+  assert.deepEqual(requests, [100, 300]);
+  see(300);
+  returned(300);
+  see(300);
+  assert.deepEqual(requests, [100, 300], 'the latest count was already asked for');
+  see(301);
+  assert.deepEqual(requests, [100, 300, 301]);
+});

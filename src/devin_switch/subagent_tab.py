@@ -4,9 +4,10 @@ The native reports subagents in `session/update` metadata: `cognition.ai/subagen
 `_completed` and `_paused` events, and on a subagent's own updates `cognition.ai/subagent_context`,
 whose `parentAgentId` is that subagent's ID (the chat's own agent sends it only on usage updates,
 as "root"). The bridge feeds each live update to a `Roster`, kept only in memory, which also
-keeps what each subagent said. `/subagents` typed in a chat opens the page that shows it, served
-by `side.Server` like the side page. It is a view: nothing here reaches the agent or the chat's
-transcript.
+keeps what each subagent said: the bridge leaves those messages out of the chat, where Desktop
+would show them as the chat's own agent's. `/subagents` typed in a chat opens the page that shows
+it, served by `side.Server` like the side page. It is a view: nothing here reaches the agent or
+the chat's transcript.
 """
 
 import asyncio
@@ -49,6 +50,14 @@ def author(update: object) -> str | None:
     context = meta.get(CONTEXT) if isinstance(meta, dict) else None
     parent = context.get("parentAgentId") if isinstance(context, dict) else None
     return parent if isinstance(parent, str) and parent and parent != "root" else None
+
+
+def own_message(update: object) -> bool:
+    """Whether an update is a subagent's own message, not one of the chat's own agent.
+
+    Never raises on what a native might send: the caller is the chat's read loop.
+    """
+    return author(update) is not None and update.get("sessionUpdate") == "agent_message_chunk"
 
 
 def line(value: object) -> str:

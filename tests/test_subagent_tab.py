@@ -515,6 +515,34 @@ def test_a_reply_goes_when_its_row_does():
     assert roster.reply("chat", "job-0") == "Report 0"
 
 
+def test_only_a_subagents_own_message_is_told_from_the_chats_own():
+    own = subagent_tab.own_message
+    # Live, the chunks of one message share a streaming ID; a load replays it whole, by event.
+    assert own(said("Report")) and own(said("", "m2", "never-started"))
+    saved = {"cognition.ai/eventId": "45", **STAMP, CONTEXT: {"parentAgentId": AGENT}}
+    assert own({**MESSAGE, "_meta": saved})
+    assert own(by(AGENT, {"sessionUpdate": "agent_message_chunk"}))
+
+    # The chat's own agent's messages are not, nor is a subagent's other work.
+    assert not own(MESSAGE)
+    assert not own({**MESSAGE, "_meta": {STREAM: "m1", **STAMP}})
+    assert not own({**MESSAGE, "_meta": {"cognition.ai/eventId": "72", **STAMP}})
+    assert not own(by("root", MESSAGE))
+    for change in (THOUGHT, TOOL, RAN, USAGE, {"title": "No kind"}):
+        assert not own(by(AGENT, change))
+    for change in (started(), completed(), paused(AGENT, True)):
+        assert not own(change)
+
+    # Whatever else a native sends is not one either, and never raises.
+    for odd in (None, "", "text", 7, ["agent_message_chunk"], {}):
+        assert not own(odd)
+        assert not own({**MESSAGE, "_meta": odd})
+        assert not own({**MESSAGE, "_meta": {CONTEXT: odd}})
+    for odd in (None, "", 7, [AGENT], {"id": AGENT}):
+        assert not own(by(odd, MESSAGE))
+        assert not own(by(AGENT, {"sessionUpdate": odd}))
+
+
 @pytest.fixture
 def clock(monkeypatch):
     """The roster's monotonic clock, moved by hand."""

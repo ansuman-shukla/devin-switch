@@ -769,6 +769,12 @@ class Bridge:
                 for key in (subagents.STARTED, subagents.COMPLETED):
                     if isinstance(event := meta.get(key), dict):
                         await self.track_subagent(backend, key, event)
+            # Desktop 3.12 puts every agent message at the chat's top level, so a subagent's
+            # report would read as Devin's own. Live or replayed, it never reaches Desktop or
+            # the reload record: the Subagents tab shows it instead (the roster above kept it).
+            # Remove once Desktop nests a subagent's replies itself.
+            if subagent_tab.own_message(update):
+                return
             if backend.chat:
                 backend.record(message)
             if backend.suppress_replay:

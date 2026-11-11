@@ -3289,6 +3289,42 @@ def test_gui_auto_switch_continue_repeats_the_subagents_note_its_failed_prompt_c
     asyncio.run(scenario())
 
 
+def test_gui_prompt_sent_while_the_closed_subagents_are_read_waits_for_its_own_turn(
+    acp_native, tmp_path, monkeypatch
+):
+    """Reading the record must not open the turn: a second prompt would overtake as steering."""
+    reading, finish_reading = threading.Event(), threading.Event()
+    closed = subagents.closed
+
+    def slow(store, session_id):
+        reading.set()
+        finish_reading.wait(10)
+        return closed(store, session_id)
+
+    async def scenario():
+        async with in_process(acp_native) as (bridge, _):
+            session_id = await chat_with_finished_subagents(bridge, tmp_path, "idle")
+            monkeypatch.setattr(subagents, "closed", slow)
+            first = asyncio.create_task(
+                bridge.dispatch("session/prompt", prompt_params(session_id, "first"))
+            )
+            await asyncio.to_thread(reading.wait, 10)
+            second = asyncio.create_task(
+                bridge.dispatch("session/prompt", prompt_params(session_id, "second"))
+            )
+            try:
+                await asyncio.sleep(0.3)
+                assert prompt_texts(acp_native)[-1] == ["finished-subagents"]
+            finally:
+                finish_reading.set()
+            await asyncio.gather(first, second)
+            sent = prompt_texts(acp_native)[-2:]
+            assert [len(texts) for texts in sent] == [2, 1]
+            assert [texts[0] for texts in sent] == ["first", "second"]
+
+    asyncio.run(scenario())
+
+
 @pytest.mark.parametrize(
     ("failing", "error", "blocks"),
     [("closed", OSError("unreadable"), 1), ("forget_closed", SwitchError("locked"), 2)],

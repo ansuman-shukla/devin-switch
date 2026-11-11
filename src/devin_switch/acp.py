@@ -1012,18 +1012,26 @@ class Bridge:
     async def prompt_turn(self, chat, params):
         tried = {chat.backend.account.name}
         while True:
+            # Read before the turn opens: steering sent during it must not overtake this prompt.
+            sent, closed = await self.closed_note_params(chat, params)
             backend = chat.backend
             backend.stop_cause = None
             controls = chat.controls = set()
             result = error = None
             backend.record_prompt(params)
             try:
-                result = await self.forward_request(backend, "session/prompt", params)
+                result = await self.forward_request(backend, "session/prompt", sent)
             except RpcError as exc:
                 error = exc
             finally:
                 chat.controls = None
                 await asyncio.gather(*controls, return_exceptions=True)
+            if closed and not error and result.get("stopReason") != "cancelled":
+                # Told once: a prompt that failed or was stopped leaves them for the next one.
+                with suppress(SwitchError, OSError):
+                    await asyncio.to_thread(
+                        subagents.forget_closed, self.native.store, chat.session_id, closed
+                    )
             exhausted = (
                 quota_exhausted(error)
                 if error
@@ -1388,6 +1396,27 @@ class Bridge:
         block = params["prompt"][0]
         block["text"] = text if resume_only else f"{block['text']}\n\n{text}"
         return params
+
+    async def closed_note_params(self, chat, params):
+        """The prompt to forward and the closed subagents it names (none: params unchanged).
+
+        A finished subagent can be read or resumed only in the process that ran it, so the
+        first prompt a replacement process gets says which ones are gone. A slash command is
+        read by the native as it is and leaves the note for the next prompt.
+        """
+        blocks, _, command = prompt_command(params)
+        # A prompt that merely starts with "/" (a path, say) only delays the note by a prompt.
+        if command.startswith("/"):
+            return params, {}
+        try:
+            closed = await asyncio.to_thread(subagents.closed, self.native.store, chat.session_id)
+        except (SwitchError, OSError):
+            return params, {}
+        if not closed:
+            return params, {}
+        # The native joins a prompt's text blocks as they are when it replays them.
+        note = {"type": "text", "text": "\n\n" + subagents.closed_note(closed)}
+        return {**params, "prompt": [*blocks, note]}, closed
 
     async def claim(self, session_id):
         """Take a saved conversation over from another window's idle GUI connection."""

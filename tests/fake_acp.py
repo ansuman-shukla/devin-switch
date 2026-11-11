@@ -281,6 +281,11 @@ async def handle(message):
                         "args": sys.argv[1:],
                         "gh_config_dir": os.environ.get("GH_CONFIG_DIR"),
                         "text": (params.get("prompt") or [{}])[0].get("text"),
+                        "texts": [
+                            block["text"]
+                            for block in params.get("prompt") or []
+                            if block.get("type") == "text"
+                        ],
                         "uri": params.get("uri"),
                         "process_cwd": process_cwd(),
                         "chat_id": whiteboard_chat(params),
@@ -489,6 +494,23 @@ async def handle(message):
                 emit({"id": identifier, "result": {"stopReason": "cancelled"}})
             foreground = None
             return
+        if text == "finished-subagents":
+            # Two subagents that start and finish inside this turn; f2 ends unsuccessfully.
+            for agent_id, success in (("f1", True), ("f2", False)):
+                subagent_update(
+                    loaded,
+                    "cognition.ai/subagent_started",
+                    {"agentId": agent_id, "title": f"Title {agent_id}", "task": f"Do {agent_id}"},
+                )
+                subagent_update(
+                    loaded,
+                    "cognition.ai/subagent_completed",
+                    {
+                        "agentId": agent_id,
+                        "success": success,
+                        "summary": "done" if success else "[Error] Canceled by user",
+                    },
+                )
         if text == "side-noise":
             # A side answer streaming while this main turn runs.
             update(

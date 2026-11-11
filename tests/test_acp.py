@@ -3072,6 +3072,488 @@ def test_subagents_that_fail_on_quota_are_offered_for_resume(store):
     assert "Fix it" in text and "Test it" not in text
 
 
+def finish(store, session_id, agent, *, success=True, summary="done", **started):
+    subagents.record(store, session_id, subagents.STARTED, {"agentId": agent, **started})
+    subagents.record(
+        store,
+        session_id,
+        subagents.COMPLETED,
+        {"agentId": agent, "success": success, "summary": summary},
+    )
+
+
+def test_subagents_that_finish_are_remembered_while_their_process_lives(store):
+    session_id = "chat-finished"
+    before = time.time()
+    finish(store, session_id, "ok", title="Review", profile="reviewer", isBackground=True, task="x")
+    finish(store, session_id, "failed", success=False, summary="[Error] Canceled by user")
+    quota = "[Error] weekly usage quota has been exhausted"
+    finish(store, session_id, "quota", success=False, summary=quota)
+    ended = subagents.load_ended(store, session_id)
+    assert list(ended["finished"]) == ["ok", "failed"] and ended["closed"] == {}
+    assert before <= ended["finished"]["ok"].pop("ended_at") <= time.time()
+    assert ended["finished"]["ok"] == {"title": "Review", "profile": "reviewer", "background": True}
+    state = subagents.load(store, session_id)
+    assert state["running"] == {} and list(state["interrupted"]) == ["quota"]
+    assert subagents.closed(store, session_id) == {}
+    # Resumed in the same process, it runs again.
+    subagents.record(store, session_id, subagents.STARTED, {"agentId": "ok", "title": "Review"})
+    assert list(subagents.load_ended(store, session_id)["finished"]) == ["failed"]
+    assert list(subagents.load(store, session_id)["running"]) == ["ok"]
+
+
+def test_subagent_completion_whose_start_was_missed_still_counts_as_finished(store):
+    """Events are not counted while a load replays, so a subagent's start can be missed."""
+    session_id = "chat-missed"
+    before = time.time()
+    quota = "[Error] daily usage quota has been exhausted"
+    for agent, success, summary in (
+        ("late", True, "done"),
+        ("spent", False, quota),
+        ("stopped", False, "[Error] Canceled by user"),
+    ):
+        event = {"agentId": agent, "success": success, "summary": summary}
+        subagents.record(store, session_id, subagents.COMPLETED, event)
+    finished = subagents.load_ended(store, session_id)["finished"]
+    assert list(finished) == ["late", "stopped"]
+    assert before <= finished["late"].pop("ended_at") <= time.time()
+    assert finished["late"] == {"title": "", "profile": "", "background": False}
+    # A quota failure nobody saw start has no task to resume.
+    assert subagents.interrupted(store, session_id) == {}
+    assert not subagents.path(store, session_id).exists()
+    subagents.interrupt_running(store, session_id)
+    note = subagents.closed_note(subagents.closed(store, session_id))
+    assert note.splitlines()[1:-1] == ['- "subagent" (late)', '- "subagent" (stopped)']
+    # A completion repeated without a start keeps what is known about the subagent.
+    finish(store, session_id, "named", title="Named", profile="General", isBackground=True)
+    known = subagents.load_ended(store, session_id)["finished"]["named"]
+    subagents.record(store, session_id, subagents.COMPLETED, {"agentId": "named", "success": True})
+    again = subagents.load_ended(store, session_id)["finished"]["named"]
+    assert again["ended_at"] >= known.pop("ended_at")
+    assert again == {**known, "ended_at": again["ended_at"]} and again["title"] == "Named"
+
+
+def test_replacement_process_closes_finished_subagents_and_interrupts_running_ones(store):
+    session_id = "chat-replaced"
+    finish(store, session_id, "done", title="Done")
+    subagents.record(store, session_id, subagents.STARTED, {"agentId": "busy", "title": "Busy"})
+    finished = subagents.load_ended(store, session_id)["finished"]
+    assert subagents.interrupt_running(store, session_id) == ["busy"]
+    state = subagents.load(store, session_id)
+    assert state["running"] == {}
+    assert state["interrupted"]["busy"]["reason"] == "the agent restarted"
+    ended = subagents.load_ended(store, session_id)
+    assert ended["finished"] == {} and ended["closed"] == finished and list(finished) == ["done"]
+    # Later replacements keep earlier closed subagents and add the newly finished ones.
+    finish(store, session_id, "later", title="Later")
+    assert subagents.interrupt_running(store, session_id) == []
+    assert list(subagents.closed(store, session_id)) == ["done", "later"]
+
+
+def test_only_the_latest_finished_and_closed_subagents_are_kept(store):
+    session_id = "chat-many"
+    limit = subagents.FINISHED_LIMIT
+    # Saved in the reverse of the order they ended in, so age decides and not position.
+    old = {f"old-{n}": {"title": f"Old {n}", "ended_at": float(limit - n)} for n in range(limit)}
+    subagents.save_ended(store, {"session_id": session_id, "finished": old, "closed": {}})
+    finish(store, session_id, "new")
+    finished = subagents.load_ended(store, session_id)["finished"]
+    assert set(finished) == {"new", *(f"old-{n}" for n in range(limit - 1))}
+    closed = {
+        "oldest": {"title": "Oldest", "ended_at": -1.0},
+        "recent": {"title": "Recent", "ended_at": limit + 1.0},
+        "older": {"title": "Older", "ended_at": 0.0},
+    }
+    subagents.save_ended(store, {"session_id": session_id, "finished": finished, "closed": closed})
+    subagents.interrupt_running(store, session_id)
+    kept = subagents.closed(store, session_id)
+    assert set(kept) == {"recent", "new", *(f"old-{n}" for n in range(limit - 2))}
+    assert list(kept)[-3:] == ["old-0", "recent", "new"]
+
+
+def old_bridge_saves(store, session_id, interrupted):
+    """Save the subagent record the way a bridge that knows only its two lists does."""
+    target = subagents.path(store, session_id)
+    if interrupted:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        state = {"session_id": session_id, "running": {}, "interrupted": interrupted}
+        target.write_text(json.dumps(state))
+    else:
+        target.unlink(missing_ok=True)
+
+
+def test_finished_and_closed_subagents_stay_out_of_the_record_older_bridges_save(store):
+    """Bridges started before this change still run in other windows and rewrite that file."""
+    session_id = "chat-shared"
+    legacy, ended = subagents.path(store, session_id), subagents.ended_path(store, session_id)
+    assert ended == store.root / "acp" / "closed-subagents" / legacy.name
+    finish(store, session_id, "done", title="Done")
+    subagents.record(store, session_id, subagents.STARTED, {"agentId": "busy", "title": "Busy"})
+    assert set(json.loads(legacy.read_text())) == {"session_id", "running", "interrupted"}
+    assert set(json.loads(ended.read_text())) == {"session_id", "finished", "closed"}
+    assert ended.parent.stat().st_mode & 0o777 == 0o700
+    # The shared record is still removed as soon as nothing is running or interrupted.
+    subagents.record(store, session_id, subagents.COMPLETED, {"agentId": "busy", "success": True})
+    assert not legacy.exists()
+    left = {"x": {"title": "X", "task": "Do X", "reason": "usage ran out"}}
+    for interrupted in (left, {}):
+        old_bridge_saves(store, session_id, interrupted)
+        assert list(subagents.load_ended(store, session_id)["finished"]) == ["done", "busy"]
+    subagents.interrupt_running(store, session_id)
+    for interrupted in (left, {}):
+        old_bridge_saves(store, session_id, interrupted)
+        assert list(subagents.closed(store, session_id)) == ["done", "busy"]
+
+
+def test_unreadable_closed_subagents_file_counts_as_empty(store):
+    session_id = "chat-unreadable"
+    target = subagents.ended_path(store, session_id)
+    target.parent.mkdir(parents=True)
+    other = {"session_id": "another-chat", "finished": {}, "closed": {"a": {"title": "A"}}}
+    wrong = {"session_id": session_id, "finished": {}, "closed": ["a"]}
+    for content in ("not json", "[]", json.dumps(other), json.dumps(wrong)):
+        target.write_text(content)
+        assert subagents.closed(store, session_id) == {}
+    finish(store, session_id, "a", title="A")
+    assert list(subagents.load_ended(store, session_id)["finished"]) == ["a"]
+
+
+def test_closed_subagents_are_kept_until_they_are_forgotten(store):
+    session_id = "chat-closed"
+    for agent in ("a", "b", "c"):
+        finish(store, session_id, agent, title=agent.upper())
+    subagents.interrupt_running(store, session_id)
+    quota = "[Error] daily usage quota has been exhausted"
+    finish(store, session_id, "q", success=False, summary=quota)
+    assert list(subagents.closed(store, session_id)) == ["a", "b", "c"]
+    subagents.forget_closed(store, session_id, ["a", "c", "q", "unseen"])
+    assert list(subagents.closed(store, session_id)) == ["b"]
+    assert list(subagents.interrupted(store, session_id)) == ["q"]
+    subagents.forget(store, session_id, ["q", "b"])
+    # Closed subagents outlive the shared record, which goes once nothing is interrupted.
+    assert not subagents.path(store, session_id).exists()
+    assert list(subagents.closed(store, session_id)) == ["b"]
+    subagents.forget_closed(store, session_id, {"b": {}})
+    assert not subagents.ended_path(store, session_id).exists()
+
+
+def test_closed_subagents_note_names_them_and_says_what_no_longer_works():
+    note = subagents.closed_note(
+        {
+            "a1": {"title": "Fix tests", "profile": "coder"},
+            "b2": {"title": "", "profile": "reviewer"},
+            "c3": {"title": "", "profile": ""},
+        }
+    )
+    assert note.startswith("[Note from Devin Switch, not typed by the user] ")
+    lines = note.splitlines()
+    assert lines[1:-1] == ['- "Fix tests" (a1)', '- "reviewer" (b2)', '- "subagent" (c3)']
+    assert "agent process that ran these subagents has ended" in lines[0]
+    for fact in (
+        "results were already delivered earlier in this conversation",
+        "read_subagent and run_subagent with resume no longer work for these IDs",
+        '"No subagent found"',
+        "start a new subagent with the context it needs",
+    ):
+        assert fact in lines[-1]
+    assert "#" not in note and len(f"{lines[0]} {lines[-1]}".split()) < 90
+    many = {f"id-{n}": {"title": f"Task {n}"} for n in range(23)}
+    assert subagents.closed_note(many).splitlines()[1:-1] == [
+        *(f'- "Task {n}" (id-{n})' for n in range(3, 23)),
+        "- and 3 more",
+    ]
+    exact = dict(list(many.items())[:20])
+    assert len(subagents.closed_note(exact).splitlines()) == 22
+
+
+def prompt_texts(native):
+    """Every text block of each prompt the native agents received."""
+    return [call["texts"] for call in logged(native) if call["method"] == "session/prompt"]
+
+
+def recorded_prompts(backend):
+    """The prompts a reload during a turn would replay."""
+    updates = [json.loads(text)["params"]["update"] for text in backend.transcript]
+    return [
+        update["content"]["text"]
+        for update in updates
+        if update["sessionUpdate"] == "user_message_chunk"
+    ]
+
+
+async def chat_with_finished_subagents(bridge, tmp_path, replaced=None):
+    """Open a chat, finish subagents f1 and f2 in it, then replace its agent process."""
+    created = await bridge.dispatch("session/new", {"cwd": str(tmp_path), "mcpServers": []})
+    session_id = created["sessionId"]
+    chat = bridge.chats[session_id]
+    await bridge.dispatch("session/prompt", prompt_params(session_id, "finished-subagents"))
+    if replaced == "idle":
+        # The next prompt reconnects the chat on a new process.
+        chat.backend.last_activity -= acp.IDLE_TIMEOUT + 1
+        assert await bridge.release_idle(chat)
+    elif replaced == "switch":
+        await bridge.dispatch("session/prompt", prompt_params(session_id, "/switch ansuman-2"))
+    elif replaced == "killed":
+        chat.backend.process.kill()
+        await until(lambda: chat.backend.process.poll() is not None)
+        await bridge.dispatch("session/load", chat.setup)
+    return session_id
+
+
+@pytest.mark.parametrize("replaced", ["idle", "switch", "killed"])
+def test_gui_first_prompt_to_a_replacement_process_names_the_closed_subagents(
+    acp_native, tmp_path, replaced
+):
+    async def scenario():
+        async with in_process(acp_native) as (bridge, _):
+            session_id = await chat_with_finished_subagents(bridge, tmp_path, replaced)
+            ended = subagents.load_ended(acp_native.store, session_id)
+            params = prompt_params(session_id, "next")
+            await bridge.dispatch("session/prompt", params)
+            assert params == prompt_params(session_id, "next")
+            text, note = prompt_texts(acp_native)[-1]
+            # A reload shows a prompt's blocks joined as they are: the note needs its own lines.
+            assert text == "next" and note.startswith("\n\n[Note from Devin Switch, not typed")
+            assert note[2:] == subagents.closed_note({**ended["closed"], **ended["finished"]})
+            assert '"Title f1" (f1)' in note and '"Title f2" (f2)' in note
+            assert subagents.closed(acp_native.store, session_id) == {}
+            await bridge.dispatch("session/prompt", prompt_params(session_id, "again"))
+            assert prompt_texts(acp_native)[-1] == ["again"]
+            assert recorded_prompts(bridge.chats[session_id].backend) == ["next", "again"]
+
+    asyncio.run(scenario())
+
+
+def test_gui_finished_subagents_stay_usable_in_their_own_process(acp_native, tmp_path):
+    async def scenario():
+        async with in_process(acp_native) as (bridge, _):
+            session_id = await chat_with_finished_subagents(bridge, tmp_path)
+            await bridge.dispatch("session/prompt", prompt_params(session_id, "next"))
+            # Desktop reloading the open chat keeps its process, and with it the subagents.
+            await bridge.dispatch("session/load", bridge.chats[session_id].setup)
+            await bridge.dispatch("session/prompt", prompt_params(session_id, "again"))
+            assert prompt_texts(acp_native) == [["finished-subagents"], ["next"], ["again"]]
+            calls = [call for call in logged(acp_native) if call["sessionId"] == session_id]
+            assert len({call["pid"] for call in calls}) == 1
+            ended = subagents.load_ended(acp_native.store, session_id)
+            assert list(ended["finished"]) == ["f1", "f2"] and ended["closed"] == {}
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize(
+    "left",
+    [{}, {"x": {"title": "X", "task": "Do X", "reason": "usage ran out"}}],
+    ids=["deletes", "rewrites"],
+)
+def test_gui_closed_subagents_note_survives_an_older_bridge_saving_the_record(
+    acp_native, tmp_path, left
+):
+    store = acp_native.store
+
+    async def scenario():
+        async with in_process(acp_native) as (bridge, _):
+            session_id = await chat_with_finished_subagents(bridge, tmp_path)
+            old_bridge_saves(store, session_id, left)
+            await bridge.dispatch("session/prompt", prompt_params(session_id, "/switch ansuman-2"))
+            old_bridge_saves(store, session_id, left)
+            await bridge.dispatch("session/prompt", prompt_params(session_id, "next"))
+            text, note = prompt_texts(acp_native)[-1]
+            assert text == "next" and '"Title f1" (f1)' in note and '"Title f2" (f2)' in note
+            assert subagents.interrupted(store, session_id) == left
+
+    asyncio.run(scenario())
+
+
+def test_gui_slash_command_is_forwarded_as_typed_and_leaves_the_subagents_note_for_later(
+    acp_native, tmp_path
+):
+    async def scenario():
+        async with in_process(acp_native) as (bridge, _):
+            session_id = await chat_with_finished_subagents(bridge, tmp_path, "idle")
+            await bridge.dispatch("session/prompt", prompt_params(session_id, "/help topics"))
+            assert prompt_texts(acp_native)[-1] == ["/help topics"]
+            assert list(subagents.closed(acp_native.store, session_id)) == ["f1", "f2"]
+            await bridge.dispatch("session/prompt", prompt_params(session_id, "next"))
+            text, note = prompt_texts(acp_native)[-1]
+            assert text == "next" and '"Title f1" (f1)' in note and '"Title f2" (f2)' in note
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("ending", ["failed", "cancelled"])
+def test_gui_closed_subagents_note_is_repeated_until_a_prompt_gets_through(
+    acp_native, tmp_path, ending
+):
+    async def scenario():
+        async with in_process(acp_native) as (bridge, _):
+            session_id = await chat_with_finished_subagents(bridge, tmp_path, "idle")
+            if ending == "failed":
+                with pytest.raises(acp.RpcError):
+                    await bridge.dispatch("session/prompt", prompt_params(session_id, "infer"))
+            else:
+                turn = asyncio.create_task(
+                    bridge.dispatch("session/prompt", prompt_params(session_id, "wait"))
+                )
+                await until(lambda: prompt_texts(acp_native)[-1][0] == "wait")
+                await bridge.dispatch(
+                    "session/cancel", {"sessionId": session_id}, notification=True
+                )
+                assert await turn == {"stopReason": "cancelled"}
+            _, note = prompt_texts(acp_native)[-1]
+            assert '"Title f1" (f1)' in note and '"Title f2" (f2)' in note
+            await bridge.dispatch("session/prompt", prompt_params(session_id, "next"))
+            assert prompt_texts(acp_native)[-1] == ["next", note]
+            await bridge.dispatch("session/prompt", prompt_params(session_id, "again"))
+            assert prompt_texts(acp_native)[-1] == ["again"]
+
+    asyncio.run(scenario())
+
+
+def test_gui_auto_switch_continue_repeats_the_subagents_note_its_failed_prompt_carried(
+    acp_native, tmp_path, monkeypatch
+):
+    monkeypatch.setattr(usage, "refresh_account", fresh_usage())
+    monkeypatch.setenv("FAKE_QUOTA_ACCOUNTS", "ansuman-2")
+
+    async def scenario():
+        async with in_process(acp_native) as (bridge, _):
+            session_id = await chat_with_finished_subagents(bridge, tmp_path, "switch")
+            result = await bridge.dispatch("session/prompt", prompt_params(session_id, "next"))
+            assert result == {"stopReason": "end_turn"}
+            accounts = [account for account, _ in prompts(acp_native)[-2:]]
+            assert accounts == ["ansuman-2", "ansuman-1"]
+            failed, continued = prompt_texts(acp_native)[-2:]
+            assert failed[0] == "next" and continued == ["continue", failed[1]]
+            assert '"Title f1" (f1)' in failed[1] and '"Title f2" (f2)' in failed[1]
+            await bridge.dispatch("session/prompt", prompt_params(session_id, "again"))
+            assert prompt_texts(acp_native)[-1] == ["again"]
+
+    asyncio.run(scenario())
+
+
+def test_gui_steering_prompt_neither_carries_nor_forgets_the_closed_subagents_note(
+    acp_native, tmp_path
+):
+    """A prompt sent during a turn goes straight to the native, not through a turn of its own."""
+    store = acp_native.store
+
+    async def scenario():
+        async with in_process(acp_native) as (bridge, messages):
+            session_id = await chat_with_finished_subagents(bridge, tmp_path, "switch")
+            turn = asyncio.create_task(
+                bridge.dispatch("session/prompt", prompt_params(session_id, "busy"))
+            )
+            await until(lambda: "live progress" in texts(messages))
+            steer = await bridge.dispatch("session/prompt", prompt_params(session_id, "steer now"))
+            assert steer == {"stopReason": "end_turn"} and not turn.done()
+            (busy, note), steered = prompt_texts(acp_native)[-2:]
+            assert busy == "busy" and '"Title f1" (f1)' in note and steered == ["steer now"]
+            assert list(subagents.closed(store, session_id)) == ["f1", "f2"]
+            await bridge.dispatch("session/cancel", {"sessionId": session_id}, notification=True)
+            assert await turn == {"stopReason": "cancelled"}
+            await bridge.dispatch("session/prompt", prompt_params(session_id, "next"))
+            assert prompt_texts(acp_native)[-1] == ["next", note]
+            assert subagents.closed(store, session_id) == {}
+
+    asyncio.run(scenario())
+
+
+def test_gui_resume_subagents_prompt_also_carries_the_closed_subagents_note(
+    acp_native, relayed, tmp_path, monkeypatch
+):
+    store = acp_native.store
+    monkeypatch.setenv("FAKE_SUBAGENT_GATE", str(tmp_path / "never-opened"))
+
+    async def scenario():
+        async with in_process(acp_native) as (bridge, _):
+            session_id = await chat_with_finished_subagents(bridge, tmp_path)
+            chat = bridge.chats[session_id]
+            turn = asyncio.create_task(
+                bridge.dispatch("session/prompt", prompt_params(session_id, "subagents"))
+            )
+            await until(lambda: set(subagents.load(store, session_id)["running"]) == {"s1", "s2"})
+            chat.backend.process.kill()
+            with pytest.raises(SwitchError):
+                await turn
+            await bridge.dispatch("session/load", chat.setup)
+            assert set(subagents.interrupted(store, session_id)) == {"s1", "s2"}
+            sent = len(prompt_texts(acp_native))
+            await bridge.dispatch("session/prompt", prompt_params(session_id, "/resume-subagents"))
+            ((resume, note),) = prompt_texts(acp_native)[sent:]
+            assert "2 of your subagents stopped before finishing" in resume
+            assert "Task for s1" in resume and "Task for s2" in resume
+            assert note.startswith("\n\n[Note from Devin Switch, not typed by the user] ")
+            assert note.splitlines()[3:-1] == ['- "Title f1" (f1)', '- "Title f2" (f2)']
+            assert subagents.interrupted(store, session_id) == {}
+            assert subagents.closed(store, session_id) == {}
+
+    asyncio.run(scenario())
+
+
+def test_gui_prompt_sent_while_the_closed_subagents_are_read_waits_for_its_own_turn(
+    acp_native, tmp_path, monkeypatch
+):
+    """Reading the record must not open the turn: a second prompt would overtake as steering."""
+    reading, finish_reading = threading.Event(), threading.Event()
+    closed = subagents.closed
+
+    def slow(store, session_id):
+        reading.set()
+        finish_reading.wait(10)
+        return closed(store, session_id)
+
+    async def scenario():
+        async with in_process(acp_native) as (bridge, _):
+            session_id = await chat_with_finished_subagents(bridge, tmp_path, "idle")
+            monkeypatch.setattr(subagents, "closed", slow)
+            first = asyncio.create_task(
+                bridge.dispatch("session/prompt", prompt_params(session_id, "first"))
+            )
+            await asyncio.to_thread(reading.wait, 10)
+            second = asyncio.create_task(
+                bridge.dispatch("session/prompt", prompt_params(session_id, "second"))
+            )
+            try:
+                await asyncio.sleep(0.3)
+                assert prompt_texts(acp_native)[-1] == ["finished-subagents"]
+            finally:
+                finish_reading.set()
+            await asyncio.gather(first, second)
+            sent = prompt_texts(acp_native)[-2:]
+            assert [len(texts) for texts in sent] == [2, 1]
+            assert [texts[0] for texts in sent] == ["first", "second"]
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize(
+    ("failing", "error", "blocks"),
+    [("closed", OSError("unreadable"), 1), ("forget_closed", SwitchError("locked"), 2)],
+    ids=["reading", "forgetting"],
+)
+def test_gui_prompt_is_sent_when_the_closed_subagents_record_fails(
+    acp_native, tmp_path, monkeypatch, failing, error, blocks
+):
+    def broken(*_):
+        raise error
+
+    async def scenario():
+        async with in_process(acp_native) as (bridge, _):
+            session_id = await chat_with_finished_subagents(bridge, tmp_path, "idle")
+            with monkeypatch.context() as patch:
+                patch.setattr(subagents, failing, broken)
+                result = await bridge.dispatch("session/prompt", prompt_params(session_id, "next"))
+            assert result == {"stopReason": "end_turn"}
+            assert len(prompt_texts(acp_native)[-1]) == blocks
+            # Nothing was forgotten, so the next prompt still says it.
+            await bridge.dispatch("session/prompt", prompt_params(session_id, "again"))
+            text, note = prompt_texts(acp_native)[-1]
+            assert text == "again" and '"Title f1" (f1)' in note
+
+    asyncio.run(scenario())
+
+
 @pytest.mark.parametrize("case", ["auto-switch-off", "no-login-left"])
 def test_gui_relay_returns_quota_unchanged_when_it_cannot_rotate(
     acp_native, relayed, tmp_path, monkeypatch, case

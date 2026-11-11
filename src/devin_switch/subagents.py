@@ -6,6 +6,12 @@ history (`subagent_heads` points at the latest node of its chain). Switch record
 subagents were running for a conversation; when a replacement process opens the conversation,
 those are interrupted, and the parent agent can start fresh subagents that continue from the
 saved progress instead of redoing it.
+
+A finished subagent stays readable and resumable only in the process that ran it. Switch
+records those too: once a replacement process opens the conversation they are closed, and the
+parent agent is told so it does not ask for IDs that no longer exist. They live in their own
+file: older bridges still running in other windows rewrite the first one with only the lists
+they know.
 """
 
 import json
@@ -23,6 +29,8 @@ QUOTA_FAILURE = re.compile(r"usage quota has been exhausted|quota exhausted", re
 TASK_LIMIT = 4000
 PROGRESS_LIMIT = 2000
 PROGRESS_STEPS = 6
+FINISHED_LIMIT = 100
+NOTE_LIMIT = 20
 
 
 def path(store: Store, session_id: str) -> Path:
@@ -54,6 +62,34 @@ def save(store: Store, state: dict) -> None:
     write_json(target, state)
 
 
+def ended_path(store: Store, session_id: str) -> Path:
+    return store.root / "acp" / "closed-subagents" / f"{acp_state.session_key(session_id)}.json"
+
+
+def load_ended(store: Store, session_id: str) -> dict:
+    """Subagents that finished in the live process, and ones closed with an earlier one.
+
+    Not in the file above: older bridges in other windows save it with only its two lists.
+    """
+    state = {"session_id": session_id, "finished": {}, "closed": {}}
+    try:
+        value = json.loads(ended_path(store, session_id).read_text())
+        if value.get("session_id") != session_id:
+            raise ValueError
+        return state | {name: dict(value.get(name) or {}) for name in ("finished", "closed")}
+    except (FileNotFoundError, ValueError, TypeError, AttributeError):
+        return state
+
+
+def save_ended(store: Store, state: dict) -> None:
+    target = ended_path(store, state["session_id"])
+    if not state["finished"] and not state["closed"]:
+        target.unlink(missing_ok=True)
+        return
+    private_directory(target.parent)
+    write_json(target, state)
+
+
 def describe(event: dict) -> dict:
     return {
         "title": str(event.get("title") or "")[:200],
@@ -64,25 +100,48 @@ def describe(event: dict) -> dict:
     }
 
 
+def newest(agents: dict) -> dict:
+    """The FINISHED_LIMIT subagents that ended last, oldest first."""
+    ordered = sorted(agents.items(), key=lambda item: item[1].get("ended_at", 0))
+    return dict(ordered[-FINISHED_LIMIT:])
+
+
 def record(store: Store, session_id: str, key: str, event: dict) -> None:
     """Apply one live subagent event: started, finished, or failed because usage ran out."""
     agent = event.get("agentId")
     if not isinstance(agent, str) or not agent:
         return
     with store.lock("subagents.lock", timeout=5):
-        state = load(store, session_id)
+        state, ended = load(store, session_id), load_ended(store, session_id)
         if key == STARTED:
             state["running"][agent] = describe(event)
+            ended["finished"].pop(agent, None)
         elif key == COMPLETED:
             info = state["running"].pop(agent, None)
             summary = str(event.get("summary") or "")
-            if info is not None and event.get("success") is False and QUOTA_FAILURE.search(summary):
-                state["interrupted"][agent] = {**info, "reason": "usage ran out"}
+            if event.get("success") is False and QUOTA_FAILURE.search(summary):
+                if info is not None:
+                    state["interrupted"][agent] = {**info, "reason": "usage ran out"}
+            else:
+                # A start can be missed (events are not counted while a load replays): the
+                # subagent still finished here, known by its ID alone.
+                known = info or ended["finished"].get(agent) or {}
+                ended["finished"][agent] = {
+                    "title": known.get("title", ""),
+                    "profile": known.get("profile", ""),
+                    "background": bool(known.get("background")),
+                    "ended_at": time.time(),
+                }
+                ended["finished"] = newest(ended["finished"])
         save(store, state)
+        save_ended(store, ended)
 
 
 def interrupt_running(store: Store, session_id: str) -> list[str]:
-    """Mark subagents a previous process left running as interrupted; return their IDs."""
+    """Mark subagents a previous process left running as interrupted; return their IDs.
+
+    The ones that finished in that process are closed: their IDs ended with it.
+    """
     with store.lock("subagents.lock", timeout=5):
         state = load(store, session_id)
         moved = list(state["running"])
@@ -92,11 +151,19 @@ def interrupt_running(store: Store, session_id: str) -> list[str]:
                 "reason": "the agent restarted",
             }
         save(store, state)
+        ended = load_ended(store, session_id)
+        ended["closed"] = newest({**ended["closed"], **ended["finished"]})
+        ended["finished"] = {}
+        save_ended(store, ended)
     return moved
 
 
 def interrupted(store: Store, session_id: str) -> dict:
     return load(store, session_id)["interrupted"]
+
+
+def closed(store: Store, session_id: str) -> dict:
+    return load_ended(store, session_id)["closed"]
 
 
 def forget(store: Store, session_id: str, agents) -> None:
@@ -105,6 +172,34 @@ def forget(store: Store, session_id: str, agents) -> None:
         for agent in agents:
             state["interrupted"].pop(agent, None)
         save(store, state)
+
+
+def forget_closed(store: Store, session_id: str, agents) -> None:
+    with store.lock("subagents.lock", timeout=5):
+        ended = load_ended(store, session_id)
+        for agent in agents:
+            ended["closed"].pop(agent, None)
+        save_ended(store, ended)
+
+
+def closed_note(agents: dict) -> str:
+    """Tell the parent agent which finished subagents it can no longer read or resume."""
+    listed = list(agents.items())[-NOTE_LIMIT:]
+    lines = [
+        "[Note from Devin Switch, not typed by the user] The agent process that ran these "
+        "subagents has ended:"
+    ]
+    for agent, info in listed:
+        title = info.get("title") or info.get("profile") or "subagent"
+        lines.append(f'- "{title}" ({agent})')
+    if len(agents) > len(listed):
+        lines.append(f"- and {len(agents) - len(listed)} more")
+    lines.append(
+        "Their results were already delivered earlier in this conversation. read_subagent and "
+        'run_subagent with resume no longer work for these IDs (they return "No subagent '
+        'found"). If more work is wanted, start a new subagent with the context it needs.'
+    )
+    return "\n".join(lines)
 
 
 def summarize(message: dict) -> str:

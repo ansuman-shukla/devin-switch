@@ -64,7 +64,33 @@
       .map(({ row }) => row);
   }
 
-  const api = { isActive, formatDuration, timeLabel, titleOf, metaOf, detailOf, countLine, ordered };
+  /** How much the subagent has said so far, in characters; anything but a positive whole number is no reply. */
+  const replyChars = (row) => (Number.isInteger(row.reply_chars) && row.reply_chars > 0 ? row.reply_chars : 0);
+  const hasReply = (row) => replyChars(row) > 0;
+
+  /** The reply toggle's text; an active row is still writing, so its reply is not final. */
+  function replyLabel(row, expanded) {
+    return `${expanded ? 'Hide' : 'Show'} reply${isActive(row) ? ' so far' : ''}`;
+  }
+
+  /** "1 character", "999 characters", "3.7k characters"; empty without a reply. */
+  function replySize(row) {
+    const chars = replyChars(row);
+    if (!chars) return '';
+    if (chars < 1000) return chars === 1 ? '1 character' : `${chars} characters`;
+    return `${Math.round(chars / 100) / 10}k characters`;
+  }
+
+  /**
+   * Whether to ask the server for a row's reply now. `asked` is the `reply_chars` the latest request
+   * was made at (null: none yet) and `waiting` says it has not come back. Only an expanded row asks,
+   * one request at a time, and again only once the count has moved on from the one it asked at.
+   */
+  function needsReply(row, { open, asked, waiting }) {
+    return open && !waiting && hasReply(row) && asked !== replyChars(row);
+  }
+
+  const api = { isActive, formatDuration, timeLabel, titleOf, metaOf, detailOf, countLine, ordered, replyChars, hasReply, replyLabel, replySize, needsReply };
   if (typeof module === 'object' && module.exports) module.exports = api;
   else root.SubagentsView = api;
 })(typeof window === 'undefined' ? globalThis : window);

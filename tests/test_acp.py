@@ -3032,8 +3032,6 @@ def test_subagents_that_finish_are_remembered_while_their_process_lives(store):
     finish(store, session_id, "failed", success=False, summary="[Error] Canceled by user")
     quota = "[Error] weekly usage quota has been exhausted"
     finish(store, session_id, "quota", success=False, summary=quota)
-    # A completion whose start this process never reported is not one of its subagents.
-    subagents.record(store, session_id, subagents.COMPLETED, {"agentId": "unseen", "success": True})
     ended = subagents.load_ended(store, session_id)
     assert list(ended["finished"]) == ["ok", "failed"] and ended["closed"] == {}
     assert before <= ended["finished"]["ok"].pop("ended_at") <= time.time()
@@ -3045,6 +3043,37 @@ def test_subagents_that_finish_are_remembered_while_their_process_lives(store):
     subagents.record(store, session_id, subagents.STARTED, {"agentId": "ok", "title": "Review"})
     assert list(subagents.load_ended(store, session_id)["finished"]) == ["failed"]
     assert list(subagents.load(store, session_id)["running"]) == ["ok"]
+
+
+def test_subagent_completion_whose_start_was_missed_still_counts_as_finished(store):
+    """Events are not counted while a load replays, so a subagent's start can be missed."""
+    session_id = "chat-missed"
+    before = time.time()
+    quota = "[Error] daily usage quota has been exhausted"
+    for agent, success, summary in (
+        ("late", True, "done"),
+        ("spent", False, quota),
+        ("stopped", False, "[Error] Canceled by user"),
+    ):
+        event = {"agentId": agent, "success": success, "summary": summary}
+        subagents.record(store, session_id, subagents.COMPLETED, event)
+    finished = subagents.load_ended(store, session_id)["finished"]
+    assert list(finished) == ["late", "stopped"]
+    assert before <= finished["late"].pop("ended_at") <= time.time()
+    assert finished["late"] == {"title": "", "profile": "", "background": False}
+    # A quota failure nobody saw start has no task to resume.
+    assert subagents.interrupted(store, session_id) == {}
+    assert not subagents.path(store, session_id).exists()
+    subagents.interrupt_running(store, session_id)
+    note = subagents.closed_note(subagents.closed(store, session_id))
+    assert note.splitlines()[1:-1] == ['- "subagent" (late)', '- "subagent" (stopped)']
+    # A completion repeated without a start keeps what is known about the subagent.
+    finish(store, session_id, "named", title="Named", profile="General", isBackground=True)
+    known = subagents.load_ended(store, session_id)["finished"]["named"]
+    subagents.record(store, session_id, subagents.COMPLETED, {"agentId": "named", "success": True})
+    again = subagents.load_ended(store, session_id)["finished"]["named"]
+    assert again["ended_at"] >= known.pop("ended_at")
+    assert again == {**known, "ended_at": again["ended_at"]} and again["title"] == "Named"
 
 
 def test_replacement_process_closes_finished_subagents_and_interrupts_running_ones(store):

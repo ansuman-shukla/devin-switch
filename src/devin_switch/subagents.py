@@ -116,13 +116,22 @@ def record(store: Store, session_id: str, key: str, event: dict) -> None:
         if key == STARTED:
             state["running"][agent] = describe(event)
             ended["finished"].pop(agent, None)
-        elif key == COMPLETED and (info := state["running"].pop(agent, None)) is not None:
+        elif key == COMPLETED:
+            info = state["running"].pop(agent, None)
             summary = str(event.get("summary") or "")
             if event.get("success") is False and QUOTA_FAILURE.search(summary):
-                state["interrupted"][agent] = {**info, "reason": "usage ran out"}
+                if info is not None:
+                    state["interrupted"][agent] = {**info, "reason": "usage ran out"}
             else:
-                kept = {name: info.get(name) for name in ("title", "profile", "background")}
-                ended["finished"][agent] = {**kept, "ended_at": time.time()}
+                # A start can be missed (events are not counted while a load replays): the
+                # subagent still finished here, known by its ID alone.
+                known = info or ended["finished"].get(agent) or {}
+                ended["finished"][agent] = {
+                    "title": known.get("title", ""),
+                    "profile": known.get("profile", ""),
+                    "background": bool(known.get("background")),
+                    "ended_at": time.time(),
+                }
                 ended["finished"] = newest(ended["finished"])
         save(store, state)
         save_ended(store, ended)

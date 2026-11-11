@@ -25,6 +25,10 @@ from devin_switch import acp, side, subagent_tab
 from devin_switch.store import SwitchError
 
 AGENT = "acb63708"
+# The foreground subagent of an earlier turn that the fake replays on a load.
+PAST = "9d2e41aa"
+# What the fake's delegate subagent says, in two messages, before its first command.
+REPLY = "I'll run the command.\n\n## Plan\nSleep, then **report**."
 STARTED = "cognition.ai/subagent_started"
 COMPLETED = "cognition.ai/subagent_completed"
 PAUSED = "cognition.ai/subagent_paused"
@@ -733,6 +737,119 @@ def test_closing_a_chat_forgets_its_subagents(acp_native, tmp_path):
             await bridge.dispatch("session/close", {"sessionId": chat.session_id})
             assert rows(bridge.roster, chat.session_id) == []
             assert states(bridge.roster, other.session_id) == {"elsewhere": "running"}
+
+    asyncio.run(scenario())
+
+
+def authored(messages, agent):
+    """The updates Desktop was sent that name `agent` as the one whose work they are."""
+    return [
+        update
+        for message in messages
+        if message.get("method") == "session/update"
+        and ((update := message["params"]["update"]).get("_meta") or {}).get(CONTEXT)
+        == {"parentAgentId": agent}
+    ]
+
+
+def kinds(updates):
+    return [update["sessionUpdate"] for update in updates]
+
+
+def test_what_a_subagent_says_reaches_its_row_but_never_the_chat(acp_native, tmp_path):
+    async def scenario():
+        async with in_process(acp_native) as (bridge, messages):
+            chat = await new_chat(bridge, tmp_path)
+            session_id, roster = chat.session_id, bridge.roster
+            turn = delegate(bridge, chat)
+            await until(lambda: states(roster, session_id) == {AGENT: "running"})
+            await until(lambda: row(roster, AGENT, session_id)["step"] == "Running command")
+
+            # Desktop got the chat's own message as sent, and the subagent's card and steps...
+            (progress,) = replayed(messages, "agent_message_chunk")
+            assert progress["content"] == {"type": "text", "text": "live progress"}
+            assert set(progress["_meta"]) == {STREAM, "cognition.ai/timestamp"}
+            assert [event["agentId"] for event in subagent_events(messages, STARTED)] == [AGENT]
+            assert kinds(authored(messages, AGENT)) == [
+                "agent_thought_chunk",
+                "usage_update",
+                "tool_call",
+            ]
+            assert kinds(authored(messages, "root")) == ["usage_update"]
+            # ...but nothing of what the subagent said: that is its row's to show.
+            assert not any(words in json.dumps(messages) for words in ("I'll run", "## Plan"))
+            assert roster.reply(session_id, AGENT) == REPLY
+            assert row(roster, AGENT, session_id)["reply_chars"] == len(REPLY)
+
+            # A reload during the turn replays the bridge's own record, which never held it.
+            start = len(messages)
+            await bridge.dispatch("session/load", chat.setup)
+            replay = messages[start:]
+            assert native_loads(acp_native) == []
+            assert replayed_texts(replay, "user_message_chunk") == ["delegate"]
+            assert replayed_texts(replay, "agent_message_chunk") == ["live progress"]
+            assert [event["agentId"] for event in subagent_events(replay, STARTED)] == [AGENT]
+            assert kinds(authored(replay, AGENT)) == [
+                "agent_thought_chunk",
+                "tool_call",
+                "usage_update",
+            ]
+
+            await stop(bridge, chat, turn)
+            assert states(roster, session_id) == {AGENT: "failed"}
+            assert roster.reply(session_id, AGENT) == REPLY
+            assert replayed_texts(messages, "agent_message_chunk") == ["live progress"] * 2
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("method", ["session/load", "session/resume"])
+def test_a_reopened_chat_shows_a_past_subagents_steps_but_not_what_it_said(
+    acp_native, tmp_path, monkeypatch, method
+):
+    monkeypatch.setenv("FAKE_REPLAY_SUBAGENT", "1")
+
+    async def scenario():
+        async with in_process(acp_native) as (bridge, messages):
+            chat = await new_chat(bridge, tmp_path)
+            session_id, roster = chat.session_id, bridge.roster
+            start = len(messages)
+            assert "configOptions" in await bridge.dispatch(method, chat.setup)
+            assert native_loads(acp_native) == [chat.backend.process.pid]
+            shown = messages[start:]
+            if method == "session/load":
+                assert replayed_texts(shown, "agent_message_chunk") == ["historical replay"]
+                assert [update["title"] for update in authored(shown, PAST)] == ["Read notes.md"]
+                assert [event["agentId"] for event in subagent_events(shown, STARTED)] == [PAST]
+                ended = subagent_events(shown, COMPLETED)
+                assert [event["summary"] for event in ended] == ["Read the notes."]
+            else:
+                # A resume asks for no replay at all.
+                assert replayed(shown, "agent_message_chunk") == []
+                assert authored(shown, PAST) == [] and subagent_events(shown, STARTED) == []
+            assert rows(roster, session_id) == [] and roster.reply(session_id, PAST) is None
+
+            # Either way the bridge recorded that load for a reload during a later turn.
+            turn = delegate(bridge, chat)
+            await until(lambda: states(roster, session_id) == {AGENT: "running"})
+            await until(lambda: row(roster, AGENT, session_id)["step"] == "Running command")
+            start = len(messages)
+            await bridge.dispatch("session/load", chat.setup)
+            replay = messages[start:]
+            assert replayed_texts(replay, "agent_message_chunk") == [
+                "historical replay",
+                "live progress",
+            ]
+            assert [update["title"] for update in authored(replay, PAST)] == ["Read notes.md"]
+            assert [event["agentId"] for event in subagent_events(replay, STARTED)] == [
+                PAST,
+                AGENT,
+            ]
+            sent = json.dumps(messages)
+            assert not any(words in sent for words in ("notes say hello", "I'll run", "## Plan"))
+            assert list(states(roster, session_id)) == [AGENT]
+            assert roster.reply(session_id, AGENT) == REPLY
+            await stop(bridge, chat, turn)
 
     asyncio.run(scenario())
 

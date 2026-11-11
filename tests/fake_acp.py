@@ -111,12 +111,13 @@ def chunk(kind, text):
     return {"sessionUpdate": kind, "content": {"type": "text", "text": text}}
 
 
+def stamp():
+    return {"cognition.ai/timestamp": datetime.now(UTC).isoformat()}
+
+
 def streaming(message_id):
     """What CLI 3000.12.43 adds to each live chunk of one message or thought."""
-    return {
-        "cognition.ai/streamingMessageId": message_id,
-        "cognition.ai/timestamp": datetime.now(UTC).isoformat(),
-    }
+    return {"cognition.ai/streamingMessageId": message_id, **stamp()}
 
 
 def produced(agent_id, change, **meta):
@@ -154,7 +155,7 @@ def finished(agent_id, success, summary):
 
 
 async def delegate(request_id):
-    """A turn whose background subagent works until Stop, which ends it unsuccessfully."""
+    """A turn whose background subagent speaks, then works until Stop, which fails it."""
     agent_id, command = "acb63708", {"toolCallId": "call_ab18"}
     usage = {"sessionUpdate": "usage_update", "used": 1, "size": 10}
     canceled.clear()
@@ -165,6 +166,15 @@ async def delegate(request_id):
     thought = chunk("agent_thought_chunk", "…")
     update(loaded, produced(agent_id, thought, **streaming(str(uuid.uuid4()))))
     update(loaded, produced(agent_id, usage))
+    # Its own messages: the chunks of one share a streaming ID.
+    first, second = str(uuid.uuid4()), str(uuid.uuid4())
+    for text, message_id in (
+        ("I'll run the command.", first),
+        ("## Plan\n", second),
+        ("Sleep, then **report**.", second),
+    ):
+        said = chunk("agent_message_chunk", text)
+        update(loaded, produced(agent_id, said, **streaming(message_id)))
     running = {"sessionUpdate": "tool_call", "title": "Running command", "kind": "execute"}
     update(loaded, produced(agent_id, {**running, **command}))
     # A test opens the gate to let the subagent take its next step.
@@ -346,10 +356,14 @@ async def handle(message):
                 },
             )
             if os.environ.get("FAKE_REPLAY_SUBAGENT"):
-                # The native replays a saved chat's foreground subagents in the live shapes.
+                # The native replays a saved chat's foreground subagents in the live shapes,
+                # but each message whole, named by its saved event.
                 read = {"sessionUpdate": "tool_call", "toolCallId": "call_77", "kind": "read"}
+                report = chunk("agent_message_chunk", "The notes say hello.")
+                saved = {"cognition.ai/eventId": "45", **stamp()}
                 update(session_id, launched("9d2e41aa", False))
                 update(session_id, produced("9d2e41aa", {**read, "title": "Read notes.md"}))
+                update(session_id, produced("9d2e41aa", report, **saved))
                 update(session_id, finished("9d2e41aa", True, "Read the notes."))
         elif not os.environ.get("FAKE_SAVE_ON_PROMPT"):
             connection.execute(

@@ -3039,14 +3039,31 @@ def test_subagents_that_finish_are_remembered_while_their_process_lives(store):
     assert before <= state["finished"]["ok"].pop("ended_at") <= time.time()
     assert state["finished"]["ok"] == {"title": "Review", "profile": "reviewer", "background": True}
     assert list(state["interrupted"]) == ["quota"]
-    assert state["running"] == {}
+    assert state["running"] == {} and state["closed"] == {}
+    assert subagents.closed(store, session_id) == {}
     # Resumed in the same process, it runs again.
     subagents.record(store, session_id, subagents.STARTED, {"agentId": "ok", "title": "Review"})
     state = subagents.load(store, session_id)
     assert list(state["finished"]) == ["failed"] and list(state["running"]) == ["ok"]
 
 
-def test_only_the_latest_finished_subagents_are_kept(store):
+def test_replacement_process_closes_finished_subagents_and_interrupts_running_ones(store):
+    session_id = "chat-replaced"
+    finish(store, session_id, "done", title="Done")
+    subagents.record(store, session_id, subagents.STARTED, {"agentId": "busy", "title": "Busy"})
+    finished = subagents.load(store, session_id)["finished"]
+    assert subagents.interrupt_running(store, session_id) == ["busy"]
+    state = subagents.load(store, session_id)
+    assert state["running"] == {} and state["finished"] == {}
+    assert state["interrupted"]["busy"]["reason"] == "the agent restarted"
+    assert state["closed"] == finished and list(finished) == ["done"]
+    # Later replacements keep earlier closed subagents and add the newly finished ones.
+    finish(store, session_id, "later", title="Later")
+    assert subagents.interrupt_running(store, session_id) == []
+    assert list(subagents.closed(store, session_id)) == ["done", "later"]
+
+
+def test_only_the_latest_finished_and_closed_subagents_are_kept(store):
     session_id = "chat-many"
     limit = subagents.FINISHED_LIMIT
     # Saved in the reverse of the order they ended in, so age decides and not position.
@@ -3055,6 +3072,16 @@ def test_only_the_latest_finished_subagents_are_kept(store):
     finish(store, session_id, "new")
     finished = subagents.load(store, session_id)["finished"]
     assert set(finished) == {"new", *(f"old-{n}" for n in range(limit - 1))}
+    closed = {
+        "oldest": {"title": "Oldest", "ended_at": -1.0},
+        "recent": {"title": "Recent", "ended_at": limit + 1.0},
+        "older": {"title": "Older", "ended_at": 0.0},
+    }
+    subagents.save(store, {**subagents.load(store, session_id), "closed": closed})
+    subagents.interrupt_running(store, session_id)
+    kept = subagents.closed(store, session_id)
+    assert set(kept) == {"recent", "new", *(f"old-{n}" for n in range(limit - 2))}
+    assert list(kept)[-3:] == ["old-0", "recent", "new"]
 
 
 def test_subagent_record_saved_before_finished_ones_were_kept_still_loads(store):
@@ -3067,10 +3094,31 @@ def test_subagent_record_saved_before_finished_ones_were_kept_still_loads(store)
     target = subagents.path(store, session_id)
     target.parent.mkdir(parents=True)
     target.write_text(json.dumps(legacy))
-    assert subagents.load(store, session_id) == {**legacy, "finished": {}}
+    assert subagents.load(store, session_id) == {**legacy, "finished": {}, "closed": {}}
     subagents.record(store, session_id, subagents.COMPLETED, {"agentId": "a", "success": True})
     state = subagents.load(store, session_id)
     assert list(state["finished"]) == ["a"] and state["interrupted"] == legacy["interrupted"]
+
+
+def test_closed_subagents_are_kept_until_they_are_forgotten(store):
+    session_id = "chat-closed"
+    for agent in ("a", "b", "c"):
+        finish(store, session_id, agent, title=agent.upper())
+    subagents.interrupt_running(store, session_id)
+    quota = "[Error] daily usage quota has been exhausted"
+    finish(store, session_id, "q", success=False, summary=quota)
+    target = subagents.path(store, session_id)
+    assert list(subagents.closed(store, session_id)) == ["a", "b", "c"]
+    subagents.forget_closed(store, session_id, ["a", "c", "q", "unseen"])
+    state = subagents.load(store, session_id)
+    assert list(state["closed"]) == ["b"] and list(state["interrupted"]) == ["q"]
+    subagents.forget(store, session_id, ["q", "b"])
+    # Only closed subagents are left: the record must outlive every other list.
+    state = json.loads(target.read_text())
+    assert [state[name] for name in ("running", "interrupted", "finished")] == [{}, {}, {}]
+    assert list(subagents.closed(store, session_id)) == ["b"]
+    subagents.forget_closed(store, session_id, {"b": state["closed"]["b"]})
+    assert not target.exists()
 
 
 @pytest.mark.parametrize("case", ["auto-switch-off", "no-login-left"])

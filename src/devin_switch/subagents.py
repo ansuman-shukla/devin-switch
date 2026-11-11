@@ -6,6 +6,10 @@ history (`subagent_heads` points at the latest node of its chain). Switch record
 subagents were running for a conversation; when a replacement process opens the conversation,
 those are interrupted, and the parent agent can start fresh subagents that continue from the
 saved progress instead of redoing it.
+
+A finished subagent stays readable and resumable only in the process that ran it. Switch
+records those too: once a replacement process opens the conversation they are closed, and the
+parent agent is told so it does not ask for IDs that no longer exist.
 """
 
 import json
@@ -23,7 +27,7 @@ QUOTA_FAILURE = re.compile(r"usage quota has been exhausted|quota exhausted", re
 TASK_LIMIT = 4000
 PROGRESS_LIMIT = 2000
 PROGRESS_STEPS = 6
-MAPS = ("running", "interrupted", "finished")
+MAPS = ("running", "interrupted", "finished", "closed")
 FINISHED_LIMIT = 100
 
 
@@ -90,7 +94,10 @@ def record(store: Store, session_id: str, key: str, event: dict) -> None:
 
 
 def interrupt_running(store: Store, session_id: str) -> list[str]:
-    """Mark subagents a previous process left running as interrupted; return their IDs."""
+    """Mark subagents a previous process left running as interrupted; return their IDs.
+
+    The ones that finished in that process are closed: their IDs ended with it.
+    """
     with store.lock("subagents.lock", timeout=5):
         state = load(store, session_id)
         moved = list(state["running"])
@@ -99,6 +106,8 @@ def interrupt_running(store: Store, session_id: str) -> list[str]:
                 **state["running"].pop(agent),
                 "reason": "the agent restarted",
             }
+        state["closed"] = newest({**state["closed"], **state["finished"]})
+        state["finished"] = {}
         save(store, state)
     return moved
 
@@ -107,12 +116,20 @@ def interrupted(store: Store, session_id: str) -> dict:
     return load(store, session_id)["interrupted"]
 
 
-def forget(store: Store, session_id: str, agents) -> None:
+def closed(store: Store, session_id: str) -> dict:
+    return load(store, session_id)["closed"]
+
+
+def forget(store: Store, session_id: str, agents, kind: str = "interrupted") -> None:
     with store.lock("subagents.lock", timeout=5):
         state = load(store, session_id)
         for agent in agents:
-            state["interrupted"].pop(agent, None)
+            state[kind].pop(agent, None)
         save(store, state)
+
+
+def forget_closed(store: Store, session_id: str, agents) -> None:
+    forget(store, session_id, agents, "closed")
 
 
 def summarize(message: dict) -> str:

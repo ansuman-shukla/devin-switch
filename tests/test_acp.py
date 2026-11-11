@@ -3375,6 +3375,65 @@ def test_gui_auto_switch_continue_repeats_the_subagents_note_its_failed_prompt_c
     asyncio.run(scenario())
 
 
+def test_gui_steering_prompt_neither_carries_nor_forgets_the_closed_subagents_note(
+    acp_native, tmp_path
+):
+    """A prompt sent during a turn goes straight to the native, not through a turn of its own."""
+    store = acp_native.store
+
+    async def scenario():
+        async with in_process(acp_native) as (bridge, messages):
+            session_id = await chat_with_finished_subagents(bridge, tmp_path, "switch")
+            turn = asyncio.create_task(
+                bridge.dispatch("session/prompt", prompt_params(session_id, "busy"))
+            )
+            await until(lambda: "live progress" in texts(messages))
+            steer = await bridge.dispatch("session/prompt", prompt_params(session_id, "steer now"))
+            assert steer == {"stopReason": "end_turn"} and not turn.done()
+            (busy, note), steered = prompt_texts(acp_native)[-2:]
+            assert busy == "busy" and '"Title f1" (f1)' in note and steered == ["steer now"]
+            assert list(subagents.closed(store, session_id)) == ["f1", "f2"]
+            await bridge.dispatch("session/cancel", {"sessionId": session_id}, notification=True)
+            assert await turn == {"stopReason": "cancelled"}
+            await bridge.dispatch("session/prompt", prompt_params(session_id, "next"))
+            assert prompt_texts(acp_native)[-1] == ["next", note]
+            assert subagents.closed(store, session_id) == {}
+
+    asyncio.run(scenario())
+
+
+def test_gui_resume_subagents_prompt_also_carries_the_closed_subagents_note(
+    acp_native, relayed, tmp_path, monkeypatch
+):
+    store = acp_native.store
+    monkeypatch.setenv("FAKE_SUBAGENT_GATE", str(tmp_path / "never-opened"))
+
+    async def scenario():
+        async with in_process(acp_native) as (bridge, _):
+            session_id = await chat_with_finished_subagents(bridge, tmp_path)
+            chat = bridge.chats[session_id]
+            turn = asyncio.create_task(
+                bridge.dispatch("session/prompt", prompt_params(session_id, "subagents"))
+            )
+            await until(lambda: set(subagents.load(store, session_id)["running"]) == {"s1", "s2"})
+            chat.backend.process.kill()
+            with pytest.raises(SwitchError):
+                await turn
+            await bridge.dispatch("session/load", chat.setup)
+            assert set(subagents.interrupted(store, session_id)) == {"s1", "s2"}
+            sent = len(prompt_texts(acp_native))
+            await bridge.dispatch("session/prompt", prompt_params(session_id, "/resume-subagents"))
+            ((resume, note),) = prompt_texts(acp_native)[sent:]
+            assert "2 of your subagents stopped before finishing" in resume
+            assert "Task for s1" in resume and "Task for s2" in resume
+            assert note.startswith("\n\n[Note from Devin Switch, not typed by the user] ")
+            assert note.splitlines()[3:-1] == ['- "Title f1" (f1)', '- "Title f2" (f2)']
+            assert subagents.interrupted(store, session_id) == {}
+            assert subagents.closed(store, session_id) == {}
+
+    asyncio.run(scenario())
+
+
 def test_gui_prompt_sent_while_the_closed_subagents_are_read_waits_for_its_own_turn(
     acp_native, tmp_path, monkeypatch
 ):

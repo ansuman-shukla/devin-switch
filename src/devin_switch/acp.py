@@ -655,6 +655,7 @@ class Chat:
     suspended: bool = False
     blank: bool = False
     canceled: bool = False
+    early_stops: int = 0
     next_idle_check: float = 0
     # Side updates carry no request id, so a chat answers one side question at a time.
     side: asyncio.Lock = field(default_factory=asyncio.Lock)
@@ -948,7 +949,10 @@ class Bridge:
         if notification:
             if method == "session/cancel":
                 chat.canceled = True
-                if chat.controls is not None and not chat.suspended:
+                if chat.controls is None:
+                    # No turn to stop yet: it is for the prompts already waiting to open one.
+                    chat.early_stops += 1
+                elif not chat.suspended:
                     self.spawn(self.keep_canceling(chat, params))
             if chat.suspended:
                 if method == "session/cancel":
@@ -1017,6 +1021,9 @@ class Bridge:
             backend = chat.backend
             backend.stop_cause = None
             controls = chat.controls = set()
+            if chat.canceled:
+                # Stopped before this turn opened, so the native has not seen that Stop.
+                self.spawn(self.keep_canceling(chat, {"sessionId": chat.session_id}))
             result = error = None
             backend.record_prompt(params)
             try:

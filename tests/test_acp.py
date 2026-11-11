@@ -1471,6 +1471,94 @@ def test_gui_prompt_after_cancel_starts_a_new_turn(acp_native, tmp_path):
     asyncio.run(scenario())
 
 
+async def stop_before_the_turn_opens(native, bridge, chat, held, proceed):
+    """Stop a prompt held before its turn opens: the native gets the prompt, then the Stop.
+
+    Desktop greys out Stop until the prompt answers, so this Stop cannot be repeated. Like the
+    native, the fake "foreground" turn ignores a Stop sent before its prompt.
+    """
+    session_id = chat.session_id
+    cancel = {"method": "session/cancel", "params": {"sessionId": session_id}}
+    turn = asyncio.create_task(
+        bridge.dispatch("session/prompt", prompt_params(session_id, "foreground"))
+    )
+    await asyncio.wait_for(held.wait(), 10)
+    await bridge.dispatch(cancel["method"], cancel["params"], notification=True)
+    proceed.set()
+    try:
+        answer = await asyncio.wait_for(turn, 5)
+    except TimeoutError:
+        # The fake agent exits only once its open turn is stopped.
+        await chat.backend.send(cancel)
+        answer = "still running"
+    assert answer == {"stopReason": "cancelled"}
+    assert chat.controls is None
+    following = bridge.dispatch("session/prompt", prompt_params(session_id, "next"))
+    assert await asyncio.wait_for(following, 10) == {"stopReason": "end_turn"}
+    received = [
+        (call["method"], call["sessionId"], call["text"])
+        for call in logged(native)
+        if call["pid"] == chat.backend.process.pid
+        and call["method"] in {"session/prompt", "session/cancel"}
+    ]
+    typed = received.index(("session/prompt", session_id, "foreground"))
+    *stops, last = received[typed + 1 :]
+    assert stops and set(stops) == {("session/cancel", session_id, None)}
+    assert last == ("session/prompt", session_id, "next")
+
+
+def test_gui_stop_while_reconnecting_a_released_chat_cancels_its_prompt(
+    acp_native, tmp_path, monkeypatch
+):
+    """A released chat takes seconds to reconnect for its next message: time to press Stop."""
+    monkeypatch.setattr(acp, "CANCEL_RETRY_DELAY", 0.05)
+
+    async def scenario():
+        async with in_process(acp_native) as (bridge, _):
+            created = await bridge.dispatch("session/new", {"cwd": str(tmp_path), "mcpServers": []})
+            chat = bridge.chats[created["sessionId"]]
+            chat.backend.last_activity -= acp.IDLE_TIMEOUT + 1
+            assert await bridge.release_idle(chat)
+            assert chat.suspended
+            request = acp.Backend.request
+            loading, loaded = asyncio.Event(), asyncio.Event()
+
+            async def slow_load(backend, method, params, timeout=None):
+                if method == "session/load":
+                    loading.set()
+                    await loaded.wait()
+                return await request(backend, method, params, timeout)
+
+            monkeypatch.setattr(acp.Backend, "request", slow_load)
+            await stop_before_the_turn_opens(acp_native, bridge, chat, loading, loaded)
+
+    asyncio.run(scenario())
+
+
+def test_gui_stop_while_a_prompt_waits_to_open_its_turn_cancels_it(
+    acp_native, tmp_path, monkeypatch
+):
+    """A connected chat reads the closed subagents note before its prompt opens the turn."""
+    monkeypatch.setattr(acp, "CANCEL_RETRY_DELAY", 0.05)
+
+    async def scenario():
+        async with in_process(acp_native) as (bridge, _):
+            created = await bridge.dispatch("session/new", {"cwd": str(tmp_path), "mcpServers": []})
+            chat = bridge.chats[created["sessionId"]]
+            closed_note = bridge.closed_note_params
+            reading, read = asyncio.Event(), asyncio.Event()
+
+            async def slow_note(chat, params):
+                reading.set()
+                await read.wait()
+                return await closed_note(chat, params)
+
+            monkeypatch.setattr(bridge, "closed_note_params", slow_note)
+            await stop_before_the_turn_opens(acp_native, bridge, chat, reading, read)
+
+    asyncio.run(scenario())
+
+
 def test_gui_startup_and_listing_skip_the_login_check(acp_native, tmp_path, monkeypatch):
     """A window reload waits for initialize; the login check can take 10 s on a slow network."""
     checked = []

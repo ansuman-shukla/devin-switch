@@ -1,11 +1,11 @@
 """The Subagents tab: a GUI chat's subagents, live, in a Browser tab of the chat.
 
 The native reports subagents in `session/update` metadata: `cognition.ai/subagent_started`,
-`_completed` and `_paused` events, and on every update `cognition.ai/subagent_context`, whose
-`parentAgentId` names the agent that produced the update ("root" for the chat's own agent, a
-subagent's ID for its own steps). The bridge feeds each live update to a `Roster`, kept only in
-memory. `/subagents` typed in a chat opens the page that shows it, served by `side.Server`
-like the side page. It is a view: nothing here reaches the agent or the chat's transcript.
+`_completed` and `_paused` events, and on a subagent's own updates `cognition.ai/subagent_context`,
+whose `parentAgentId` is that subagent's ID (the chat's own agent sends it only on usage updates,
+as "root"). The bridge feeds each live update to a `Roster`, kept only in memory. `/subagents`
+typed in a chat opens the page that shows it, served by `side.Server` like the side page. It is
+a view: nothing here reaches the agent or the chat's transcript.
 """
 
 import asyncio

@@ -3034,29 +3034,30 @@ def test_subagents_that_finish_are_remembered_while_their_process_lives(store):
     finish(store, session_id, "quota", success=False, summary=quota)
     # A completion whose start this process never reported is not one of its subagents.
     subagents.record(store, session_id, subagents.COMPLETED, {"agentId": "unseen", "success": True})
+    ended = subagents.load_ended(store, session_id)
+    assert list(ended["finished"]) == ["ok", "failed"] and ended["closed"] == {}
+    assert before <= ended["finished"]["ok"].pop("ended_at") <= time.time()
+    assert ended["finished"]["ok"] == {"title": "Review", "profile": "reviewer", "background": True}
     state = subagents.load(store, session_id)
-    assert list(state["finished"]) == ["ok", "failed"]
-    assert before <= state["finished"]["ok"].pop("ended_at") <= time.time()
-    assert state["finished"]["ok"] == {"title": "Review", "profile": "reviewer", "background": True}
-    assert list(state["interrupted"]) == ["quota"]
-    assert state["running"] == {} and state["closed"] == {}
+    assert state["running"] == {} and list(state["interrupted"]) == ["quota"]
     assert subagents.closed(store, session_id) == {}
     # Resumed in the same process, it runs again.
     subagents.record(store, session_id, subagents.STARTED, {"agentId": "ok", "title": "Review"})
-    state = subagents.load(store, session_id)
-    assert list(state["finished"]) == ["failed"] and list(state["running"]) == ["ok"]
+    assert list(subagents.load_ended(store, session_id)["finished"]) == ["failed"]
+    assert list(subagents.load(store, session_id)["running"]) == ["ok"]
 
 
 def test_replacement_process_closes_finished_subagents_and_interrupts_running_ones(store):
     session_id = "chat-replaced"
     finish(store, session_id, "done", title="Done")
     subagents.record(store, session_id, subagents.STARTED, {"agentId": "busy", "title": "Busy"})
-    finished = subagents.load(store, session_id)["finished"]
+    finished = subagents.load_ended(store, session_id)["finished"]
     assert subagents.interrupt_running(store, session_id) == ["busy"]
     state = subagents.load(store, session_id)
-    assert state["running"] == {} and state["finished"] == {}
+    assert state["running"] == {}
     assert state["interrupted"]["busy"]["reason"] == "the agent restarted"
-    assert state["closed"] == finished and list(finished) == ["done"]
+    ended = subagents.load_ended(store, session_id)
+    assert ended["finished"] == {} and ended["closed"] == finished and list(finished) == ["done"]
     # Later replacements keep earlier closed subagents and add the newly finished ones.
     finish(store, session_id, "later", title="Later")
     assert subagents.interrupt_running(store, session_id) == []
@@ -3068,36 +3069,67 @@ def test_only_the_latest_finished_and_closed_subagents_are_kept(store):
     limit = subagents.FINISHED_LIMIT
     # Saved in the reverse of the order they ended in, so age decides and not position.
     old = {f"old-{n}": {"title": f"Old {n}", "ended_at": float(limit - n)} for n in range(limit)}
-    subagents.save(store, {**subagents.load(store, session_id), "finished": old})
+    subagents.save_ended(store, {"session_id": session_id, "finished": old, "closed": {}})
     finish(store, session_id, "new")
-    finished = subagents.load(store, session_id)["finished"]
+    finished = subagents.load_ended(store, session_id)["finished"]
     assert set(finished) == {"new", *(f"old-{n}" for n in range(limit - 1))}
     closed = {
         "oldest": {"title": "Oldest", "ended_at": -1.0},
         "recent": {"title": "Recent", "ended_at": limit + 1.0},
         "older": {"title": "Older", "ended_at": 0.0},
     }
-    subagents.save(store, {**subagents.load(store, session_id), "closed": closed})
+    subagents.save_ended(store, {"session_id": session_id, "finished": finished, "closed": closed})
     subagents.interrupt_running(store, session_id)
     kept = subagents.closed(store, session_id)
     assert set(kept) == {"recent", "new", *(f"old-{n}" for n in range(limit - 2))}
     assert list(kept)[-3:] == ["old-0", "recent", "new"]
 
 
-def test_subagent_record_saved_before_finished_ones_were_kept_still_loads(store):
-    session_id = "chat-legacy"
-    legacy = {
-        "session_id": session_id,
-        "running": {"a": {"title": "A", "task": "Do A", "profile": "", "background": False}},
-        "interrupted": {"b": {"title": "B", "task": "Do B", "reason": "usage ran out"}},
-    }
+def old_bridge_saves(store, session_id, interrupted):
+    """Save the subagent record the way a bridge that knows only its two lists does."""
     target = subagents.path(store, session_id)
+    if interrupted:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        state = {"session_id": session_id, "running": {}, "interrupted": interrupted}
+        target.write_text(json.dumps(state))
+    else:
+        target.unlink(missing_ok=True)
+
+
+def test_finished_and_closed_subagents_stay_out_of_the_record_older_bridges_save(store):
+    """Bridges started before this change still run in other windows and rewrite that file."""
+    session_id = "chat-shared"
+    legacy, ended = subagents.path(store, session_id), subagents.ended_path(store, session_id)
+    assert ended == store.root / "acp" / "closed-subagents" / legacy.name
+    finish(store, session_id, "done", title="Done")
+    subagents.record(store, session_id, subagents.STARTED, {"agentId": "busy", "title": "Busy"})
+    assert set(json.loads(legacy.read_text())) == {"session_id", "running", "interrupted"}
+    assert set(json.loads(ended.read_text())) == {"session_id", "finished", "closed"}
+    assert ended.parent.stat().st_mode & 0o777 == 0o700
+    # The shared record is still removed as soon as nothing is running or interrupted.
+    subagents.record(store, session_id, subagents.COMPLETED, {"agentId": "busy", "success": True})
+    assert not legacy.exists()
+    left = {"x": {"title": "X", "task": "Do X", "reason": "usage ran out"}}
+    for interrupted in (left, {}):
+        old_bridge_saves(store, session_id, interrupted)
+        assert list(subagents.load_ended(store, session_id)["finished"]) == ["done", "busy"]
+    subagents.interrupt_running(store, session_id)
+    for interrupted in (left, {}):
+        old_bridge_saves(store, session_id, interrupted)
+        assert list(subagents.closed(store, session_id)) == ["done", "busy"]
+
+
+def test_unreadable_closed_subagents_file_counts_as_empty(store):
+    session_id = "chat-unreadable"
+    target = subagents.ended_path(store, session_id)
     target.parent.mkdir(parents=True)
-    target.write_text(json.dumps(legacy))
-    assert subagents.load(store, session_id) == {**legacy, "finished": {}, "closed": {}}
-    subagents.record(store, session_id, subagents.COMPLETED, {"agentId": "a", "success": True})
-    state = subagents.load(store, session_id)
-    assert list(state["finished"]) == ["a"] and state["interrupted"] == legacy["interrupted"]
+    other = {"session_id": "another-chat", "finished": {}, "closed": {"a": {"title": "A"}}}
+    wrong = {"session_id": session_id, "finished": {}, "closed": ["a"]}
+    for content in ("not json", "[]", json.dumps(other), json.dumps(wrong)):
+        target.write_text(content)
+        assert subagents.closed(store, session_id) == {}
+    finish(store, session_id, "a", title="A")
+    assert list(subagents.load_ended(store, session_id)["finished"]) == ["a"]
 
 
 def test_closed_subagents_are_kept_until_they_are_forgotten(store):
@@ -3107,18 +3139,16 @@ def test_closed_subagents_are_kept_until_they_are_forgotten(store):
     subagents.interrupt_running(store, session_id)
     quota = "[Error] daily usage quota has been exhausted"
     finish(store, session_id, "q", success=False, summary=quota)
-    target = subagents.path(store, session_id)
     assert list(subagents.closed(store, session_id)) == ["a", "b", "c"]
     subagents.forget_closed(store, session_id, ["a", "c", "q", "unseen"])
-    state = subagents.load(store, session_id)
-    assert list(state["closed"]) == ["b"] and list(state["interrupted"]) == ["q"]
-    subagents.forget(store, session_id, ["q", "b"])
-    # Only closed subagents are left: the record must outlive every other list.
-    state = json.loads(target.read_text())
-    assert [state[name] for name in ("running", "interrupted", "finished")] == [{}, {}, {}]
     assert list(subagents.closed(store, session_id)) == ["b"]
-    subagents.forget_closed(store, session_id, {"b": state["closed"]["b"]})
-    assert not target.exists()
+    assert list(subagents.interrupted(store, session_id)) == ["q"]
+    subagents.forget(store, session_id, ["q", "b"])
+    # Closed subagents outlive the shared record, which goes once nothing is interrupted.
+    assert not subagents.path(store, session_id).exists()
+    assert list(subagents.closed(store, session_id)) == ["b"]
+    subagents.forget_closed(store, session_id, {"b": {}})
+    assert not subagents.ended_path(store, session_id).exists()
 
 
 def test_closed_subagents_note_names_them_and_says_what_no_longer_works():
@@ -3216,8 +3246,32 @@ def test_gui_finished_subagents_stay_usable_in_their_own_process(acp_native, tmp
             assert prompt_texts(acp_native) == [["finished-subagents"], ["next"], ["again"]]
             calls = [call for call in logged(acp_native) if call["sessionId"] == session_id]
             assert len({call["pid"] for call in calls}) == 1
-            state = subagents.load(acp_native.store, session_id)
-            assert list(state["finished"]) == ["f1", "f2"] and state["closed"] == {}
+            ended = subagents.load_ended(acp_native.store, session_id)
+            assert list(ended["finished"]) == ["f1", "f2"] and ended["closed"] == {}
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize(
+    "left",
+    [{}, {"x": {"title": "X", "task": "Do X", "reason": "usage ran out"}}],
+    ids=["deletes", "rewrites"],
+)
+def test_gui_closed_subagents_note_survives_an_older_bridge_saving_the_record(
+    acp_native, tmp_path, left
+):
+    store = acp_native.store
+
+    async def scenario():
+        async with in_process(acp_native) as (bridge, _):
+            session_id = await chat_with_finished_subagents(bridge, tmp_path)
+            old_bridge_saves(store, session_id, left)
+            await bridge.dispatch("session/prompt", prompt_params(session_id, "/switch ansuman-2"))
+            old_bridge_saves(store, session_id, left)
+            await bridge.dispatch("session/prompt", prompt_params(session_id, "next"))
+            text, note = prompt_texts(acp_native)[-1]
+            assert text == "next" and '"Title f1" (f1)' in note and '"Title f2" (f2)' in note
+            assert subagents.interrupted(store, session_id) == left
 
     asyncio.run(scenario())
 

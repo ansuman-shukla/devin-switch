@@ -9,7 +9,9 @@ saved progress instead of redoing it.
 
 A finished subagent stays readable and resumable only in the process that ran it. Switch
 records those too: once a replacement process opens the conversation they are closed, and the
-parent agent is told so it does not ask for IDs that no longer exist.
+parent agent is told so it does not ask for IDs that no longer exist. They live in their own
+file: older bridges still running in other windows rewrite the first one with only the lists
+they know.
 """
 
 import json
@@ -27,7 +29,6 @@ QUOTA_FAILURE = re.compile(r"usage quota has been exhausted|quota exhausted", re
 TASK_LIMIT = 4000
 PROGRESS_LIMIT = 2000
 PROGRESS_STEPS = 6
-MAPS = ("running", "interrupted", "finished", "closed")
 FINISHED_LIMIT = 100
 NOTE_LIMIT = 20
 
@@ -37,20 +38,52 @@ def path(store: Store, session_id: str) -> Path:
 
 
 def load(store: Store, session_id: str) -> dict:
-    state = {"session_id": session_id, **{name: {} for name in MAPS}}
     try:
         value = json.loads(path(store, session_id).read_text())
         if value.get("session_id") != session_id:
             raise ValueError
-        # Files written before finished subagents were recorded have only the first two maps.
-        return state | {name: dict(value.get(name) or {}) for name in MAPS}
-    except (FileNotFoundError, ValueError, TypeError, AttributeError):
-        return state
+        return {
+            "session_id": session_id,
+            "running": dict(value.get("running") or {}),
+            "interrupted": dict(value.get("interrupted") or {}),
+        }
+    except FileNotFoundError:
+        return {"session_id": session_id, "running": {}, "interrupted": {}}
+    except (ValueError, TypeError, AttributeError):
+        return {"session_id": session_id, "running": {}, "interrupted": {}}
 
 
 def save(store: Store, state: dict) -> None:
     target = path(store, state["session_id"])
-    if not any(state[name] for name in MAPS):
+    if not state["running"] and not state["interrupted"]:
+        target.unlink(missing_ok=True)
+        return
+    private_directory(target.parent)
+    write_json(target, state)
+
+
+def ended_path(store: Store, session_id: str) -> Path:
+    return store.root / "acp" / "closed-subagents" / f"{acp_state.session_key(session_id)}.json"
+
+
+def load_ended(store: Store, session_id: str) -> dict:
+    """Subagents that finished in the live process, and ones closed with an earlier one.
+
+    Not in the file above: older bridges in other windows save it with only its two lists.
+    """
+    state = {"session_id": session_id, "finished": {}, "closed": {}}
+    try:
+        value = json.loads(ended_path(store, session_id).read_text())
+        if value.get("session_id") != session_id:
+            raise ValueError
+        return state | {name: dict(value.get(name) or {}) for name in ("finished", "closed")}
+    except (FileNotFoundError, ValueError, TypeError, AttributeError):
+        return state
+
+
+def save_ended(store: Store, state: dict) -> None:
+    target = ended_path(store, state["session_id"])
+    if not state["finished"] and not state["closed"]:
         target.unlink(missing_ok=True)
         return
     private_directory(target.parent)
@@ -79,19 +112,20 @@ def record(store: Store, session_id: str, key: str, event: dict) -> None:
     if not isinstance(agent, str) or not agent:
         return
     with store.lock("subagents.lock", timeout=5):
-        state = load(store, session_id)
+        state, ended = load(store, session_id), load_ended(store, session_id)
         if key == STARTED:
             state["running"][agent] = describe(event)
-            state["finished"].pop(agent, None)
+            ended["finished"].pop(agent, None)
         elif key == COMPLETED and (info := state["running"].pop(agent, None)) is not None:
             summary = str(event.get("summary") or "")
             if event.get("success") is False and QUOTA_FAILURE.search(summary):
                 state["interrupted"][agent] = {**info, "reason": "usage ran out"}
             else:
                 kept = {name: info.get(name) for name in ("title", "profile", "background")}
-                state["finished"][agent] = {**kept, "ended_at": time.time()}
-                state["finished"] = newest(state["finished"])
+                ended["finished"][agent] = {**kept, "ended_at": time.time()}
+                ended["finished"] = newest(ended["finished"])
         save(store, state)
+        save_ended(store, ended)
 
 
 def interrupt_running(store: Store, session_id: str) -> list[str]:
@@ -107,9 +141,11 @@ def interrupt_running(store: Store, session_id: str) -> list[str]:
                 **state["running"].pop(agent),
                 "reason": "the agent restarted",
             }
-        state["closed"] = newest({**state["closed"], **state["finished"]})
-        state["finished"] = {}
         save(store, state)
+        ended = load_ended(store, session_id)
+        ended["closed"] = newest({**ended["closed"], **ended["finished"]})
+        ended["finished"] = {}
+        save_ended(store, ended)
     return moved
 
 
@@ -118,19 +154,23 @@ def interrupted(store: Store, session_id: str) -> dict:
 
 
 def closed(store: Store, session_id: str) -> dict:
-    return load(store, session_id)["closed"]
+    return load_ended(store, session_id)["closed"]
 
 
-def forget(store: Store, session_id: str, agents, kind: str = "interrupted") -> None:
+def forget(store: Store, session_id: str, agents) -> None:
     with store.lock("subagents.lock", timeout=5):
         state = load(store, session_id)
         for agent in agents:
-            state[kind].pop(agent, None)
+            state["interrupted"].pop(agent, None)
         save(store, state)
 
 
 def forget_closed(store: Store, session_id: str, agents) -> None:
-    forget(store, session_id, agents, "closed")
+    with store.lock("subagents.lock", timeout=5):
+        ended = load_ended(store, session_id)
+        for agent in agents:
+            ended["closed"].pop(agent, None)
+        save_ended(store, ended)
 
 
 def closed_note(agents: dict) -> str:

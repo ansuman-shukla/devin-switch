@@ -1471,6 +1471,13 @@ def test_gui_prompt_after_cancel_starts_a_new_turn(acp_native, tmp_path):
     asyncio.run(scenario())
 
 
+async def started(request):
+    """A request's task, run up to its first wait (the chat's gate, say): it has arrived."""
+    task = asyncio.create_task(request)
+    await asyncio.sleep(0)
+    return task
+
+
 async def stop_before_the_turn_opens(native, bridge, chat, held, proceed):
     """Stop a prompt held before its turn opens: the native gets the prompt, then the Stop.
 
@@ -1479,9 +1486,7 @@ async def stop_before_the_turn_opens(native, bridge, chat, held, proceed):
     """
     session_id = chat.session_id
     cancel = {"method": "session/cancel", "params": {"sessionId": session_id}}
-    turn = asyncio.create_task(
-        bridge.dispatch("session/prompt", prompt_params(session_id, "foreground"))
-    )
+    turn = await started(bridge.dispatch("session/prompt", prompt_params(session_id, "foreground")))
     await asyncio.wait_for(held.wait(), 10)
     await bridge.dispatch(cancel["method"], cancel["params"], notification=True)
     proceed.set()
@@ -1507,6 +1512,26 @@ async def stop_before_the_turn_opens(native, bridge, chat, held, proceed):
     assert last == ("session/prompt", session_id, "next")
 
 
+async def released_chat_with_a_held_load(bridge, tmp_path, monkeypatch):
+    """An idle-released chat whose reconnect waits in its native load until told to go on."""
+    created = await bridge.dispatch("session/new", {"cwd": str(tmp_path), "mcpServers": []})
+    chat = bridge.chats[created["sessionId"]]
+    chat.backend.last_activity -= acp.IDLE_TIMEOUT + 1
+    assert await bridge.release_idle(chat)
+    assert chat.suspended
+    request = acp.Backend.request
+    loading, loaded = asyncio.Event(), asyncio.Event()
+
+    async def slow_load(backend, method, params, timeout=None):
+        if method == "session/load":
+            loading.set()
+            await loaded.wait()
+        return await request(backend, method, params, timeout)
+
+    monkeypatch.setattr(acp.Backend, "request", slow_load)
+    return chat, loading, loaded
+
+
 def test_gui_stop_while_reconnecting_a_released_chat_cancels_its_prompt(
     acp_native, tmp_path, monkeypatch
 ):
@@ -1515,22 +1540,33 @@ def test_gui_stop_while_reconnecting_a_released_chat_cancels_its_prompt(
 
     async def scenario():
         async with in_process(acp_native) as (bridge, _):
-            created = await bridge.dispatch("session/new", {"cwd": str(tmp_path), "mcpServers": []})
-            chat = bridge.chats[created["sessionId"]]
-            chat.backend.last_activity -= acp.IDLE_TIMEOUT + 1
-            assert await bridge.release_idle(chat)
-            assert chat.suspended
-            request = acp.Backend.request
-            loading, loaded = asyncio.Event(), asyncio.Event()
-
-            async def slow_load(backend, method, params, timeout=None):
-                if method == "session/load":
-                    loading.set()
-                    await loaded.wait()
-                return await request(backend, method, params, timeout)
-
-            monkeypatch.setattr(acp.Backend, "request", slow_load)
+            chat, loading, loaded = await released_chat_with_a_held_load(
+                bridge, tmp_path, monkeypatch
+            )
             await stop_before_the_turn_opens(acp_native, bridge, chat, loading, loaded)
+
+    asyncio.run(scenario())
+
+
+def test_gui_stop_while_a_prompt_waits_for_a_reconnecting_chat_cancels_it(
+    acp_native, tmp_path, monkeypatch
+):
+    """A sidebar rename reconnects a released chat too, and the next message waits behind it."""
+    monkeypatch.setattr(acp, "CANCEL_RETRY_DELAY", 0.05)
+
+    async def scenario():
+        async with in_process(acp_native) as (bridge, _):
+            chat, loading, loaded = await released_chat_with_a_held_load(
+                bridge, tmp_path, monkeypatch
+            )
+            rename = asyncio.create_task(
+                bridge.dispatch(
+                    "_cognition.ai/session/rename", {"sessionId": chat.session_id, "title": "New"}
+                )
+            )
+            await asyncio.wait_for(loading.wait(), 10)
+            await stop_before_the_turn_opens(acp_native, bridge, chat, loading, loaded)
+            await asyncio.wait_for(rename, 5)
 
     asyncio.run(scenario())
 
@@ -1555,6 +1591,30 @@ def test_gui_stop_while_a_prompt_waits_to_open_its_turn_cancels_it(
 
             monkeypatch.setattr(bridge, "closed_note_params", slow_note)
             await stop_before_the_turn_opens(acp_native, bridge, chat, reading, read)
+
+    asyncio.run(scenario())
+
+
+def test_gui_stop_for_an_open_turn_spares_a_command_waiting_behind_it(acp_native, tmp_path):
+    """Typed during a turn, /switch-continue waits for it to end: that Stop is for the turn."""
+
+    async def scenario():
+        async with in_process(acp_native) as (bridge, messages):
+            created = await bridge.dispatch("session/new", {"cwd": str(tmp_path), "mcpServers": []})
+            session_id = created["sessionId"]
+            turn = asyncio.create_task(
+                bridge.dispatch("session/prompt", prompt_params(session_id, "foreground"))
+            )
+            await until(lambda: "live progress" in texts(messages))
+            command = await started(
+                bridge.dispatch(
+                    "session/prompt", prompt_params(session_id, "/switch-continue ansuman-2")
+                )
+            )
+            await bridge.dispatch("session/cancel", {"sessionId": session_id}, notification=True)
+            assert await asyncio.wait_for(turn, 5) == {"stopReason": "cancelled"}
+            assert await asyncio.wait_for(command, 10) == {"stopReason": "end_turn"}
+            assert prompts(acp_native)[-1] == ("ansuman-2", "continue")
 
     asyncio.run(scenario())
 

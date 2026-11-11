@@ -990,6 +990,7 @@ class Bridge:
                 await chat.backend.send(
                     {"method": "session/cancel", "params": {"sessionId": session_id}}
                 )
+        stops = chat.early_stops
         async with chat.access():
             if self.chats.get(session_id) is not chat:
                 raise SwitchError("This GUI chat was closed. Reopen the saved conversation.")
@@ -1002,7 +1003,8 @@ class Bridge:
                 self.roster.forget(session_id)
                 return {}
             if method == "session/prompt":
-                chat.canceled = False
+                # A Stop from before this prompt arrived was for an earlier turn.
+                chat.canceled = chat.early_stops != stops
                 if (result := await self.local_prompt(chat, params)) is not None:
                     return result
                 await self.reconnect(chat)

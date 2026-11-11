@@ -16,6 +16,7 @@ from devin_switch import (
     relay,
     sessions,
     side,
+    subagent_tab,
     subagents,
     tool_folders,
 )
@@ -56,6 +57,10 @@ LOCAL_COMMANDS = [
         "name": "btw",
         "description": "Ask on the side in a Side chat tab; this chat keeps working",
         "input": {"hint": "question"},
+    },
+    {
+        "name": "subagents",
+        "description": "Show this chat's subagents live in a tab; this chat keeps working",
     },
 ]
 LOCAL_NAMES = {"/" + command["name"] for command in LOCAL_COMMANDS}
@@ -616,6 +621,7 @@ class Backend:
             self.pump.cancel()
             with suppress(asyncio.CancelledError):
                 await self.pump
+        self.bridge.interrupt_subagents(self)
         self.lease.close(ended=True)
         await self.bridge.drop_client_requests(self)
         self.close_pipes()
@@ -696,6 +702,7 @@ class Bridge:
         self.filling = False
         self.side_server = None
         self.side_sinks = {}
+        self.roster = subagent_tab.Roster()
 
     def spawn(self, coroutine):
         task = asyncio.create_task(coroutine)
@@ -784,6 +791,7 @@ class Bridge:
                 backend.commands = update["availableCommands"]
             meta = update.get("_meta")
             if backend.live and backend.session_id and isinstance(meta, dict):
+                self.roster.apply(backend.session_id, update)
                 for key in (subagents.STARTED, subagents.COMPLETED):
                     if isinstance(event := meta.get(key), dict):
                         await self.track_subagent(backend, key, event)
@@ -925,6 +933,9 @@ class Bridge:
         ):
             # Answered on the chat's side page, so it never waits for (or joins) the turn.
             return await self.side_question(chat, question)
+        if method == "session/prompt" and prompt_command(params)[2] == "/subagents":
+            # A view beside the chat: like /btw it never waits for (or joins) the turn.
+            return await self.show_subagents(chat)
         if method in SIDE_REQUESTS and chat.suspended and await self.held_elsewhere(session_id):
             # The native answers this for a chat it hasn't loaded; Desktop ignores it quietly.
             raise RpcError("Session not found: this chat is open in another window.", -32602)
@@ -978,6 +989,7 @@ class Bridge:
                         "The GUI agent is still shutting down; it was not force-killed."
                     )
                 self.chats.pop(session_id)
+                self.roster.forget(session_id)
                 return {}
             if method == "session/prompt":
                 chat.canceled = False
@@ -1130,6 +1142,18 @@ class Bridge:
         if not showing:
             async with chat.backend.emitting:
                 await self.emit({"jsonrpc": "2.0", **server.opened(chat.session_id)})
+        return {"stopReason": "end_turn"}
+
+    async def show_subagents(self, chat):
+        """A /subagents typed in the chat: its live Subagents page opens as a Browser tab of it.
+
+        Desktop opens a new tab for every notice, so a chat whose page is connected gets none.
+        Nothing reaches the chat's agent or waits for its turn.
+        """
+        if not self.roster.showing(chat.session_id):
+            notice = self.side_server.opened(chat.session_id, "subagents")
+            async with chat.backend.emitting:
+                await self.emit({"jsonrpc": "2.0", **notice})
         return {"stopReason": "end_turn"}
 
     async def side_cancel(self, session_id):
@@ -1310,9 +1334,16 @@ class Bridge:
         except (SwitchError, OSError):
             pass
 
+    def interrupt_subagents(self, backend):
+        """A native that exited took its subagents along; a newer native's are not its own."""
+        chat = self.chats.get(backend.session_id)
+        if chat is not None and chat.backend is backend:
+            self.roster.interrupt(backend.session_id)
+
     async def go_live(self, backend):
         """Start counting subagent events; ones an earlier process left running are now stopped."""
         backend.live = True
+        self.roster.interrupt(backend.session_id)
         try:
             await asyncio.to_thread(
                 subagents.interrupt_running, self.native.store, backend.session_id
@@ -1416,6 +1447,8 @@ class Bridge:
                                 "session/load", setup, LIFECYCLE_TIMEOUT
                             )
                             chat.setup = setup
+                            # A native's own reload wipes its subagents, like a restart.
+                            self.roster.interrupt(session_id, subagent_tab.RELOADED)
                             return result
                         finally:
                             chat.backend.suppress_replay = False

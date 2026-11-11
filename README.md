@@ -362,6 +362,16 @@ turn. `Stop` ends only the side answer, and `New` starts a fresh thread. Closed 
 `/btw` again, with or without a question, to reopen it. The page is served by Switch on
 `127.0.0.1` with a random token and lives as long as the window's Switch agent.
 
+### See a chat's subagents at a glance
+
+Type `/subagents` in a Desktop chat run through Devin Switch. A **Subagents** tab opens next to
+the chat and lists the subagents that chat has started: each one's title, whether it is running,
+paused, done, failed or stopped, how long it has been running, and its latest step. The list
+updates live while the chat's agent keeps working, and nothing is added to the chat. It only
+shows what is going on: it cannot stop or change a subagent. It covers subagents started since
+the chat was opened in this window, so it starts empty after the window reloads. Closed the tab?
+Type `/subagents` again. The page is served the same way as the Side chat tab.
+
 ### Keep a whiteboard per chat
 
 Switch gives chats `WHITEBOARD_CHAT_COMMAND="ds chat id"` (unless you set it), so a chat keeps

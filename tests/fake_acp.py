@@ -106,6 +106,63 @@ async def subagent(session_id, agent_id):
     return agent_id, summary
 
 
+def chunk(kind, text):
+    return {"sessionUpdate": kind, "content": {"type": "text", "text": text}}
+
+
+def produced(agent_id, change, **meta):
+    """As CLI 3000.12.43 does, name the agent an update comes from ("root": the chat's own)."""
+    context = {"cognition.ai/subagent_context": {"parentAgentId": agent_id}}
+    return {**change, "_meta": {**context, **meta}}
+
+
+def lifecycle(agent_id, status, key, **details):
+    """A subagent's start or end, as CLI 3000.12.43 reports it on the launching tool call."""
+    change = {"sessionUpdate": "tool_call_update", "toolCallId": agent_id, "status": status}
+    return produced("root", change, **{key: {"agentId": agent_id, **details, "depth": 1}})
+
+
+def launched(agent_id, background):
+    return lifecycle(
+        agent_id,
+        "in_progress",
+        "cognition.ai/subagent_started",
+        title="Sleeper",
+        task="Run sleep 30, then report",
+        profile="General",
+        isBackground=background,
+        model="SWE-1.6",
+    )
+
+
+def finished(agent_id, success, summary):
+    return lifecycle(
+        agent_id, "completed", "cognition.ai/subagent_completed", success=success, summary=summary
+    )
+
+
+async def delegate(request_id):
+    """A turn whose background subagent works until Stop, which ends it unsuccessfully."""
+    agent_id, command = "acb63708", {"toolCallId": "call_ab18"}
+    canceled.clear()
+    update(loaded, produced("root", chunk("agent_message_chunk", "live progress")))
+    update(loaded, launched(agent_id, True))
+    update(loaded, produced(agent_id, chunk("agent_thought_chunk", "…")))
+    running = {"sessionUpdate": "tool_call", "title": "Running command", "kind": "execute"}
+    update(loaded, produced(agent_id, {**running, **command}))
+    # A test opens the gate to let the subagent take its next step.
+    gate = os.environ.get("FAKE_SUBAGENT_GATE")
+    while gate and not canceled.is_set():
+        if Path(gate).exists():
+            ran = {"sessionUpdate": "tool_call_update", "title": "Ran sleep"}
+            update(loaded, produced(agent_id, {**ran, **command}))
+            break
+        await asyncio.sleep(0.02)
+    await canceled.wait()
+    update(loaded, finished(agent_id, False, "[Error] Canceled by user"))
+    emit({"id": request_id, "result": {"stopReason": "cancelled"}})
+
+
 def emit(message):
     print(json.dumps({"jsonrpc": "2.0", **message}), flush=True)
 
@@ -271,6 +328,12 @@ async def handle(message):
                     "content": {"type": "text", "text": "historical replay"},
                 },
             )
+            if os.environ.get("FAKE_REPLAY_SUBAGENT"):
+                # The native replays a saved chat's foreground subagents in the live shapes.
+                read = {"sessionUpdate": "tool_call", "toolCallId": "call_77", "kind": "read"}
+                update(session_id, launched("9d2e41aa", False))
+                update(session_id, produced("9d2e41aa", {**read, "title": "Read notes.md"}))
+                update(session_id, finished("9d2e41aa", True, "Read the notes."))
         elif not os.environ.get("FAKE_SAVE_ON_PROMPT"):
             connection.execute(
                 "INSERT INTO sessions VALUES (?, ?, ?, ?, 0)",
@@ -365,6 +428,9 @@ async def handle(message):
                 },
             )
             emit({"id": message["id"], "result": {"stopReason": "end_turn"}})
+            return
+        if text == "delegate":
+            await delegate(message["id"])
             return
         if foreground is not None and text.startswith("steer"):
             foreground["steering"].append(message["id"])

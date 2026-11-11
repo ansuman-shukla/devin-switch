@@ -46,6 +46,8 @@ def bundle_runtime(app: Path, workspace: Path) -> None:
             "tkinter",
             "--add-data",
             f"{ROOT / 'src/devin_switch/side_page'}:devin_switch/side_page",
+            "--add-data",
+            f"{ROOT / 'src/devin_switch/subagent_page'}:devin_switch/subagent_page",
             str(ROOT / "src/devin_switch/__main__.py"),
         ),
         check=True,

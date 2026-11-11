@@ -7,6 +7,7 @@ import subprocess
 import sys
 import urllib.request
 import uuid
+from datetime import UTC, datetime
 from pathlib import Path
 
 account = Path(os.environ["XDG_DATA_HOME"]).parent.name
@@ -104,6 +105,89 @@ async def subagent(session_id, agent_id):
         {"agentId": agent_id, "success": success, "summary": summary},
     )
     return agent_id, summary
+
+
+def chunk(kind, text):
+    return {"sessionUpdate": kind, "content": {"type": "text", "text": text}}
+
+
+def stamp():
+    return {"cognition.ai/timestamp": datetime.now(UTC).isoformat()}
+
+
+def streaming(message_id):
+    """What CLI 3000.12.43 adds to each live chunk of one message or thought."""
+    return {"cognition.ai/streamingMessageId": message_id, **stamp()}
+
+
+def produced(agent_id, change, **meta):
+    """As CLI 3000.12.43 does, name the subagent an update is the work of.
+
+    The chat's own agent names itself ("root") on its usage updates alone.
+    """
+    context = {"cognition.ai/subagent_context": {"parentAgentId": agent_id}}
+    return {**change, "_meta": {**context, **meta}}
+
+
+def lifecycle(agent_id, status, key, **details):
+    """A subagent's start or end, as CLI 3000.12.43 reports it on the launching tool call."""
+    change = {"sessionUpdate": "tool_call_update", "toolCallId": agent_id, "status": status}
+    return {**change, "_meta": {key: {"agentId": agent_id, **details, "depth": 1}}}
+
+
+def launched(agent_id, background):
+    return lifecycle(
+        agent_id,
+        "in_progress",
+        "cognition.ai/subagent_started",
+        title="Sleeper",
+        task="Run sleep 30, then report",
+        profile="General",
+        isBackground=background,
+        model="SWE-1.6",
+    )
+
+
+def finished(agent_id, success, summary):
+    return lifecycle(
+        agent_id, "completed", "cognition.ai/subagent_completed", success=success, summary=summary
+    )
+
+
+async def delegate(request_id):
+    """A turn whose background subagent speaks, then works until Stop, which fails it."""
+    agent_id, command = "acb63708", {"toolCallId": "call_ab18"}
+    usage = {"sessionUpdate": "usage_update", "used": 1, "size": 10}
+    canceled.clear()
+    progress = chunk("agent_message_chunk", "live progress")
+    update(loaded, {**progress, "_meta": streaming(str(uuid.uuid4()))})
+    update(loaded, produced("root", usage))
+    update(loaded, launched(agent_id, True))
+    thought = chunk("agent_thought_chunk", "…")
+    update(loaded, produced(agent_id, thought, **streaming(str(uuid.uuid4()))))
+    update(loaded, produced(agent_id, usage))
+    # Its own messages: the chunks of one share a streaming ID.
+    first, second = str(uuid.uuid4()), str(uuid.uuid4())
+    for text, message_id in (
+        ("I'll run the command.", first),
+        ("## Plan\n", second),
+        ("Sleep, then **report**.", second),
+    ):
+        said = chunk("agent_message_chunk", text)
+        update(loaded, produced(agent_id, said, **streaming(message_id)))
+    running = {"sessionUpdate": "tool_call", "title": "Running command", "kind": "execute"}
+    update(loaded, produced(agent_id, {**running, **command}))
+    # A test opens the gate to let the subagent take its next step.
+    gate = os.environ.get("FAKE_SUBAGENT_GATE")
+    while gate and not canceled.is_set():
+        if Path(gate).exists():
+            ran = {"sessionUpdate": "tool_call_update", "title": "Ran sleep"}
+            update(loaded, produced(agent_id, {**ran, **command}))
+            break
+        await asyncio.sleep(0.02)
+    await canceled.wait()
+    update(loaded, finished(agent_id, False, "[Error] Canceled by user"))
+    emit({"id": request_id, "result": {"stopReason": "cancelled"}})
 
 
 def emit(message):
@@ -276,6 +360,16 @@ async def handle(message):
                     "content": {"type": "text", "text": "historical replay"},
                 },
             )
+            if os.environ.get("FAKE_REPLAY_SUBAGENT"):
+                # The native replays a saved chat's foreground subagents in the live shapes,
+                # but each message whole, named by its saved event.
+                read = {"sessionUpdate": "tool_call", "toolCallId": "call_77", "kind": "read"}
+                report = chunk("agent_message_chunk", "The notes say hello.")
+                saved = {"cognition.ai/eventId": "45", **stamp()}
+                update(session_id, launched("9d2e41aa", False))
+                update(session_id, produced("9d2e41aa", {**read, "title": "Read notes.md"}))
+                update(session_id, produced("9d2e41aa", report, **saved))
+                update(session_id, finished("9d2e41aa", True, "Read the notes."))
         elif not os.environ.get("FAKE_SAVE_ON_PROMPT"):
             connection.execute(
                 "INSERT INTO sessions VALUES (?, ?, ?, ?, 0)",
@@ -370,6 +464,9 @@ async def handle(message):
                 },
             )
             emit({"id": message["id"], "result": {"stopReason": "end_turn"}})
+            return
+        if text == "delegate":
+            await delegate(message["id"])
             return
         if foreground is not None and text.startswith("steer"):
             foreground["steering"].append(message["id"])
@@ -471,7 +568,7 @@ async def handle(message):
             emit({"id": 101, "method": "elicitation/create", "params": {"sessionId": loaded}})
             await asyncio.sleep(0.2)
             emit({"method": "$/cancel_request", "params": {"requestId": 101}})
-        if text in {"permission", "question"}:
+        if text in {"permission", "question", "abandoned"}:
             future = asyncio.get_running_loop().create_future()
             replies[100] = future
             request = {
@@ -538,8 +635,33 @@ async def handle(message):
                         "type": "object",
                         "properties": {"approach": {"type": "string", "enum": ["one", "two"]}},
                     },
+                    "_meta": {"cognition.ai/toolCallId": "ask_user_question:0#test"},
                 }
             emit(request)
+            if text == "abandoned":
+                # As captured from CLI 3000.12.43: a steering prompt (or Stop) fails the tool
+                # call of an unanswered question card, and its request is never withdrawn.
+                emit(
+                    {
+                        "id": "question",
+                        "method": "elicitation/create",
+                        "params": {
+                            "sessionId": loaded,
+                            "mode": "form",
+                            "message": "Pick a color",
+                            "_meta": {"cognition.ai/toolCallId": "ask_user_question:0#test"},
+                        },
+                    }
+                )
+                update(
+                    loaded,
+                    {
+                        "sessionUpdate": "tool_call_update",
+                        "toolCallId": "ask_user_question:0#test",
+                        "status": "failed",
+                        "_meta": {"cognition.ai/canceled": True},
+                    },
+                )
             response = await future
             assert response["id"] == 100
             decision = {"decision": response}

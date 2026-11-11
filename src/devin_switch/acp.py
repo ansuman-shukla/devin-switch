@@ -1329,6 +1329,7 @@ class Bridge:
         read by the native as it is and leaves the note for the next prompt.
         """
         blocks, _, command = prompt_command(params)
+        # A prompt that merely starts with "/" (a path, say) only delays the note by a prompt.
         if command.startswith("/"):
             return params, {}
         try:

@@ -27,6 +27,8 @@ from devin_switch.store import SwitchError
 AGENT = "acb63708"
 # The foreground subagent of an earlier turn that the fake replays on a load.
 PAST = "9d2e41aa"
+# The foreground subagent the fake's "foreground" turn reports (FAKE_FOREGROUND_SUBAGENT).
+WORKER = "5e1f0c2a"
 # What the fake's delegate subagent says, in two messages, before its first command.
 REPLY = "I'll run the command.\n\n## Plan\nSleep, then **report**."
 STARTED = "cognition.ai/subagent_started"
@@ -254,17 +256,19 @@ def test_interrupt_stops_only_the_rows_still_active():
     assert [row(roster, agent) for agent in ("done", "failed")] == finished
     assert states(roster, "other-chat") == {"elsewhere": "running"}
 
-    # Stopped is final: nothing a later event (or interrupt, whatever its reason) changes it.
+    # Stopped is final: neither a later event nor another interrupt changes it.
     before = rows(roster)
-    roster.interrupt("chat", "the chat was reloaded")
+    roster.interrupt("chat")
     roster.apply("chat", completed("running"))
     roster.apply("chat", paused("paused", False))
     assert rows(roster) == before
+    assert states(roster, "other-chat") == {"elsewhere": "running"}
 
-    # The note says why they stopped.
-    roster.interrupt("other-chat", subagent_tab.RELOADED)
+    # Another chat's rows stop only with that chat's own native.
+    roster.interrupt("other-chat")
     elsewhere = row(roster, "elsewhere", "other-chat")
-    assert (elsewhere["status"], elsewhere["note"]) == ("stopped", "the chat was reloaded")
+    assert (elsewhere["status"], elsewhere["note"]) == ("stopped", "the agent restarted")
+    assert rows(roster) == before
 
 
 def test_forget_drops_only_that_chats_rows():
@@ -1065,39 +1069,66 @@ def native_loads(native):
 
 
 @pytest.mark.parametrize("method", ["session/load", "session/resume"])
-def test_reloading_an_idle_chat_stops_the_rows_its_native_wiped(acp_native, tmp_path, method):
+def test_reloading_an_idle_chat_leaves_its_subagents_rows_alone(
+    acp_native, tmp_path, monkeypatch, method
+):
+    """A native keeps its subagents over a load of its own chat (verified on 3000.12.43): one
+    that a Stop parked carries on with the next prompt, and finishes."""
+    gate = tmp_path / "may-finish"
+    monkeypatch.setenv("FAKE_FOREGROUND_SUBAGENT", "1")
+    monkeypatch.setenv("FAKE_SUBAGENT_GATE", str(gate))
+
     async def scenario():
         async with in_process(acp_native) as (bridge, _):
             chat, other = await new_chat(bridge, tmp_path), await new_chat(bridge, tmp_path)
             session_id, roster, server = chat.session_id, bridge.roster, bridge.side_server
             native = chat.backend
 
-            # A reload during a turn is answered from the bridge's own record: nothing is wiped.
-            turn = delegate(bridge, chat)
-            await until(lambda: states(roster, session_id) == {AGENT: "running"})
-            await bridge.dispatch(method, chat.setup)
-            assert states(roster, session_id) == {AGENT: "running"}
-            assert native_loads(acp_native) == []
-            await stop(bridge, chat, turn)
-            (failed,) = rows(roster, session_id)
-            assert failed["status"] == "failed"
+            def listed():
+                return [
+                    (item["id"], item["status"], item["note"], item["ended"])
+                    for item in rows(roster, session_id)
+                ]
 
-            # The fake's delegate turn keeps its prompt open, so an idle chat's rows are fed in.
-            for agent in ("b2", "c3"):
-                roster.apply(session_id, started(agent))
-            roster.apply(session_id, paused("c3", True))
+            # A reload during a turn is answered from the bridge's own record.
+            turn = asyncio.create_task(
+                bridge.dispatch("session/prompt", prompt_params(session_id, "foreground"))
+            )
+            await until(lambda: states(roster, session_id) == {WORKER: "running"})
+            await bridge.dispatch(method, chat.setup)
+            assert states(roster, session_id) == {WORKER: "running"}
+            assert native_loads(acp_native) == []
+            # Stop parks a foreground subagent instead of ending it.
+            await stop(bridge, chat, turn)
+            await until(lambda: states(roster, session_id) == {WORKER: "paused"})
+
+            # The fake has no subagent that works while its chat is idle, so one is fed in.
+            roster.apply(session_id, started("b2"))
             roster.apply(other.session_id, started("elsewhere"))
+            before = rows(roster, session_id)
             _, reader, writer = await request(server.port, "GET", events_url(server, session_id))
             await lines(reader, 1)
 
             await bridge.dispatch(method, chat.setup)
             assert chat.backend is native and native_loads(acp_native) == [native.process.pid]
-            assert rows(roster, session_id)[0] == failed
-            for agent in ("b2", "c3"):
-                stopped = row(roster, agent, session_id)
-                assert (stopped["status"], stopped["note"]) == ("stopped", "the chat was reloaded")
-                assert stopped["started"] <= stopped["ended"] <= time.time()
+            assert rows(roster, session_id) == before
+            assert listed() == [(WORKER, "paused", "", None), ("b2", "running", "", None)]
+            assert await quiet(reader)
+
+            # The next prompt un-pauses the parked one, and it finishes.
+            following = asyncio.create_task(
+                bridge.dispatch("session/prompt", prompt_params(session_id, "next"))
+            )
+            await until(lambda: states(roster, session_id)[WORKER] == "running")
+            assert listed() == [(WORKER, "running", "", None), ("b2", "running", "", None)]
             assert await lines(reader, 1) == [roster.snapshot(session_id)]
+            gate.touch()
+            assert await following == {"stopReason": "end_turn"}
+            done = row(roster, WORKER, session_id)
+            assert (done["status"], done["note"]) == ("done", "")
+            assert done["started"] <= done["ended"] <= time.time()
+            assert await lines(reader, 1) == [roster.snapshot(session_id)]
+            assert states(roster, session_id) == {WORKER: "done", "b2": "running"}
             assert states(roster, other.session_id) == {"elsewhere": "running"}
             writer.close()
 

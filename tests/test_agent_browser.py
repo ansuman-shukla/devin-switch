@@ -116,10 +116,12 @@ def diagnostics(store: Store) -> str:
 
 
 class Client:
+    action = "mcp"
+
     def __init__(self, store: Store, **environment: str) -> None:
         self.store = store
         self.process = subprocess.Popen(
-            (sys.executable, "-m", "devin_switch.cli", "browser", "mcp"),
+            (sys.executable, "-m", "devin_switch.cli", "browser", self.action),
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             text=True,

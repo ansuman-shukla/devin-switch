@@ -115,6 +115,9 @@ def parser() -> argparse.ArgumentParser:
     disallow = actions.add_parser("disallow", help="Take sites back from real mode")
     disallow.add_argument("sites", nargs="+", metavar="SITE", help="A host or a full address")
     actions.add_parser("sites", help="List the sites real mode may use")
+    actions.add_parser(
+        "real-mcp", help="Serve the real-browser MCP server over stdio (started by Devin)"
+    )
     chrome = commands.add_parser(
         "chrome", help="Copy from Chrome's data folder, asking with a popup when macOS blocks it"
     )

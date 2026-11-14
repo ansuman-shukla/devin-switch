@@ -59,6 +59,10 @@ TAB_USAGE = (
     'Real mode takes: tab list, tab new [<url>] [--browser "<name>"], tab select <id> for a '
     "tab it opened, and tab close [<id>]."
 )
+NO_REQUEST = (
+    "Real mode never shows a request's headers or body, because they hold the owner's cookies "
+    "and tokens. `requests` lists the requests."
+)
 STOPPED = "The Browser MCP server behind real mode stopped."
 NOTE = (
     "This is the owner's real Chrome, signed in as them, not the test browser. Use it only when "
@@ -67,7 +71,8 @@ NOTE = (
     "list` shows just those, and the owner's own tabs cannot be selected. Before paying, "
     "sending, posting, deleting or changing account settings, ask the owner, unless the task "
     "itself asked for exactly that action. If a call says the owner paused Browser MCP, stop "
-    "and wait for them. Never sign in or out. Close your tabs when the work is done."
+    "and wait for them. Never sign in or out. Never read or print cookies, tokens or "
+    "passwords. Close your tabs when the work is done."
 )
 
 
@@ -227,6 +232,8 @@ def plan(command: str, allowed: Collection[str], tabs: Sequence[str], current: s
         return visit(() if current else ("tab new",), arguments[0], allowed)
     if name == "tab":
         return tab(arguments, allowed, tabs, current)
+    if name == "request":
+        return Plan(refusal=NO_REQUEST)
     if name in FREE or (name == "browser" and arguments[:1] in (["list"], ["use"])):
         return Plan(sends=(command,))
     return Plan(sends=(command,), page=True)

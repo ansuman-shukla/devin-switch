@@ -16,7 +16,10 @@ from pathlib import Path
 
 folder = Path(os.environ["FAKE_BROWSER_MCP"])
 OWNER_TAB = 7
-COMMANDS = "goto back tab browser help get snapshot click eval screenshot upload crash".split()
+COMMANDS = (
+    "goto back tab browser help get snapshot click eval screenshot upload crash requests "
+    "request".split()
+)
 NO_TAB = (
     "There's no tab yet: use `goto <url>`, or `tab list` and `tab select <id>` to use one of "
     "the user's tabs"
@@ -147,6 +150,10 @@ def step(line: str, notes: list[str], printed: list[str], images: list[dict]) ->
             notes.append("2\u00d72 JPEG")
         elif name in ("snapshot", "eval"):
             printed.append(f"{name} of {url}")
+        elif name == "requests":
+            printed.append(f"5 GET 200 {url}/api")
+        elif name == "request":
+            printed.append("cookie: session=secret")
     target = control().get("moves", {}).get(name)
     if target and control().get("late"):
         state["late"] = (state["current"], target)

@@ -264,9 +264,12 @@ def test_tab_list_is_answered_here_with_the_chats_own_tabs(command: str) -> None
         "goto localhost:3000",
         "goto HTTPS://other.test",
         "tab new localhost:3000/x",
+        "request",
+        "request 5",
+        "request 5 --body",
     ],
 )
-def test_other_addresses_and_tab_commands_are_refused(command: str) -> None:
+def test_other_addresses_tab_commands_and_request_details_are_refused(command: str) -> None:
     decided = plan(command)
     assert decided.refusal and not decided.sends and not decided.reply
 
@@ -276,6 +279,7 @@ def test_refusals_tell_the_agent_what_the_owner_can_do() -> None:
     assert "ds browser allow other.test" in plan("tab new other.test").refusal
     assert "only http and https" in plan("goto file:///etc/hosts").refusal
     assert "not one this chat opened" in plan("tab select 7").refusal
+    assert "cookies and tokens" in plan("request 5").refusal
 
 
 @pytest.mark.parametrize(
@@ -297,6 +301,8 @@ def test_commands_that_touch_no_page_content_are_sent_as_they_are(command: str) 
         "wait 500",
         "dialog accept",
         "requests",
+        "requests --filter api",
+        "Request 5",
         "browser",
         "browser close",
         "Tab list",
@@ -398,6 +404,7 @@ def test_instructions_carry_the_real_mode_note_and_everything_else_passes_throug
 ) -> None:
     assert chat.instructions == (f"{real_browser.NOTE}\n\nUpstream instructions: act in batches.")
     assert "real Chrome" in real_browser.NOTE and "ds browser allow" in real_browser.NOTE
+    assert "Never read or print cookies, tokens or passwords" in real_browser.NOTE
     assert chat.request("tools/list")["result"] == {
         "tools": [{"name": "browser", "inputSchema": {"type": "object"}}]
     }
@@ -599,6 +606,22 @@ def test_tab_list_never_reaches_upstream_and_the_batch_goes_on(
     assert sent(upstream) == ["tab new", 'goto "https://example.com"', "get url", "get title"]
 
 
+def test_a_requests_headers_and_body_are_never_shown(
+    chat: Chat, store: Store, upstream: Path
+) -> None:
+    allow(store, "example.com")
+    chat.run("tab new example.com")
+    before = sent(upstream)
+    for command in ("request 5", "request 5 --body"):
+        assert chat.run(command) == (
+            f"✗ step 1: {command} — {real_browser.NO_REQUEST}",
+            True,
+        )
+    assert sent(upstream) == before
+    assert chat.run("requests") == ("✓ requests\n5 GET 200 https://example.com/api", False)
+    assert sent(upstream)[len(before) :] == ["get url", "requests"]
+
+
 def test_a_click_that_leaves_the_allowed_sites_stops_the_batch_and_blocks_the_tab(
     chat: Chat, store: Store, upstream: Path
 ) -> None:
@@ -727,7 +750,7 @@ def test_failures_are_numbered_by_their_place_in_the_batch(
     assert error
     assert text.split("\n")[2:] == [
         "✗ step 2: frobnicate — Unknown command frobnicate. Commands: goto, back, tab, "
-        "browser, help, get, snapshot, click, eval, screenshot, upload, crash",
+        "browser, help, get, snapshot, click, eval, screenshot, upload, crash, requests, request",
         "Step 3 not run",
     ]
     text, error = chat.run("frobnicate now\nsnapshot")

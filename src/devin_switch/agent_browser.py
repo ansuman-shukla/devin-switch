@@ -19,6 +19,7 @@ import sys
 import tempfile
 import time
 import urllib.request
+from collections.abc import AsyncIterator
 from pathlib import Path
 
 from devin_switch import browser, chrome_access, handoff
@@ -611,6 +612,69 @@ def overview(store: Store, current: browser.ChromeProfile | None = None) -> str:
     return "\n".join(lines)
 
 
+def package_command(override: str, package: tuple[str, ...]) -> tuple[list[str], dict[str, str]]:
+    """The argv and environment that run an MCP package with npx, or the argv a test set."""
+    environment = dict(os.environ)
+    if custom := os.environ.get(override):
+        return json.loads(custom), environment
+    npx = shutil.which("npx") or next(
+        (
+            path
+            for path in ("/opt/homebrew/bin/npx", "/usr/local/bin/npx")
+            if os.access(path, os.X_OK)
+        ),
+        None,
+    )
+    if npx is None:
+        raise SwitchError("npx was not found; install Node.js to use the browser MCP servers.")
+    environment["PATH"] = f"{Path(npx).parent}{os.pathsep}{environment.get('PATH', '')}"
+    return [npx, "-y", *package], environment
+
+
+def encoded(message: dict) -> bytes:
+    return json.dumps(message, separators=(",", ":")).encode() + b"\n"
+
+
+def send(message: dict) -> None:
+    """Write one JSON-RPC message to the chat."""
+    sys.stdout.buffer.write(encoded(message))
+    sys.stdout.buffer.flush()
+
+
+async def write(process: asyncio.subprocess.Process | None, message: dict) -> None:
+    """Write one JSON-RPC message to an MCP child; one that is gone gets nothing."""
+    if process is None or process.stdin is None:
+        return
+    try:
+        process.stdin.write(encoded(message))
+        await process.stdin.drain()
+    except (BrokenPipeError, ConnectionResetError):
+        pass
+
+
+def tool_result(text: str, error: bool = False) -> dict:
+    return {"content": [{"type": "text", "text": text}], "isError": error}
+
+
+async def stdin_reader() -> asyncio.StreamReader:
+    reader = asyncio.StreamReader(limit=LINE_LIMIT)
+    await asyncio.get_running_loop().connect_read_pipe(
+        lambda: asyncio.StreamReaderProtocol(reader), sys.stdin
+    )
+    return reader
+
+
+async def messages(reader: asyncio.StreamReader) -> AsyncIterator[dict]:
+    """The JSON-RPC messages on a stream of lines; anything else on it is skipped."""
+    while line := await reader.readline():
+        try:
+            message = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(message, dict):
+            yield message
+
+
 class Proxy:
     """Serve chrome-devtools-mcp to one chat, bound to the chat's chosen agent browser."""
 
@@ -643,36 +707,18 @@ class Proxy:
         return folder_for(self.store, profile.directory) / "user-data"
 
     @staticmethod
-    def send(message: dict) -> None:
-        sys.stdout.buffer.write(json.dumps(message, separators=(",", ":")).encode() + b"\n")
-        sys.stdout.buffer.flush()
-
-    def reply(self, request: dict, text: str, error: bool = False) -> None:
-        result = {"content": [{"type": "text", "text": text}], "isError": error}
-        self.send({"jsonrpc": "2.0", "id": request["id"], "result": result})
+    def reply(request: dict, text: str, error: bool = False) -> None:
+        send({"jsonrpc": "2.0", "id": request["id"], "result": tool_result(text, error)})
 
     @staticmethod
     def mcp_command(data: Path) -> tuple[list[str], dict[str, str]]:
-        environment = {
-            **os.environ,
+        base, environment = package_command(
+            "DS_BROWSER_MCP", (MCP_PACKAGE, "--no-usage-statistics", "--no-performance-crux")
+        )
+        environment |= {
             "CHROME_DEVTOOLS_MCP_NO_UPDATE_CHECKS": "1",
             "CHROME_DEVTOOLS_MCP_NO_USAGE_STATISTICS": "1",
         }
-        if custom := os.environ.get("DS_BROWSER_MCP"):
-            base = json.loads(custom)
-        else:
-            npx = shutil.which("npx") or next(
-                (
-                    path
-                    for path in ("/opt/homebrew/bin/npx", "/usr/local/bin/npx")
-                    if os.access(path, os.X_OK)
-                ),
-                None,
-            )
-            if npx is None:
-                raise SwitchError("npx was not found; install Node.js to use the agent browser.")
-            environment["PATH"] = f"{Path(npx).parent}{os.pathsep}{environment.get('PATH', '')}"
-            base = [npx, "-y", MCP_PACKAGE, "--no-usage-statistics", "--no-performance-crux"]
         # Client roots replace the temp-only default; keep temp dirs writable for evidence files.
         temporary = {Path("/tmp").resolve(), Path(tempfile.gettempdir()).resolve()}
         workspaces = [f"--workspace={path}" for path in sorted(temporary)]
@@ -694,12 +740,8 @@ class Proxy:
 
     async def read_child(self, process: asyncio.subprocess.Process, generation: int) -> None:
         assert process.stdout is not None
-        while line := await process.stdout.readline():
-            try:
-                message = json.loads(line)
-            except ValueError:
-                continue
-            if isinstance(message, dict) and generation == self.generation:
+        async for message in messages(process.stdout):
+            if generation == self.generation:
                 self.from_child(message)
         if generation == self.generation:
             self.child = None
@@ -709,7 +751,7 @@ class Proxy:
         if "method" in message:
             if "id" in message:
                 self.child_requests.add(message["id"])
-            self.send(message)
+            send(message)
             return
         key = message.get("id")
         if isinstance(key, str) and key in self.internal:
@@ -727,23 +769,14 @@ class Proxy:
             result["instructions"] = INSTRUCTIONS
         elif isinstance(result, dict) and method == "tools/list":
             result["tools"] = [*result.get("tools", []), *TOOLS]
-        self.send(message)
+        send(message)
 
     def fail(self, generation: int, text: str) -> None:
         for key, (owner, method) in tuple(self.pending.items()):
             if owner == generation:
                 del self.pending[key]
                 self.active -= method == "tools/call"
-                self.send({"jsonrpc": "2.0", "id": key, "error": {"code": -32603, "message": text}})
-
-    async def write_child(self, message: dict) -> None:
-        if self.child is None or self.child.stdin is None:
-            return
-        try:
-            self.child.stdin.write(json.dumps(message, separators=(",", ":")).encode() + b"\n")
-            await self.child.stdin.drain()
-        except (BrokenPipeError, ConnectionResetError):
-            pass
+                send({"jsonrpc": "2.0", "id": key, "error": {"code": -32603, "message": text}})
 
     async def restart(self, data: Path) -> None:
         if (old := self.child) is not None:
@@ -759,17 +792,17 @@ class Proxy:
         if self.initialize is not None:
             key = f"ds-browser-{self.generation}"
             self.internal[key] = asyncio.get_running_loop().create_future()
-            await self.write_child({**self.initialize, "id": key})
+            await write(self.child, {**self.initialize, "id": key})
             await asyncio.wait_for(self.internal[key], 60)
             if self.initialized:
-                await self.write_child({"jsonrpc": "2.0", "method": "notifications/initialized"})
+                await write(self.child, {"jsonrpc": "2.0", "method": "notifications/initialized"})
 
     async def forward(self, message: dict) -> None:
         if self.child is None:
             await self.restart(self.child_data or self.data_for(self.profile))
         self.pending[message["id"]] = (self.generation, message["method"])
         self.active += message["method"] == "tools/call"
-        await self.write_child(message)
+        await write(self.child, message)
 
     async def bind(self, profile: browser.ChromeProfile, refresh: bool = False) -> str:
         text = await asyncio.to_thread(self.lease.acquire, profile, self.headed, refresh)
@@ -829,10 +862,10 @@ class Proxy:
         if method is None:
             if message.get("id") in self.child_requests:
                 self.child_requests.discard(message["id"])
-                await self.write_child(message)
+                await write(self.child, message)
         elif "id" not in message:
             self.initialized |= method == "notifications/initialized"
-            await self.write_child(message)
+            await write(self.child, message)
         elif method == "tools/call":
             self.background(self.call(message))
         else:
@@ -849,9 +882,7 @@ class Proxy:
                     self.lease.release()
 
     async def run(self) -> None:
-        loop = asyncio.get_running_loop()
-        reader = asyncio.StreamReader(limit=LINE_LIMIT)
-        await loop.connect_read_pipe(lambda: asyncio.StreamReaderProtocol(reader), sys.stdin)
+        reader = await stdin_reader()
         try:
             default = await asyncio.to_thread(default_profile, self.store)
         except SwitchError:
@@ -859,13 +890,8 @@ class Proxy:
         await self.spawn(self.data_for(default))
         expiry = asyncio.create_task(self.expire())
         try:
-            while line := await reader.readline():
-                try:
-                    message = json.loads(line)
-                except ValueError:
-                    continue
-                if isinstance(message, dict):
-                    await self.from_client(message)
+            async for message in messages(reader):
+                await self.from_client(message)
         finally:
             expiry.cancel()
             self.lease.release()

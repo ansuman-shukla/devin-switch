@@ -492,6 +492,37 @@ def contents(data: Path) -> dict[str, bytes]:
     }
 
 
+def test_mcp_child_is_the_pinned_package_run_through_the_npx_that_was_found(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("DS_BROWSER_MCP", raising=False)
+    monkeypatch.setenv("PATH", "/usr/bin")
+    monkeypatch.setattr(agent_browser.shutil, "which", lambda name: f"/opt/node/bin/{name}")
+    command, environment = agent_browser.Proxy.mcp_command(Path("/data"))
+    assert command[:7] == [
+        "/opt/node/bin/npx",
+        "-y",
+        "chrome-devtools-mcp@1.10.1",
+        "--no-usage-statistics",
+        "--no-performance-crux",
+        "--autoConnect",
+        "--userDataDir=/data",
+    ]
+    assert all(argument.startswith("--workspace=") for argument in command[7:])
+    assert environment["PATH"] == "/opt/node/bin:/usr/bin"
+    assert environment["CHROME_DEVTOOLS_MCP_NO_UPDATE_CHECKS"] == "1"
+    assert environment["CHROME_DEVTOOLS_MCP_NO_USAGE_STATISTICS"] == "1"
+
+    monkeypatch.setattr(agent_browser.shutil, "which", lambda name: None)
+    monkeypatch.setattr(agent_browser.os, "access", lambda path, mode: False)
+    with pytest.raises(SwitchError, match="npx was not found"):
+        agent_browser.Proxy.mcp_command(Path("/data"))
+
+    monkeypatch.setenv("DS_BROWSER_MCP", json.dumps(["fake-server", "--flag"]))
+    command, _ = agent_browser.Proxy.mcp_command(Path("/data"))
+    assert command[:4] == ["fake-server", "--flag", "--autoConnect", "--userDataDir=/data"]
+
+
 def test_chrome_starts_with_capped_web_and_media_caches(tmp_path: Path) -> None:
     assert agent_browser.DISK_CACHE_LIMIT == agent_browser.MEDIA_CACHE_LIMIT == 104857600
     for headed in (False, True):

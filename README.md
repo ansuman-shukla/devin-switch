@@ -394,15 +394,18 @@ Changes apply to open chats at their next browser call. Under that list, real mo
 - reads and acts only while the tab is on an allowed site. If a link or redirect leaves the
   allowed sites, the agent's batch stops there, and the tab stays closed to it until it goes
   back, closes the tab, or you allow the site;
-- never lists your tabs and switches only to tabs the chat opened itself. A tab that a page
-  opens by itself (a pop-up) can't be used yet.
+- works only in tabs the chat opened itself. Its `tab list` shows just those, and your own
+  tabs are never listed or selected. A tab that a page opens by itself (a pop-up) can't be
+  used yet;
+- never shows a request's headers or body (`request <id>`), because they would put your
+  cookies and tokens into the chat's history. The list of requests (`requests`) still works.
 
 Agents are told to ask you before paying, sending, posting, deleting or changing account
-settings unless the task asked for exactly that, and never to sign in or out. That is an
-instruction, not a lock: the locks are the site list and **Stop**. Unattended jobs can use real
-mode too and run without permission prompts, so allow only sites you are comfortable with.
-Click **Stop** in the extension whenever you want agents out of your Chrome; calls then tell the
-agent to wait until you click **Resume**.
+settings unless the task asked for exactly that, never to sign in or out, and never to read or
+print cookies, tokens or passwords. That is an instruction, not a lock: the locks are the site
+list and **Stop**. Unattended jobs can use real mode too and run without permission prompts,
+so allow only sites you are comfortable with. Click **Stop** in the extension whenever you
+want agents out of your Chrome; calls then tell the agent to wait until you click **Resume**.
 
 The server runs `npx -y @browsermcp/mcp@2.4.0`, so Node.js is required.
 

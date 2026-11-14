@@ -402,7 +402,11 @@ def control(upstream: Path, **settings: object) -> None:
 def test_instructions_carry_the_real_mode_note_and_everything_else_passes_through(
     chat: Chat, upstream: Path
 ) -> None:
-    assert chat.instructions == (f"{real_browser.NOTE}\n\nUpstream instructions: act in batches.")
+    assert chat.instructions == (
+        f"{real_browser.note([])}\n\nUpstream instructions: act in batches."
+    )
+    assert real_browser.note([]).startswith(real_browser.NOTE)
+    assert "No site was allowed when this chat started." in chat.instructions
     assert "real Chrome" in real_browser.NOTE and "ds browser allow" in real_browser.NOTE
     assert "Never read or print cookies, tokens or passwords" in real_browser.NOTE
     assert chat.request("tools/list")["result"] == {
@@ -412,6 +416,21 @@ def test_instructions_carry_the_real_mode_note_and_everything_else_passes_throug
     assert (upstream / "notifications").read_text() == "notifications/initialized\n"
     text, error = chat.run("upload report.pdf")
     assert not error and text == "✓ upload report.pdf\nroot file:///work"
+
+
+def test_instructions_name_the_sites_allowed_when_the_chat_started(
+    store: Store, upstream: Path
+) -> None:
+    allow(store, "example.com", "example.org")
+    client = Chat(store)
+    try:
+        assert (
+            "Sites allowed when this chat started: example.com, example.org (their subdomains "
+            "too). `ds browser sites` shows the list as it is now.\n\nUpstream instructions"
+        ) in client.instructions
+        assert "No site was allowed" not in client.instructions
+    finally:
+        client.close()
 
 
 def test_addresses_off_the_allowlist_never_reach_the_browser(

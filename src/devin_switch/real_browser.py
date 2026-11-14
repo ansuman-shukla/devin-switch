@@ -99,6 +99,16 @@ def sites(store: Store) -> list[str]:
     return [site for site in value if isinstance(site, str)] if isinstance(value, list) else []
 
 
+def note(allowed: Sequence[str]) -> str:
+    """The real-mode note for a new chat, naming the sites it may use so every agent knows."""
+    listed = (
+        f"Sites allowed when this chat started: {', '.join(allowed)} (their subdomains too)."
+        if allowed
+        else "No site was allowed when this chat started."
+    )
+    return f"{NOTE} {listed} `ds browser sites` shows the list as it is now."
+
+
 def named_site(value: str) -> str:
     """The host the owner named, given as a host or as a full address."""
     text = value.strip()
@@ -441,8 +451,8 @@ class Proxy:
         elif self.pending.pop(key, None) == "initialize":
             result = message.get("result")
             if isinstance(result, dict):
-                upstream = result.get("instructions")
-                result["instructions"] = f"{NOTE}\n\n{upstream}" if upstream else NOTE
+                head, upstream = note(sites(self.store)), result.get("instructions")
+                result["instructions"] = f"{head}\n\n{upstream}" if upstream else head
         send(message)
 
     def fail(self) -> None:

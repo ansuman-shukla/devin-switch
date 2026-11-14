@@ -388,7 +388,9 @@ ds browser sites                   # what is allowed now
 ds browser disallow example.com
 ```
 
-Changes apply to open chats at their next browser call. Under that list, real mode:
+Changes apply to open chats at their next browser call, and the server tells each new chat
+which sites are allowed, so agents know where they may use real mode. Under that list, real
+mode:
 
 - opens only allowed sites (and blank tabs), and only `http` and `https` pages;
 - reads and acts only while the tab is on an allowed site. If a link or redirect leaves the

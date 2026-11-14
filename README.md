@@ -310,6 +310,10 @@ The test browser never attaches to the Chrome you are using:
 - **Headless by default.** No window, no Dock icon and no focus change. Snapshots and
   screenshots still render the full UI at 1440×900. The agent can ask for a visible window,
   opened in the background, when you want to watch.
+- **Its own copy of the Chrome app.** The test browser runs from a copy of Chrome that Switch
+  keeps in its own folder, so the Chrome icon in the Dock and links you click in other apps
+  always open your Chrome, never the hidden one. The copy shares its disk space with the
+  installed Chrome, and Switch makes a new one after Chrome updates.
 - **No "Allow remote debugging" prompts.** Chrome is started with its own debugging port.
 - **Profiles on the fly.** Agents call `browser_profile` with an email, a profile name or a
   directory. Without one, a chat uses the default profile. Each chat stays bound to its
@@ -636,6 +640,7 @@ acp/sessions/
 acp/requests/
 acp/lifecycle/
 browser/profiles/<profile>/user-data/
+browser/app/<Chrome version>/Google Chrome.app
 browser/settings.json
 launchers/
 selected

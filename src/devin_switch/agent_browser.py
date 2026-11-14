@@ -11,6 +11,7 @@ import asyncio
 import fcntl
 import json
 import os
+import plistlib
 import re
 import shutil
 import signal
@@ -21,6 +22,7 @@ import time
 import urllib.request
 from collections.abc import AsyncIterator
 from pathlib import Path
+from xml.parsers.expat import ExpatError
 
 from devin_switch import browser, chrome_access, handoff
 from devin_switch.executable import command_prefix
@@ -71,6 +73,9 @@ BROWSER_CACHES = (
     "ShaderCache",
 )
 TRIM_MARKER = "browser-trimmed.json"
+CHROME_BINARY = "Contents/MacOS/Google Chrome"
+# A version names its app copy's folder.
+APP_VERSION = re.compile(r"[0-9]+(\.[0-9]+)*")
 LINE_LIMIT = 256 * 1024 * 1024
 LOCAL = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 INSTRUCTIONS = (
@@ -331,10 +336,60 @@ def stop(current: dict) -> None:
         time.sleep(0.1)
 
 
-def chrome_command(data: Path, headed: bool) -> list[str]:
-    executable = os.environ.get("DS_BROWSER_CHROME") or str(
-        browser.CHROME_APP / "Contents/MacOS/Google Chrome"
-    )
+def app_version(app: Path) -> str:
+    if not app.is_dir():
+        raise SwitchError("Google Chrome is not installed in /Applications.")
+    try:
+        with open(app / "Contents/Info.plist", "rb") as source:
+            version = plistlib.load(source)["CFBundleShortVersionString"]
+    except (OSError, ValueError, ExpatError, KeyError, TypeError) as exc:
+        raise SwitchError("Google Chrome's version could not be read.") from exc
+    if not isinstance(version, str) or not APP_VERSION.fullmatch(version):
+        raise SwitchError(f"Google Chrome has an unexpected version: {version!r}.")
+    return version
+
+
+def same_volume(first: Path, second: Path) -> bool:
+    return first.stat().st_dev == second.stat().st_dev
+
+
+def chrome_app(store: Store) -> Path:
+    """The Chrome app the agent browser runs from: Switch's own clone of the installed one.
+
+    LaunchServices tells running apps apart by bundle path alone and sends Dock clicks and
+    opened links to the instance of a path that started first. An agent Chrome run from
+    /Applications therefore takes them from the owner's Chrome whenever it started first.
+    """
+    installed = browser.CHROME_APP
+    version = app_version(installed)
+    folder = store.root / "browser" / "app"
+    for path in (folder.parent, folder):
+        private_directory(path)
+    if not same_volume(installed, folder):
+        # Across volumes `cp -c` silently makes a full 2 GB copy instead of a clone.
+        return installed
+    copy = folder / version / installed.name
+    if not copy.is_dir():
+        # Cloned aside and renamed into place, so a half-made copy is never run.
+        staging = Path(tempfile.mkdtemp(prefix=f"staging-{os.getpid()}-", dir=folder))
+        try:
+            subprocess.run(
+                ("/bin/cp", "-c", "-R", str(installed), str(staging / installed.name)),
+                check=True,
+                timeout=120,
+            )
+            try:
+                os.rename(staging, copy.parent)
+            except OSError:
+                # Another supervisor finished the same copy first: run from that one.
+                if not copy.is_dir():
+                    raise
+        finally:
+            shutil.rmtree(staging, ignore_errors=True)
+    return copy
+
+
+def chrome_command(executable: str, data: Path, headed: bool) -> list[str]:
     window = () if headed else ("--headless=new", "--window-size=1440,900")
     return [
         executable,
@@ -370,13 +425,18 @@ def chrome_pid(data: Path) -> int | None:
     return None
 
 
-def launch(data: Path, headed: bool) -> int:
-    command = chrome_command(data, headed)
-    if not headed or os.environ.get("DS_BROWSER_CHROME"):
+def launch(store: Store, data: Path, headed: bool) -> int:
+    if override := os.environ.get("DS_BROWSER_CHROME"):
+        # A test's fake Chrome runs as it is, with no app copy.
+        command = chrome_command(override, data, headed)
+        return subprocess.Popen(command, stdin=subprocess.DEVNULL).pid
+    app = chrome_app(store)
+    command = chrome_command(str(app / CHROME_BINARY), data, headed)
+    if not headed:
         return subprocess.Popen(command, stdin=subprocess.DEVNULL).pid
     # LaunchServices with -g opens the window without activating Chrome.
     subprocess.run(
-        ("/usr/bin/open", "-g", "-n", "-a", str(browser.CHROME_APP), "--args", *command[1:]),
+        ("/usr/bin/open", "-g", "-n", "-a", str(app), "--args", *command[1:]),
         check=True,
         timeout=15,
     )
@@ -462,7 +522,7 @@ def supervise(store: Store, directory: str, headed: bool, token: str) -> None:
     pid = chrome_pid(data)
     if pid is None:
         (data / "DevToolsActivePort").unlink(missing_ok=True)
-        pid = launch(data, headed)
+        pid = launch(store, data, headed)
     write_json(
         folder / "state.json",
         {"supervisor": os.getpid(), "chrome": pid, "headed": headed, "token": token},

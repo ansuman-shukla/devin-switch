@@ -1,7 +1,9 @@
 import fcntl
 import json
 import os
+import plistlib
 import queue
+import shutil
 import stat
 import subprocess
 import sys
@@ -555,15 +557,16 @@ def test_mcp_child_is_the_pinned_package_run_through_the_npx_that_was_found(
 def test_chrome_starts_with_capped_web_and_media_caches(tmp_path: Path) -> None:
     assert agent_browser.DISK_CACHE_LIMIT == agent_browser.MEDIA_CACHE_LIMIT == 104857600
     for headed in (False, True):
-        command = agent_browser.chrome_command(tmp_path, headed)
+        command = agent_browser.chrome_command("chrome", tmp_path, headed)
         assert "--disk-cache-size=104857600" in command
         assert "--media-cache-size=104857600" in command
-        assert command[-1] == "about:blank" and f"--user-data-dir={tmp_path}" in command
+        assert command[0] == "chrome" and command[-1] == "about:blank"
+        assert f"--user-data-dir={tmp_path}" in command
 
 
 def test_chrome_never_registers_its_own_path_with_chromes_updater(tmp_path: Path) -> None:
     for headed in (False, True):
-        command = agent_browser.chrome_command(tmp_path, headed)
+        command = agent_browser.chrome_command("chrome", tmp_path, headed)
         assert "--disable-updater-scheduler" in command[1:-1]
         assert ("--headless=new" in command) is not headed
 
@@ -659,7 +662,8 @@ def test_daily_sweep_trims_only_idle_profile_copies(store: Store, fakes: None) -
     chat = os.open(leased.parent / "lease.lock", os.O_RDWR | os.O_CREAT, 0o600)
     fcntl.flock(chat, fcntl.LOCK_SH)
     running = subprocess.Popen(
-        agent_browser.chrome_command(open_copy, False), stdin=subprocess.DEVNULL
+        agent_browser.chrome_command(os.environ["DS_BROWSER_CHROME"], open_copy, False),
+        stdin=subprocess.DEVNULL,
     )
     try:
         wait_until(lambda: agent_browser.chrome_pid(open_copy) == running.pid)
@@ -692,3 +696,237 @@ def test_daily_sweep_trims_only_idle_profile_copies(store: Store, fakes: None) -
         assert not set(contents(data)) & set(CACHES)
     assert contents(idle) == logins
     assert contents(leased)["Default/Cookies"] == expected["Profile 7"]["Default/Cookies"]
+
+
+BINARY = "Contents/MacOS/Google Chrome"
+
+
+def install_chrome(app: Path, version: object) -> None:
+    """Stand in for an installed Chrome app: its version and an executable fake Chrome."""
+    (app / BINARY).parent.mkdir(parents=True, exist_ok=True)
+    (app / "Contents/Info.plist").write_bytes(
+        plistlib.dumps({"CFBundleShortVersionString": version, "CFBundleVersion": "9999.1"})
+    )
+    (app / BINARY).write_text(f"#!{sys.executable}\n{FAKE_CHROME}")
+    (app / BINARY).chmod(0o755)
+
+
+@pytest.fixture
+def installed(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    app = tmp_path / "Applications/Google Chrome.app"
+    install_chrome(app, "150.0.1.2")
+    (app / "Contents/Frameworks/Versions/150").mkdir(parents=True)
+    (app / "Contents/Frameworks/Versions/Current").symlink_to("150")
+    monkeypatch.setattr(browser, "CHROME_APP", app)
+    monkeypatch.delenv("DS_BROWSER_CHROME", raising=False)
+    return app
+
+
+@pytest.fixture
+def commands(monkeypatch: pytest.MonkeyPatch) -> list[tuple[str, ...]]:
+    """What `subprocess.run` was asked to run.
+
+    `open` is never run for real: like LaunchServices, its stand-in starts the executable
+    of the app it was given.
+    """
+    seen: list[tuple[str, ...]] = []
+    real = subprocess.run
+
+    def run(argv, **options):
+        seen.append(tuple(argv))
+        if argv[0] != "/usr/bin/open":
+            return real(argv, **options)
+        app, arguments = argv[argv.index("-a") + 1], argv[argv.index("--args") + 1 :]
+        subprocess.Popen([f"{app}/{BINARY}", *arguments], stdin=subprocess.DEVNULL)
+        return subprocess.CompletedProcess(argv, 0)
+
+    monkeypatch.setattr(subprocess, "run", run)
+    return seen
+
+
+def ran(commands: list[tuple[str, ...]], executable: str) -> list[tuple[str, ...]]:
+    return [argv for argv in commands if argv[0] == executable]
+
+
+def command_line(pid: int) -> str:
+    listing = subprocess.run(
+        ("/bin/ps", "-ww", "-o", "command=", "-p", str(pid)),
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    return listing.stdout.strip()
+
+
+def started(store: Store, name: str, headed: bool) -> tuple[Path, str, list[str]]:
+    """Launch the agent Chrome; its data folder, its process's command line, its arguments."""
+    data = store.root / name
+    data.mkdir(parents=True)
+    pid = agent_browser.launch(store, data, headed)
+    try:
+        wait_until(lambda: (data / "DevToolsActivePort").exists())
+        return data, command_line(pid), (data / "launches").read_text().split()
+    finally:
+        agent_browser.terminate(pid)
+
+
+def names(folder: Path) -> list[str]:
+    return sorted(path.name for path in folder.iterdir())
+
+
+@pytest.mark.parametrize("headed", [False, True])
+def test_agent_chrome_does_not_take_dock_clicks_and_links_from_the_owners_chrome(
+    store: Store, installed: Path, commands: list, headed: bool
+) -> None:
+    """macOS sends Dock clicks and opened links to the instance of an app path that started
+    first, so the agent Chrome must never run from the path of the owner's Chrome (#76)."""
+    copy = store.root / "browser/app/150.0.1.2/Google Chrome.app"
+
+    data, process, arguments = started(store, "data", headed)
+
+    assert f"{copy}/{BINARY} --user-data-dir={data} " in process
+    assert str(installed) not in process
+    assert "--disable-updater-scheduler" in arguments
+    assert ("--headless=new" in arguments) is not headed
+    asked = [("/usr/bin/open", "-g", "-n", "-a", str(copy), "--args", *arguments)]
+    assert ran(commands, "/usr/bin/open") == (asked if headed else [])
+
+
+def test_app_copy_is_whole_and_made_once_for_a_version(
+    store: Store, installed: Path, commands: list
+) -> None:
+    copy = agent_browser.chrome_app(store)
+
+    assert copy == store.root / "browser/app/150.0.1.2/Google Chrome.app"
+    for name in ("Contents/Info.plist", BINARY):
+        assert (copy / name).read_bytes() == (installed / name).read_bytes()
+    assert stat.S_IMODE((copy / BINARY).stat().st_mode) == 0o755
+    assert os.readlink(copy / "Contents/Frameworks/Versions/Current") == "150"
+    assert names(copy.parent.parent) == ["150.0.1.2"]
+    # A clone, which shares the installed app's blocks, not a 2 GB copy.
+    assert [argv[:4] for argv in commands] == [("/bin/cp", "-c", "-R", str(installed))]
+
+    (copy / "marker").write_text("first copy")
+    assert agent_browser.chrome_app(store) == copy
+    assert (copy / "marker").read_text() == "first copy"
+    # Starting from an existing copy clones nothing again.
+    assert len(commands) == 1
+    assert names(installed) == ["Contents"]
+
+
+def test_app_copy_another_supervisor_finished_meanwhile_is_the_one_used(
+    store: Store, installed: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    theirs = store.root / "browser/app/150.0.1.2/Google Chrome.app"
+    real = subprocess.run
+
+    def run(argv, **options):
+        result = real(argv, **options)
+        if argv[0] == "/bin/cp":
+            shutil.copytree(installed, theirs, symlinks=True)
+            (theirs / "theirs").write_text("finished first")
+        return result
+
+    monkeypatch.setattr(subprocess, "run", run)
+    assert agent_browser.chrome_app(store) == theirs
+    assert (theirs / "theirs").read_text() == "finished first"
+    assert names(store.root / "browser/app") == ["150.0.1.2"]
+
+
+def test_half_made_app_copy_is_never_used(store: Store, installed: Path) -> None:
+    apps = store.root / "browser/app"
+    unreadable = installed / "Contents/Resources/unreadable"
+    unreadable.parent.mkdir()
+    unreadable.write_text("cp stops here")
+    unreadable.chmod(0)
+    try:
+        with pytest.raises(subprocess.CalledProcessError):
+            agent_browser.chrome_app(store)
+        assert names(apps) == []
+    finally:
+        unreadable.chmod(0o600)
+    assert agent_browser.chrome_app(store) == apps / "150.0.1.2/Google Chrome.app"
+    assert (apps / "150.0.1.2/Google Chrome.app/Contents/Resources/unreadable").is_file()
+
+
+def test_failed_rename_into_place_is_an_error_unless_the_copy_exists(
+    store: Store, installed: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def rename(source, target):
+        raise PermissionError("no rename")
+
+    monkeypatch.setattr(os, "rename", rename)
+    with pytest.raises(PermissionError, match="no rename"):
+        agent_browser.chrome_app(store)
+    assert names(store.root / "browser/app") == []
+
+
+def test_installed_app_on_another_volume_is_run_in_place_and_never_copied(
+    store: Store, installed: Path, commands: list, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    assert agent_browser.same_volume(installed, store.root)
+    assert not agent_browser.same_volume(installed, Path("/dev"))
+    compared = []
+    monkeypatch.setattr(agent_browser, "same_volume", lambda *paths: bool(compared.append(paths)))
+
+    assert agent_browser.chrome_app(store) == installed
+    assert compared == [(installed, store.root / "browser/app")]
+    _, process, arguments = started(store, "data", False)
+
+    assert f"{installed}/{BINARY} --user-data-dir=" in process
+    assert "--disable-updater-scheduler" in arguments
+    assert names(store.root / "browser/app") == []
+    assert ran(commands, "/bin/cp") == []
+
+
+@pytest.mark.parametrize(
+    "version",
+    ["150/../../outside", "../150", "/150", "150.0 beta", "v150", "150.", ".150", "1..2"]
+    + ["..", ".", "", "150\n", "150.0.1.2 ", 150],
+)
+def test_chrome_version_that_is_not_plain_digits_and_dots_is_refused(
+    store: Store, installed: Path, version: object
+) -> None:
+    install_chrome(installed, version)
+    with pytest.raises(SwitchError, match="unexpected version"):
+        agent_browser.chrome_app(store)
+    assert not (store.root / "browser/app").exists()
+
+
+def test_missing_chrome_or_unreadable_version_is_reported(store: Store, installed: Path) -> None:
+    unversioned = plistlib.dumps({"CFBundleVersion": "150.0.1.2"})
+    for content in (unversioned, plistlib.dumps(["150.0.1.2"]), b"<plist>", b"junk", None):
+        if content is None:
+            (installed / "Contents/Info.plist").unlink()
+        else:
+            (installed / "Contents/Info.plist").write_bytes(content)
+        with pytest.raises(SwitchError, match="version could not be read"):
+            agent_browser.chrome_app(store)
+    shutil.rmtree(installed)
+    for headed in (False, True):
+        with pytest.raises(SwitchError, match="Google Chrome is not installed in /Applications"):
+            agent_browser.launch(store, store.root / "data", headed)
+    assert not (store.root / "browser/app").exists()
+
+
+@pytest.mark.parametrize("headed", [False, True])
+def test_test_override_chrome_runs_as_it_is_and_nothing_is_copied(
+    store: Store,
+    tmp_path: Path,
+    commands: list,
+    monkeypatch: pytest.MonkeyPatch,
+    headed: bool,
+) -> None:
+    override = tmp_path / "fake-chrome"
+    override.write_text(f"#!{sys.executable}\n{FAKE_CHROME}")
+    override.chmod(0o700)
+    monkeypatch.setenv("DS_BROWSER_CHROME", str(override))
+    # Not even looked at.
+    monkeypatch.setattr(browser, "CHROME_APP", tmp_path / "missing/Google Chrome.app")
+
+    data, process, arguments = started(store, "data", headed)
+
+    assert f"{override} --user-data-dir={data} " in process
+    assert ("--headless=new" in arguments) is not headed
+    assert not (store.root / "browser").exists()
+    assert ran(commands, "/bin/cp") == ran(commands, "/usr/bin/open") == []

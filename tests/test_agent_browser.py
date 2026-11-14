@@ -223,8 +223,12 @@ def test_append_member_keeps_comments_and_handles_missing_or_null_members() -> N
         handoff.append_member('{"permissions": {"allow": "x"}}', ("permissions", "allow"), "y")
 
 
-def test_install_registers_server_permissions_and_default_idempotently(
-    store: Store, chrome: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+def test_install_registers_both_servers_permissions_and_default_idempotently(
+    store: Store,
+    chrome: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture,
 ) -> None:
     user = tmp_path / "user-config"
     (user / "devin").mkdir(parents=True)
@@ -252,25 +256,48 @@ def test_install_registers_server_permissions_and_default_idempotently(
 
     args = cli.parser().parse_args(["browser", "install", "--default", "ansuman@example.invalid"])
     assert cli.execute(args, store) == 0
+    summary = capsys.readouterr().out
+    assert "'browser' and 'real-browser' MCP servers" in summary
+    assert "mcp__browser__* and mcp__real-browser__*" in summary
+    assert "ds browser allow SITE" in summary
     entry = json.loads(shared.read_text())["mcpServers"]
-    assert entry["browser"]["args"][-2:] == ["browser", "mcp"]
+    assert set(entry) == {"chrome-devtools", "browser", "real-browser"}
     assert entry["chrome-devtools"] == {"args": ["x"]}
     user_servers = json.loads((user / "devin/mcp_config.json").read_text())["mcpServers"]
-    assert set(user_servers) == {"logfire", "browser"}
+    assert set(user_servers) == {"logfire", "browser", "real-browser"}
+    prefix = agent_browser.command_prefix()
+    for servers in (entry, user_servers):
+        assert servers["browser"] == {
+            "command": prefix[0],
+            "args": [*prefix[1:], "browser", "mcp"],
+        }
+        assert servers["real-browser"] == {
+            "command": prefix[0],
+            "args": [*prefix[1:], "browser", "real-mcp"],
+        }
     assert "// mine" in config.read_text()
-    for path in (config, store.directory(second.name) / "config/devin/config.json"):
+    permissions = ["mcp__browser__*", "mcp__real-browser__*"]
+    for path in (
+        config,
+        store.directory(second.name) / "config/devin/config.json",
+        user / "devin/config.json",
+    ):
         allowed = json.loads(handoff.json_source(path.read_text()))["permissions"]["allow"]
-        assert allowed == [agent_browser.PERMISSION]
+        assert sorted(allowed) == permissions
     assert agent_browser.default_profile(store).directory == "Profile 3"
-    snapshot = {path: path.read_text() for path in (config, shared, user / "devin/config.json")}
+    snapshot = {
+        path: path.read_text()
+        for path in (config, shared, user / "devin/config.json", user / "devin/mcp_config.json")
+    }
     assert cli.execute(args, store) == 0
     assert snapshot == {path: path.read_text() for path in snapshot}
+    assert not list(shared.parent.glob("mcp_config.json.superseded-*"))
 
     with store.lock():
         pass
     assert cli.execute(cli.parser().parse_args(["add", "ansuman-3"]), store) == 0
     added = store.directory("ansuman-3") / "config/devin/config.json"
-    assert agent_browser.PERMISSION in json.loads(added.read_text())["permissions"]["allow"]
+    assert sorted(json.loads(added.read_text())["permissions"]["allow"]) == permissions
 
 
 def test_chats_share_one_headless_instance_that_closes_after_the_last_release(

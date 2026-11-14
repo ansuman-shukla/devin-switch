@@ -35,8 +35,10 @@ from devin_switch.store import (
     write_json,
 )
 
-SERVER = "browser"
-PERMISSION = f"mcp__{SERVER}__*"
+# Each MCP server with the `ds browser` action that serves it: the agent-owned test Chrome,
+# and real mode in the owner's own Chrome (real_browser.py).
+SERVERS = {"browser": "mcp", "real-browser": "real-mcp"}
+PERMISSIONS = tuple(f"mcp__{name}__*" for name in SERVERS)
 MCP_PACKAGE = "chrome-devtools-mcp@1.10.1"
 CLONED = (
     "Cookies",
@@ -899,8 +901,8 @@ class Proxy:
                 self.child.stdin.close()
 
 
-def register(path: Path, entry: dict) -> list[str]:
-    """Set the browser server in an MCP config, replacing chrome-devtools-mcp entries."""
+def register(path: Path, entries: dict[str, dict]) -> list[str]:
+    """Set the browser servers in an MCP config, replacing chrome-devtools-mcp entries."""
     path = path.resolve()
     original = path.read_text() if path.exists() else None
     try:
@@ -913,12 +915,12 @@ def register(path: Path, entry: dict) -> list[str]:
     replaced = [
         name
         for name, value in servers.items()
-        if name != SERVER
+        if name not in entries
         and isinstance(value, dict)
         and any("chrome-devtools-mcp" in str(item) for item in value.get("args", []))
     ]
     servers = {name: value for name, value in servers.items() if name not in replaced}
-    updated = {**current, "mcpServers": {**servers, SERVER: entry}}
+    updated = {**current, "mcpServers": {**servers, **entries}}
     if updated != current:
         if original is not None and json_source(original) != original:
             shutil.copy2(path, path.with_name(f"{path.name}.superseded-{time.time_ns()}"))
@@ -927,23 +929,27 @@ def register(path: Path, entry: dict) -> list[str]:
     return replaced
 
 
+def allow_tools(config: Path) -> None:
+    for permission in PERMISSIONS:
+        handoff.extend_config(config, ("permissions", "allow"), permission)
+
+
 def grant(store: Store, account: Account) -> None:
-    handoff.extend_config(
-        store.directory(account.name) / "config/devin/config.json",
-        ("permissions", "allow"),
-        PERMISSION,
-    )
+    allow_tools(store.directory(account.name) / "config/devin/config.json")
 
 
 def install(store: Store, default: str | None) -> str:
     chosen = resolve(store, default) if default else None
     prefix = command_prefix()
-    entry = {"command": prefix[0], "args": [*prefix[1:], "browser", "mcp"]}
+    entries = {
+        name: {"command": prefix[0], "args": [*prefix[1:], "browser", action]}
+        for name, action in SERVERS.items()
+    }
     user = user_config_home(store) / "devin"
     with store.lock("mcp.lock", timeout=5):
-        replaced = register(store.root / "shared/config/mcp_config.json", entry)
-    replaced += register(user / "mcp_config.json", entry)
-    handoff.extend_config(user / "config.json", ("permissions", "allow"), PERMISSION)
+        replaced = register(store.root / "shared/config/mcp_config.json", entries)
+    replaced += register(user / "mcp_config.json", entries)
+    allow_tools(user / "config.json")
     skipped = []
     for account in store.accounts():
         try:
@@ -951,9 +957,10 @@ def install(store: Store, default: str | None) -> str:
         except SwitchError:
             skipped.append(account.name)
     save_settings(store, installed=True, **({"default": chosen.directory} if chosen else {}))
+    names = " and ".join(repr(name) for name in SERVERS)
     lines = [
-        f"Registered the {SERVER!r} MCP server for Switch chats and {user / 'mcp_config.json'}.",
-        f"Allowed {PERMISSION} for every saved login and the user config.",
+        f"Registered the {names} MCP servers for Switch chats and {user / 'mcp_config.json'}.",
+        f"Allowed {' and '.join(PERMISSIONS)} for every saved login and the user config.",
     ]
     if replaced:
         lines.append(
@@ -967,7 +974,11 @@ def install(store: Store, default: str | None) -> str:
         if current
         else "No default profile; set one with: ds browser default PROFILE"
     )
-    lines.append("Restart open chats (or Desktop) so they load the server.")
+    lines.append(
+        "'real-browser' is real mode: your own Chrome through the Browser MCP extension, only "
+        "on sites you allow with: ds browser allow SITE"
+    )
+    lines.append("Restart open chats (or Desktop) so they load the servers.")
     return "\n".join(lines)
 
 

@@ -12,7 +12,7 @@ policy first: only allowed sites are opened, read or acted on, and only in tabs 
 import asyncio
 import json
 import re
-from collections.abc import Collection
+from collections.abc import Collection, Sequence
 from dataclasses import dataclass, field
 
 from devin_switch.agent_browser import (
@@ -54,19 +54,20 @@ FIRST_STEP = re.compile(r"^✗ step 1:", re.MULTILINE)
 NOTHING_RAN = "Nothing ran: fix this line and send the call again"
 NO_SITES = "No site is allowed yet, so real mode opens nothing. Add one: ds browser allow SITE"
 OWN_TABS = "Real mode works only in tabs it opened, never in the owner's own tabs."
+NOT_LISTED = "The owner's own tabs are never listed."
 TAB_USAGE = (
-    'Real mode takes: tab new [<url>] [--browser "<name>"], tab select <id> for a tab it '
-    "opened, and tab close [<id>]."
+    'Real mode takes: tab list, tab new [<url>] [--browser "<name>"], tab select <id> for a '
+    "tab it opened, and tab close [<id>]."
 )
 STOPPED = "The Browser MCP server behind real mode stopped."
 NOTE = (
     "This is the owner's real Chrome, signed in as them, not the test browser. Use it only when "
     "the task says to use the real browser or needs a site the test browser cannot do. It works "
     "only on sites the owner allowed (`ds browser allow SITE`) and only in tabs you open: `tab "
-    "list` and the owner's own tabs are refused. Before paying, sending, posting, deleting or "
-    "changing account settings, ask the owner, unless the task itself asked for exactly that "
-    "action. If a call says the owner paused Browser MCP, stop and wait for them. Never sign in "
-    "or out. Close your tabs when the work is done."
+    "list` shows just those, and the owner's own tabs cannot be selected. Before paying, "
+    "sending, posting, deleting or changing account settings, ask the owner, unless the task "
+    "itself asked for exactly that action. If a call says the owner paused Browser MCP, stop "
+    "and wait for them. Never sign in or out. Close your tabs when the work is done."
 )
 
 
@@ -149,18 +150,25 @@ def off_site(url: str) -> str:
 
 @dataclass(frozen=True)
 class Plan:
-    """The policy's answer for one command, before anything is sent upstream."""
+    """The policy's answer for one command: what goes upstream (one call each), a reply made
+    here without upstream, or a refusal."""
 
-    send: str = ""
+    sends: tuple[str, ...] = ()
+    reply: str = ""
     refusal: str = ""
     page: bool = False
 
 
-def visit(start: str, target: str, end: str, allowed: Collection[str]) -> Plan:
-    """Open an address when it is allowed, quoted so upstream reads exactly the URL checked."""
+def visit(opening: tuple[str, ...], target: str, allowed: Collection[str]) -> Plan:
+    """Open an allowed address, after `opening` a blank tab for it when one is needed.
+
+    The URL goes as a JSON string, so upstream reads exactly the URL that was checked. A new
+    tab is opened blank first: upstream names a tab only once its page has loaded, so a load
+    that fails would leave the chat with a tab it cannot name.
+    """
     url = address(target)
     if permitted(url, allowed):
-        return Plan(send=f"{start} {json.dumps(url)}{end}")
+        return Plan(sends=(*opening, f"goto {json.dumps(url)}"))
     host = web_host(url)
     if host is None:
         return Plan(refusal=f"Real mode opens only http and https pages, not {url}")
@@ -170,7 +178,17 @@ def visit(start: str, target: str, end: str, allowed: Collection[str]) -> Plan:
     )
 
 
-def tab(arguments: list[str], allowed: Collection[str], tabs: Collection[str]) -> Plan:
+def listing(tabs: Sequence[str], current: str | None) -> str:
+    """What `tab list` shows in real mode: the tabs this chat opened and still has."""
+    if not tabs:
+        return f"This chat has no tab open. Open one with: tab new <url>\n{NOT_LISTED}"
+    lines = [f"{'*' if tab == current else ' '} {tab}" for tab in tabs]
+    return "\n".join([*lines, f"These are the tabs this chat opened; * is current. {NOT_LISTED}"])
+
+
+def tab(
+    arguments: list[str], allowed: Collection[str], tabs: Sequence[str], current: str | None
+) -> Plan:
     flag = ""
     if "--browser" in arguments[:-1]:
         at = arguments.index("--browser")
@@ -178,39 +196,40 @@ def tab(arguments: list[str], allowed: Collection[str], tabs: Collection[str]) -
         arguments = arguments[:at] + arguments[at + 2 :]
     action, rest = arguments[:1], arguments[1:]
     if action == ["list"]:
-        return Plan(refusal=f"{OWN_TABS} Open one with: tab new <url>")
+        return Plan(reply=listing(tabs, current))
     if action == ["new"] and not rest:
-        return Plan(send=f"tab new{flag}")
+        return Plan(sends=(f"tab new{flag}",))
     if action == ["new"] and len(rest) == 1:
-        return visit("tab new", rest[0], flag, allowed)
+        return visit((f"tab new{flag}",), rest[0], allowed)
     if flag or len(rest) > 1 or not all(TAB_ID.fullmatch(word) for word in rest):
         return Plan(refusal=TAB_USAGE)
     if action == ["close"]:
-        return Plan(send=" ".join(["tab close", *rest]))
+        return Plan(sends=(" ".join(["tab close", *rest]),))
     if action == ["select"] and rest:
         if rest[0] in tabs:
-            return Plan(send=f"tab select {rest[0]}")
+            return Plan(sends=(f"tab select {rest[0]}",))
         return Plan(refusal=f"Tab {rest[0]} is not one this chat opened. {OWN_TABS}")
     return Plan(refusal=TAB_USAGE)
 
 
-def plan(command: str, allowed: Collection[str], tabs: Collection[str]) -> Plan:
-    """What to do with one command: send it (rewritten or as it is), or refuse it and say why.
+def plan(command: str, allowed: Collection[str], tabs: Sequence[str], current: str | None) -> Plan:
+    """What to do with one command, given the chat's own open tabs and its current one.
 
     `goto` and `tab` are rebuilt from what was understood, so the check and upstream can never
-    read them differently; anything about them that is not understood is refused.
+    read them differently; anything about them that is not understood is refused. A `goto`
+    with no current tab of the chat's own opens one first, so its id is known.
     """
     name = GAP.split(command, maxsplit=1)[0]
     arguments = words(command[len(name) :])
     if name == "goto":
         if len(arguments) != 1:
             return Plan(refusal="goto takes one address, like: goto https://example.com")
-        return visit("goto", arguments[0], "", allowed)
+        return visit(() if current else ("tab new",), arguments[0], allowed)
     if name == "tab":
-        return tab(arguments, allowed, tabs)
+        return tab(arguments, allowed, tabs, current)
     if name in FREE or (name == "browser" and arguments[:1] in (["list"], ["use"])):
-        return Plan(send=command)
-    return Plan(send=command, page=True)
+        return Plan(sends=(command,))
+    return Plan(sends=(command,), page=True)
 
 
 @dataclass
@@ -250,14 +269,13 @@ def renumbered(text: str, number: int) -> str:
     return FIRST_STEP.sub(f"✗ step {number}:", "\n".join(lines))
 
 
-def joined(parts: list[Answer], total: int) -> dict:
+def joined(parts: list[Answer], ran: int, total: int) -> dict:
     """One result for the chat, laid out like the upstream result of the whole batch."""
     failed = parts[-1].failed
     lines = [part.text for part in parts if part.text]
-    if len(parts) < total:
-        first = len(parts) + 1
+    if ran < total:
         lines.append(
-            f"Step {total} not run" if first == total else f"Steps {first}–{total} not run"
+            f"Step {total} not run" if ran + 1 == total else f"Steps {ran + 1}–{total} not run"
         )
     lines += [part.page for part in parts if part.page][-1:]
     images = [image for part in parts for image in part.images]
@@ -280,7 +298,8 @@ class Proxy:
         self.replies: dict[str, asyncio.Future] = {}
         self.asked = 0
         self.lock = asyncio.Lock()
-        self.tabs: set[str] = set()
+        self.tabs: list[str] = []
+        self.tab: str | None = None
         self.tasks: set[asyncio.Task] = set()
 
     def background(self, coroutine) -> None:
@@ -313,29 +332,57 @@ class Proxy:
         lines = probe.text.split("\n")
         return lines[1] if len(lines) > 1 else probe.text
 
-    async def step(self, number: int, command: str, allowed: Collection[str]) -> Answer:
-        decided = plan(command, allowed, self.tabs)
+    def track(self, sent: str, text: str) -> None:
+        """Follow a tab command that worked, so every tab the chat has open is known by id."""
+        if not sent.startswith("tab "):
+            return
+        action, _, rest = sent.removeprefix("tab ").partition(" ")
+        if action == "new":
+            if opened := opened_tab(sent, text):
+                self.tabs.append(opened)
+                self.tab = opened
+        elif action == "select":
+            self.tab = rest
+        elif action == "close":
+            closed = rest or self.tab
+            self.tabs = [tab for tab in self.tabs if tab != closed]
+            if closed == self.tab:
+                self.tab = None
+
+    async def forward(self, number: int, sent: str, page: bool, allowed: Collection[str]) -> Answer:
+        """Run one command upstream, then check where it left the tab."""
+        result = await self.ask(sent)
+        if result.failed:
+            result.text = renumbered(result.text, number)
+        else:
+            self.track(sent, result.text)
+        landed = PAGE.fullmatch(result.page)[1] if result.page else None
+        if landed is None or permitted(landed, allowed):
+            return result
+        kept = result.text.split("\n")
+        if page:
+            # What it read may be the page it left the allowed sites for: only its ✓ line stays.
+            kept = [line for line in kept[:1] if line.startswith("✓ ")]
+        note = f"✗ after step {number}: {off_site(landed)}"
+        return Answer("\n".join([*kept, note]), result.page, failed=True)
+
+    async def step(self, number: int, command: str, allowed: Collection[str]) -> list[Answer]:
+        decided = plan(command, allowed, self.tabs, self.tab)
         refusal = decided.refusal
         if decided.page:
             url = await self.current()
             if url is not None and not permitted(url, allowed):
                 refusal = off_site(url)
         if refusal:
-            return Answer(f"✗ step {number}: {echo(command)} — {refusal}", failed=True)
-        result = await self.ask(decided.send)
-        if decided.send.startswith("tab new") and (opened := opened_tab(decided.send, result.text)):
-            self.tabs.add(opened)
-        if result.failed:
-            result.text = renumbered(result.text, number)
-        landed = PAGE.fullmatch(result.page)[1] if result.page else None
-        if landed is None or permitted(landed, allowed):
-            return result
-        kept = result.text.split("\n")
-        if decided.page:
-            # What it read may be the page it left the allowed sites for: only its ✓ line stays.
-            kept = [line for line in kept[:1] if line.startswith("✓ ")]
-        note = f"✗ after step {number}: {off_site(landed)}"
-        return Answer("\n".join([*kept, note]), result.page, failed=True)
+            return [Answer(f"✗ step {number}: {echo(command)} — {refusal}", failed=True)]
+        if decided.reply:
+            return [Answer(f"✓ {echo(command)}\n{decided.reply}")]
+        parts: list[Answer] = []
+        for sent in decided.sends:
+            parts.append(await self.forward(number, sent, decided.page, allowed))
+            if parts[-1].failed:
+                break
+        return parts
 
     async def batch(self, commands: list[str]) -> dict:
         if not commands:
@@ -343,10 +390,10 @@ class Proxy:
         allowed = sites(self.store)
         parts: list[Answer] = []
         for number, command in enumerate(commands, 1):
-            parts.append(await self.step(number, command, allowed))
+            parts += await self.step(number, command, allowed)
             if parts[-1].failed:
                 break
-        return joined(parts, len(commands))
+        return joined(parts, number, len(commands))
 
     async def call(self, message: dict) -> None:
         params = message.get("params") or {}

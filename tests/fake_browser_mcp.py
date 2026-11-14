@@ -4,7 +4,8 @@ It keeps tabs of its own next to one that belongs to the owner, logs every `comm
 it receives, and reads `control.json` beside the log before each call:
 `moves` maps a command name to the URL the tab is on once that command ran, `late` makes the
 move happen only when the next call starts (so no Page line reports it), and `error` is
-returned instead of running anything.
+returned instead of running anything. Addresses on a host that starts with `down.` fail to
+load: like upstream, `tab new <url>` then leaves a new current tab without naming it.
 """
 
 import json
@@ -60,11 +61,19 @@ def history() -> list[str]:
     return histories[state["current"]]
 
 
+def load(url: str) -> None:
+    if "://down." in url:
+        raise Failure(f"net::ERR_CONNECTION_REFUSED at {url}")
+    history().append(url)
+
+
 def create(url: str | None) -> int:
     state["last"] += 1
     tab = state["current"] = state["last"]
-    histories[tab] = ["about:blank", *([url] if url else [])]
+    histories[tab] = ["about:blank"]
     opened.add(tab)
+    if url:
+        load(url)
     return tab
 
 
@@ -89,6 +98,8 @@ def tab_step(args: list[str], notes: list[str], printed: list[str]) -> None:
         state["current"] = int(args[1])
     else:
         tab = int(args[1]) if len(args) > 1 else state["current"]
+        if tab is None:
+            raise Failure("There's no current tab")
         if tab not in opened:
             raise Failure(
                 f"Tab {tab} isn't one you opened, so it stays open. Switch away with "
@@ -110,7 +121,7 @@ def step(line: str, notes: list[str], printed: list[str], images: list[dict]) ->
     if name == "goto":
         if state["current"] is None:
             create(None)
-        history().append(normalize(args[0]))
+        load(normalize(args[0]))
     elif name == "back":
         if len(history()) < 2:
             raise Failure("There's no page to go back to")

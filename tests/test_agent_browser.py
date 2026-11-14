@@ -116,10 +116,12 @@ def diagnostics(store: Store) -> str:
 
 
 class Client:
+    action = "mcp"
+
     def __init__(self, store: Store, **environment: str) -> None:
         self.store = store
         self.process = subprocess.Popen(
-            (sys.executable, "-m", "devin_switch.cli", "browser", "mcp"),
+            (sys.executable, "-m", "devin_switch.cli", "browser", self.action),
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             text=True,
@@ -221,8 +223,12 @@ def test_append_member_keeps_comments_and_handles_missing_or_null_members() -> N
         handoff.append_member('{"permissions": {"allow": "x"}}', ("permissions", "allow"), "y")
 
 
-def test_install_registers_server_permissions_and_default_idempotently(
-    store: Store, chrome: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+def test_install_registers_both_servers_permissions_and_default_idempotently(
+    store: Store,
+    chrome: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture,
 ) -> None:
     user = tmp_path / "user-config"
     (user / "devin").mkdir(parents=True)
@@ -250,25 +256,48 @@ def test_install_registers_server_permissions_and_default_idempotently(
 
     args = cli.parser().parse_args(["browser", "install", "--default", "ansuman@example.invalid"])
     assert cli.execute(args, store) == 0
+    summary = capsys.readouterr().out
+    assert "'browser' and 'real-browser' MCP servers" in summary
+    assert "mcp__browser__* and mcp__real-browser__*" in summary
+    assert "ds browser allow SITE" in summary
     entry = json.loads(shared.read_text())["mcpServers"]
-    assert entry["browser"]["args"][-2:] == ["browser", "mcp"]
+    assert set(entry) == {"chrome-devtools", "browser", "real-browser"}
     assert entry["chrome-devtools"] == {"args": ["x"]}
     user_servers = json.loads((user / "devin/mcp_config.json").read_text())["mcpServers"]
-    assert set(user_servers) == {"logfire", "browser"}
+    assert set(user_servers) == {"logfire", "browser", "real-browser"}
+    prefix = agent_browser.command_prefix()
+    for servers in (entry, user_servers):
+        assert servers["browser"] == {
+            "command": prefix[0],
+            "args": [*prefix[1:], "browser", "mcp"],
+        }
+        assert servers["real-browser"] == {
+            "command": prefix[0],
+            "args": [*prefix[1:], "browser", "real-mcp"],
+        }
     assert "// mine" in config.read_text()
-    for path in (config, store.directory(second.name) / "config/devin/config.json"):
+    permissions = ["mcp__browser__*", "mcp__real-browser__*"]
+    for path in (
+        config,
+        store.directory(second.name) / "config/devin/config.json",
+        user / "devin/config.json",
+    ):
         allowed = json.loads(handoff.json_source(path.read_text()))["permissions"]["allow"]
-        assert allowed == [agent_browser.PERMISSION]
+        assert sorted(allowed) == permissions
     assert agent_browser.default_profile(store).directory == "Profile 3"
-    snapshot = {path: path.read_text() for path in (config, shared, user / "devin/config.json")}
+    snapshot = {
+        path: path.read_text()
+        for path in (config, shared, user / "devin/config.json", user / "devin/mcp_config.json")
+    }
     assert cli.execute(args, store) == 0
     assert snapshot == {path: path.read_text() for path in snapshot}
+    assert not list(shared.parent.glob("mcp_config.json.superseded-*"))
 
     with store.lock():
         pass
     assert cli.execute(cli.parser().parse_args(["add", "ansuman-3"]), store) == 0
     added = store.directory("ansuman-3") / "config/devin/config.json"
-    assert agent_browser.PERMISSION in json.loads(added.read_text())["permissions"]["allow"]
+    assert sorted(json.loads(added.read_text())["permissions"]["allow"]) == permissions
 
 
 def test_chats_share_one_headless_instance_that_closes_after_the_last_release(
@@ -490,6 +519,37 @@ def contents(data: Path) -> dict[str, bytes]:
         for path in sorted(data.rglob("*"))
         if path.is_file() and not path.is_symlink()
     }
+
+
+def test_mcp_child_is_the_pinned_package_run_through_the_npx_that_was_found(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("DS_BROWSER_MCP", raising=False)
+    monkeypatch.setenv("PATH", "/usr/bin")
+    monkeypatch.setattr(agent_browser.shutil, "which", lambda name: f"/opt/node/bin/{name}")
+    command, environment = agent_browser.Proxy.mcp_command(Path("/data"))
+    assert command[:7] == [
+        "/opt/node/bin/npx",
+        "-y",
+        "chrome-devtools-mcp@1.10.1",
+        "--no-usage-statistics",
+        "--no-performance-crux",
+        "--autoConnect",
+        "--userDataDir=/data",
+    ]
+    assert all(argument.startswith("--workspace=") for argument in command[7:])
+    assert environment["PATH"] == "/opt/node/bin:/usr/bin"
+    assert environment["CHROME_DEVTOOLS_MCP_NO_UPDATE_CHECKS"] == "1"
+    assert environment["CHROME_DEVTOOLS_MCP_NO_USAGE_STATISTICS"] == "1"
+
+    monkeypatch.setattr(agent_browser.shutil, "which", lambda name: None)
+    monkeypatch.setattr(agent_browser.os, "access", lambda path, mode: False)
+    with pytest.raises(SwitchError, match="npx was not found"):
+        agent_browser.Proxy.mcp_command(Path("/data"))
+
+    monkeypatch.setenv("DS_BROWSER_MCP", json.dumps(["fake-server", "--flag"]))
+    command, _ = agent_browser.Proxy.mcp_command(Path("/data"))
+    assert command[:4] == ["fake-server", "--flag", "--autoConnect", "--userDataDir=/data"]
 
 
 def test_chrome_starts_with_capped_web_and_media_caches(tmp_path: Path) -> None:

@@ -297,16 +297,18 @@ CLI removal requires explicit confirmation: `ds remove work --yes`.
 
 ### Let agents use a browser without interrupting you
 
-`ds browser install` registers one `browser` MCP server for every chat (Switch's shared MCP
-config and your user-level `~/.config/devin/mcp_config.json`). It also allows its tools
-(`mcp__browser__*`) in every saved login, in the user config, and in logins you add later. Old
-`chrome-devtools-mcp` entries are replaced. Restart open chats afterwards.
+`ds browser install` registers two MCP servers for every chat (Switch's shared MCP config and
+your user-level `~/.config/devin/mcp_config.json`): `browser`, the test browser described here,
+and `real-browser`, [real mode](#real-mode-let-agents-use-your-own-chrome-on-sites-you-allow).
+It also allows their tools (`mcp__browser__*`, `mcp__real-browser__*`) in every saved login, in
+the user config, and in logins you add later. Old `chrome-devtools-mcp` entries are replaced.
+Restart open chats afterwards.
 
 ```sh
 ds browser install --default you@example.com   # or a profile name or "Profile 3"
 ```
 
-The agent never attaches to the Chrome you are using:
+The test browser never attaches to the Chrome you are using:
 
 - **One separate instance per Chrome profile.** The first time a chat names a profile, Switch
   copies that profile's cookies and site storage into its own folder. Passwords, extensions,
@@ -354,6 +356,55 @@ Agents (or you) can copy other items with
 
 `ds browser status` lists profiles and running instances, and `ds browser stop` closes them
 immediately. The server runs `npx -y chrome-devtools-mcp@1.10.1`, so Node.js is required.
+
+### Real mode: let agents use your own Chrome on sites you allow
+
+Some websites can tell the test browser is a robot and turn it away. For those, agents can use
+the `real-browser` server, which drives the Chrome you are signed into through the
+[Browser MCP](https://browsermcp.io) extension.
+
+| | Test mode (`browser`) | Real mode (`real-browser`) |
+| --- | --- | --- |
+| Which Chrome | A separate headless copy of a profile | Your own running Chrome |
+| Use it for | Everyday browsing, checks and screenshots | Sites that refuse the test browser |
+| Websites | Any | Only the sites you allow; none to begin with |
+| Your tabs | Never touched | Never listed or selected; agents work in tabs they open |
+| Your off switch | `ds browser stop` | The extension's **Stop** / **Resume** button |
+
+Set it up once:
+
+1. Install the Browser MCP extension in your Chrome.
+2. Run `ds browser install` and restart open chats.
+3. Allow the sites agents may use (see below).
+4. The first time an agent uses real mode, the extension's popup shows a code: click **Allow**.
+
+You decide which websites real mode may touch. Nothing is allowed until you add a site, and a
+site covers its subdomains (`example.com` also allows `app.example.com`, but not
+`notexample.com`):
+
+```sh
+ds browser allow example.com       # a host or a full address; several at once work too
+ds browser sites                   # what is allowed now
+ds browser disallow example.com
+```
+
+Changes apply to open chats at their next browser call. Under that list, real mode:
+
+- opens only allowed sites (and blank tabs), and only `http` and `https` pages;
+- reads and acts only while the tab is on an allowed site. If a link or redirect leaves the
+  allowed sites, the agent's batch stops there, and the tab stays closed to it until it goes
+  back, closes the tab, or you allow the site;
+- never lists your tabs and switches only to tabs the chat opened itself. A tab that a page
+  opens by itself (a pop-up) can't be used yet.
+
+Agents are told to ask you before paying, sending, posting, deleting or changing account
+settings unless the task asked for exactly that, and never to sign in or out. That is an
+instruction, not a lock: the locks are the site list and **Stop**. Unattended jobs can use real
+mode too and run without permission prompts, so allow only sites you are comfortable with.
+Click **Stop** in the extension whenever you want agents out of your Chrome; calls then tell the
+agent to wait until you click **Resume**.
+
+The server runs `npx -y @browsermcp/mcp@2.4.0`, so Node.js is required.
 
 ### Ask on the side without interrupting a chat
 
@@ -554,12 +605,15 @@ extension.
 | `ds sessions` | List shared history for the current project |
 | `ds verify FIRST SECOND` | Check A → B → A login and local-history visibility |
 | `ds remove ALIAS --yes` | Remove a local profile, preserving shared history |
-| `ds browser install [--default PROFILE]` | Register the agent browser MCP server for all chats and allow its tools |
+| `ds browser install [--default PROFILE]` | Register the `browser` and `real-browser` MCP servers for all chats and allow their tools |
 | `ds browser default PROFILE` | Choose the Chrome profile for chats that name none |
 | `ds browser status` | List Chrome profiles, cloned agent profiles and running instances |
 | `ds browser refresh PROFILE` | Copy a Chrome profile's logins into its agent profile again |
 | `ds chrome copy ITEM... --to DIR --reason TEXT` | Copy from Chrome's data folder, asking with a popup when macOS blocks it |
 | `ds browser stop [PROFILE]` | Close running agent browsers now |
+| `ds browser allow SITE...` | Let real mode use these sites (and their subdomains) in your own Chrome |
+| `ds browser disallow SITE...` | Take sites back from real mode |
+| `ds browser sites` | List the sites real mode may use |
 | `ds chat id` | Print the conversation a Desktop chat's process belongs to |
 
 `ds verify` makes no model request. Matching history across accounts is separate from a
@@ -584,6 +638,7 @@ acp/sessions/
 acp/requests/
 acp/lifecycle/
 browser/profiles/<profile>/user-data/
+browser/settings.json
 launchers/
 selected
 ```
@@ -591,6 +646,9 @@ selected
 - Agent browser profiles hold copies of Chrome cookies and site storage. They are as
   sensitive as your browser profile: the folders are private to your user, and the
   `browser` MCP server gives agents full control of these logged-in sessions.
+- Real mode acts in your own Chrome, signed in as you, on the sites listed under `real_sites`
+  in `browser/settings.json`. Pages on those sites, and what agents do there, reach the chat
+  like any other tool output. Browser MCP keeps its own state in `~/.browsermcp`.
 
 - Native credentials are local files restricted to the current user, **not Keychain-encrypted**.
   Protect this directory and its backups as sensitive data.
@@ -621,7 +679,7 @@ selected
 | `DS_HOME` | Override Switch's private state directory; keep it outside the repository |
 | `DS_BINARY` | Choose the native Devin executable explicitly |
 | `DS_TEST_NATIVE` | Enable isolated, offline native-CLI compatibility tests |
-| `DS_CHROME_DATA`, `DS_BROWSER_CHROME`, `DS_BROWSER_MCP` | Tests only: fake Chrome data, Chrome executable and MCP child |
+| `DS_CHROME_DATA`, `DS_BROWSER_CHROME`, `DS_BROWSER_MCP`, `DS_REAL_BROWSER_MCP` | Tests only: fake Chrome data, Chrome executable and the MCP children of both modes |
 | `DS_BROWSER_IDLE`, `DS_BROWSER_GRACE` | Seconds before an idle chat releases the browser (900), and before an unused one closes (10) |
 
 Never commit your state directory, environment files, signing certificates, or credentials.

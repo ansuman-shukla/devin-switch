@@ -699,6 +699,7 @@ def test_daily_sweep_trims_only_idle_profile_copies(store: Store, fakes: None) -
 
 
 BINARY = "Contents/MacOS/Google Chrome"
+DAY = 24 * 3600
 
 
 def install_chrome(app: Path, version: object) -> None:
@@ -807,11 +808,126 @@ def test_app_copy_is_whole_and_made_once_for_a_version(
     assert [argv[:4] for argv in commands] == [("/bin/cp", "-c", "-R", str(installed))]
 
     (copy / "marker").write_text("first copy")
+    (copy.parent.parent / "149.0.0.0").mkdir()
     assert agent_browser.chrome_app(store) == copy
     assert (copy / "marker").read_text() == "first copy"
-    # Starting from an existing copy clones nothing again.
+    # Starting from an existing copy runs nothing: no second clone, and old copies wait
+    # for the next new one or the daily sweep.
     assert len(commands) == 1
+    assert names(copy.parent.parent) == ["149.0.0.0", "150.0.1.2"]
     assert names(installed) == ["Contents"]
+
+
+def test_new_chrome_version_gets_a_new_copy_and_unused_old_ones_are_removed(
+    store: Store, installed: Path, tmp_path: Path
+) -> None:
+    apps = store.root / "browser/app"
+    first = agent_browser.chrome_app(store)
+    data = tmp_path / "data"
+    data.mkdir()
+    running = subprocess.Popen([first / BINARY, f"--user-data-dir={data}"])
+    gone = subprocess.Popen([sys.executable, "-c", "pass"])
+    gone.wait(timeout=15)
+    abandoned = apps / f"staging-{gone.pid}-abandoned"
+    underway = apps / f"staging-{os.getpid()}-underway"
+    foreign = apps / "not-made-by-switch"
+    for folder in (abandoned, underway, foreign):
+        (folder / "Google Chrome.app").mkdir(parents=True)
+    try:
+        wait_until(lambda: (data / "DevToolsActivePort").exists())
+
+        install_chrome(installed, "151.0.0.0")
+        second = agent_browser.chrome_app(store)
+
+        assert second == apps / "151.0.0.0/Google Chrome.app" and (second / BINARY).is_file()
+        # The running agent browser keeps its copy; another supervisor keeps the copy it
+        # is still making; only the one whose maker is gone is a leftover.
+        assert names(apps) == ["150.0.1.2", "151.0.0.0", foreign.name, underway.name]
+        assert (first / BINARY).is_file()
+
+        install_chrome(installed, "152.0.0.0")
+        agent_browser.chrome_app(store)
+        assert names(apps) == ["150.0.1.2", "152.0.0.0", foreign.name, underway.name]
+    finally:
+        running.terminate()
+        running.wait(timeout=15)
+
+    install_chrome(installed, "153.0.0.0")
+    agent_browser.chrome_app(store)
+    assert names(apps) == ["153.0.0.0", foreign.name, underway.name]
+
+
+@pytest.mark.parametrize("resolved", [False, True])
+def test_old_app_copy_stays_while_a_process_runs_from_either_form_of_its_path(
+    store: Store, installed: Path, tmp_path: Path, resolved: bool
+) -> None:
+    (tmp_path / "linked").symlink_to(store.root)
+    linked = Store(tmp_path / "linked")
+    old = agent_browser.chrome_app(linked)
+    assert old.is_relative_to(linked.root) and old.resolve().is_relative_to(store.root)
+    data = tmp_path / "data"
+    data.mkdir()
+    binary = (old.resolve() if resolved else old) / BINARY
+    running = subprocess.Popen([binary, f"--user-data-dir={data}"])
+    try:
+        wait_until(lambda: (data / "DevToolsActivePort").exists())
+        install_chrome(installed, "151.0.0.0")
+        agent_browser.chrome_app(linked)
+        assert names(store.root / "browser/app") == ["150.0.1.2", "151.0.0.0"]
+    finally:
+        running.terminate()
+        running.wait(timeout=15)
+
+
+@pytest.mark.parametrize("failure", ["exit", "timeout"])
+def test_no_app_copy_is_removed_when_running_processes_cannot_be_listed(
+    store: Store, installed: Path, monkeypatch: pytest.MonkeyPatch, failure: str
+) -> None:
+    agent_browser.chrome_app(store)
+    install_chrome(installed, "151.0.0.0")
+    real = subprocess.run
+
+    def run(argv, **options):
+        if argv[0] != "/bin/ps":
+            return real(argv, **options)
+        if failure == "timeout":
+            raise subprocess.TimeoutExpired(argv, options["timeout"])
+        return real(("/usr/bin/false",), **options)
+
+    monkeypatch.setattr(subprocess, "run", run)
+    agent_browser.chrome_app(store)
+    assert names(store.root / "browser/app") == ["150.0.1.2", "151.0.0.0"]
+
+
+def test_daily_sweep_removes_app_copies_of_other_versions_that_nothing_runs_from(
+    store: Store, installed: Path, tmp_path: Path
+) -> None:
+    apps = store.root / "browser/app"
+    now = time.time()
+    old = agent_browser.chrome_app(store)
+    data = tmp_path / "data"
+    data.mkdir()
+    running = subprocess.Popen([old / BINARY, f"--user-data-dir={data}"])
+    try:
+        wait_until(lambda: (data / "DevToolsActivePort").exists())
+        install_chrome(installed, "151.0.0.0")
+        agent_browser.chrome_app(store)
+
+        assert agent_browser.sweep(store, now=now) == 0
+        assert names(apps) == ["150.0.1.2", "151.0.0.0"]
+    finally:
+        running.terminate()
+        running.wait(timeout=15)
+
+    # At most once a day.
+    agent_browser.sweep(store, now=now + DAY - 1)
+    assert names(apps) == ["150.0.1.2", "151.0.0.0"]
+    # The installed version's copy stays, used or not.
+    agent_browser.sweep(store, now=now + DAY)
+    assert names(apps) == ["151.0.0.0"]
+    shutil.rmtree(installed)
+    agent_browser.sweep(store, now=now + 2 * DAY)
+    assert names(apps) == []
 
 
 def test_app_copy_another_supervisor_finished_meanwhile_is_the_one_used(
@@ -831,6 +947,28 @@ def test_app_copy_another_supervisor_finished_meanwhile_is_the_one_used(
     assert agent_browser.chrome_app(store) == theirs
     assert (theirs / "theirs").read_text() == "finished first"
     assert names(store.root / "browser/app") == ["150.0.1.2"]
+
+
+def test_cleanup_by_another_supervisor_spares_a_copy_that_is_still_being_made(
+    store: Store, installed: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    apps = store.root / "browser/app"
+    real = subprocess.run
+
+    def run(argv, **options):
+        if argv[0] != "/bin/cp":
+            return real(argv, **options)
+        maker = agent_browser.APP_STAGING.fullmatch(Path(argv[-1]).parent.name)
+        assert maker and int(maker[1]) == os.getpid()
+        # Just before the clone starts and just after it ends, no process names the folder.
+        agent_browser.drop_unused_apps(apps, "151.0.0.0")
+        result = real(argv, **options)
+        agent_browser.drop_unused_apps(apps, "151.0.0.0")
+        return result
+
+    monkeypatch.setattr(subprocess, "run", run)
+    copy = agent_browser.chrome_app(store)
+    assert (copy / BINARY).is_file() and names(apps) == ["150.0.1.2"]
 
 
 def test_half_made_app_copy_is_never_used(store: Store, installed: Path) -> None:

@@ -74,8 +74,11 @@ BROWSER_CACHES = (
 )
 TRIM_MARKER = "browser-trimmed.json"
 CHROME_BINARY = "Contents/MacOS/Google Chrome"
-# A version names its app copy's folder.
+# A version names its app copy's folder; an unfinished copy's folder names the process
+# making it.
 APP_VERSION = re.compile(r"[0-9]+(\.[0-9]+)*")
+APP_STAGING = re.compile(r"staging-([0-9]{1,7})-\w+")
+PROCESSES = ("/bin/ps", "-axww", "-o", "pid=,command=")
 LINE_LIMIT = 256 * 1024 * 1024
 LOCAL = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 INSTRUCTIONS = (
@@ -353,6 +356,39 @@ def same_volume(first: Path, second: Path) -> bool:
     return first.stat().st_dev == second.stat().st_dev
 
 
+def running_commands() -> str | None:
+    """Every running process's command line, or None when `ps` cannot tell."""
+    try:
+        listing = subprocess.run(
+            PROCESSES, capture_output=True, text=True, errors="replace", timeout=5, check=True
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return listing.stdout
+
+
+def drop_unused_apps(folder: Path, keep: str | None) -> None:
+    """Remove app copies of other Chrome versions, and what unfinished copies left behind.
+
+    Only those that no running process was started from: an agent browser keeps the copy
+    it runs from until it exits. An unfinished copy also stays while its maker is alive.
+    """
+    unused = []
+    for path in folder.iterdir():
+        staging = APP_STAGING.fullmatch(path.name)
+        if staging and alive(int(staging[1])):
+            continue
+        if staging or (APP_VERSION.fullmatch(path.name) and path.name != keep):
+            unused.append(path)
+    commands = running_commands() if unused else None
+    if commands is None:
+        return
+    for path in unused:
+        # LaunchServices may report the resolved path of what it started.
+        if not any(f"{root}/" in commands for root in {str(path), str(path.resolve())}):
+            shutil.rmtree(path, ignore_errors=True)
+
+
 def chrome_app(store: Store) -> Path:
     """The Chrome app the agent browser runs from: Switch's own clone of the installed one.
 
@@ -386,6 +422,7 @@ def chrome_app(store: Store) -> Path:
                     raise
         finally:
             shutil.rmtree(staging, ignore_errors=True)
+        drop_unused_apps(folder, version)
     return copy
 
 
@@ -412,7 +449,7 @@ def chrome_command(executable: str, data: Path, headed: bool) -> list[str]:
 
 def chrome_pid(data: Path) -> int | None:
     listing = subprocess.run(
-        ("/bin/ps", "-axww", "-o", "pid=,command="),
+        PROCESSES,
         capture_output=True,
         text=True,
         timeout=5,
@@ -494,7 +531,8 @@ def trim_idle(lease: int, data: Path) -> bool:
 def sweep(store: Store, *, now: float | None = None) -> int:
     """Trim every idle profile copy, at most once a day, so unopened ones shrink too.
 
-    The copies themselves stay: making one again needs the macOS permission popup.
+    The copies themselves stay: making one again needs the macOS permission popup. Copies
+    of the Chrome app for versions no longer installed go, once nothing runs from them.
     """
     now = time.time() if now is None else now
     if not store.due(TRIM_MARKER, PRUNE_INTERVAL, now):
@@ -506,6 +544,10 @@ def sweep(store: Store, *, now: float | None = None) -> int:
             trimmed += trim_idle(lease, data)
         finally:
             os.close(lease)
+    apps = store.root / "browser" / "app"
+    if apps.is_dir():
+        installed = browser.CHROME_APP
+        drop_unused_apps(apps, app_version(installed) if installed.is_dir() else None)
     return trimmed
 
 

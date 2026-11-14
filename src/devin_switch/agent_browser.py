@@ -345,6 +345,11 @@ def chrome_command(data: Path, headed: bool) -> list[str]:
         "--hide-crash-restore-bubble",
         f"--disk-cache-size={DISK_CACHE_LIMIT}",
         f"--media-cache-size={MEDIA_CACHE_LIMIT}",
+        # Not removable. Without it Chrome registers the path it runs from with Chrome's
+        # updater 30 s after start and every 5 h, replacing the only registration of
+        # com.google.chrome: run from a copy of the app, it would point the owner's updates
+        # at the copy and the Chrome in /Applications would stop being updated.
+        "--disable-updater-scheduler",
         *window,
         "about:blank",
     ]

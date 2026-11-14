@@ -561,6 +561,13 @@ def test_chrome_starts_with_capped_web_and_media_caches(tmp_path: Path) -> None:
         assert command[-1] == "about:blank" and f"--user-data-dir={tmp_path}" in command
 
 
+def test_chrome_never_registers_its_own_path_with_chromes_updater(tmp_path: Path) -> None:
+    for headed in (False, True):
+        command = agent_browser.chrome_command(tmp_path, headed)
+        assert "--disable-updater-scheduler" in command[1:-1]
+        assert ("--headless=new" in command) is not headed
+
+
 def test_trim_deletes_only_caches_and_keeps_logins_byte_identical(tmp_path: Path) -> None:
     data = tmp_path / "user-data"
     logins = fill(data, LOGINS)

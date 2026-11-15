@@ -261,7 +261,9 @@ def test_install_registers_both_servers_permissions_and_default_idempotently(
     summary = capsys.readouterr().out
     assert "'browser' and 'real-browser' MCP servers" in summary
     assert "mcp__browser__* and mcp__real-browser__*" in summary
-    assert "ds browser allow SITE" in summary
+    assert "'real-browser' is real mode: your own Chrome" in summary
+    assert "on any site, in tabs the agents open" in summary
+    assert "ds browser allow" not in summary
     entry = json.loads(shared.read_text())["mcpServers"]
     assert set(entry) == {"chrome-devtools", "browser", "real-browser"}
     assert entry["chrome-devtools"] == {"args": ["x"]}

@@ -357,6 +357,37 @@ def test_a_site_list_left_in_old_settings_changes_nothing(
     assert (store.root / "browser/settings.json").read_bytes() == saved
 
 
+def test_a_goto_that_cannot_run_opens_no_tab(chat: Chat, upstream: Path) -> None:
+    for command in ("goto", "goto example.com other.test"):
+        assert chat.run(f"{command}\nget title") == (
+            f"✗ step 1: {command} — goto takes one address, like: goto https://example.com\n"
+            "Step 2 not run",
+            True,
+        )
+    assert chat.run("tab list")[0].startswith("✓ tab list\nThis chat has no tab open.")
+    assert sent(upstream) == []
+
+
+def test_other_chrome_profiles_are_listed_chosen_and_opened_in(chat: Chat, upstream: Path) -> None:
+    text, error = chat.run(
+        'browser list\nbrowser use "Work"\ntab new example.com --browser "Work 2"\ntab list'
+    )
+    assert not error
+    assert text == (
+        '✓ browser list\n* b1 "Work" — 3 tabs\n'
+        '✓ browser use "Work"\n* b1 "Work" — 3 tabs\n'
+        '✓ tab new --browser "Work 2" — tab 501 in Work 2\n✓ goto "example.com"\n'
+        f"✓ tab list\n* 501\n{LISTED}\n"
+        'Page: https://example.com — "Title of example.com"'
+    )
+    assert sent(upstream) == [
+        "browser list",
+        'browser use "Work"',
+        'tab new --browser "Work 2"',
+        'goto "example.com"',
+    ]
+
+
 def test_the_owners_tabs_are_never_listed_or_selected(
     chat: Chat, store: Store, upstream: Path
 ) -> None:
@@ -492,9 +523,16 @@ def test_a_requests_headers_and_body_are_never_shown(chat: Chat, upstream: Path)
             f"✗ step 1: {command} — {real_browser.NO_REQUEST}",
             True,
         )
-    assert sent(upstream) == before
+    text, error = chat.run("get title\nrequest 5 --body\nget url")
+    assert error and "secret" not in text
+    assert text == (
+        "✓ get title\nTitle of example.com\n"
+        f"✗ step 2: request 5 --body — {real_browser.NO_REQUEST}\n"
+        "Step 3 not run"
+    )
+    assert sent(upstream)[len(before) :] == ["get title"]
     assert chat.run("requests") == ("✓ requests\n5 GET 200 https://example.com/api", False)
-    assert sent(upstream)[len(before) :] == ["requests"]
+    assert sent(upstream)[len(before) :] == ["get title", "requests"]
 
 
 def test_leaving_a_site_by_a_link_or_a_redirect_does_not_stop_the_batch(
@@ -618,6 +656,15 @@ def test_failures_are_numbered_by_their_place_in_the_batch(chat: Chat, upstream:
     assert error and text.endswith(f"✗ step 2: request 5 — {real_browser.NO_REQUEST}")
     assert "not run" not in text
 
+    text, error = chat.run("get title\ntab new down.example.com\nhelp")
+    assert error and text.split("\n")[2:] == [
+        "✓ tab new — tab 502",
+        '✗ step 2: goto "down.example.com" — net::ERR_CONNECTION_REFUSED at '
+        "https://down.example.com",
+        "Step 3 not run",
+        'Page: about:blank — ""',
+    ]
+
 
 @pytest.mark.parametrize("message", [PAUSED, NOT_CONNECTED])
 def test_upstream_errors_come_back_unchanged(chat: Chat, upstream: Path, message: str) -> None:
@@ -626,6 +673,8 @@ def test_upstream_errors_come_back_unchanged(chat: Chat, upstream: Path, message
         assert chat.run(command) == (message, True)
     assert chat.run("get title\nsnapshot") == (f"{message}\nStep 2 not run", True)
     assert sent(upstream) == ["snapshot", "tab new", "back", "get title"]
+    control(upstream)
+    assert chat.run("tab list")[0].startswith("✓ tab list\nThis chat has no tab open.")
 
 
 def test_other_tools_and_unreadable_commands_are_answered_without_upstream(

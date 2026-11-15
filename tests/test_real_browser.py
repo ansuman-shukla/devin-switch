@@ -1,4 +1,3 @@
-import asyncio
 import json
 import sys
 from pathlib import Path
@@ -9,138 +8,21 @@ from test_agent_browser import Client
 from devin_switch import agent_browser, cli, real_browser
 from devin_switch.store import Store, SwitchError
 
-ALLOWED = ["example.com", "localhost"]
 PAUSED = "The user paused Browser MCP. Ask them to click Resume in its popup"
 NOT_CONNECTED = "No browser is connected. Install the Browser MCP extension, then retry"
 
 
 @pytest.mark.parametrize(
-    "url",
-    [
-        "https://example.com",
-        "https://example.com/",
-        "http://example.com/path?next=https://other.test/#top",
-        "https://EXAMPLE.com:8443/a",
-        "https://studio.example.com/watch?v=1",
-        "https://a.b.example.com",
-        "http://localhost:3000/",
-        "about:blank",
-    ],
+    "arguments", [["allow", "example.com"], ["disallow", "example.com"], ["sites"]]
 )
-def test_allowed_sites_cover_the_host_and_its_subdomains(url: str) -> None:
-    assert real_browser.permitted(url, ALLOWED)
-
-
-@pytest.mark.parametrize(
-    "url",
-    [
-        "https://notexample.com/",
-        "https://example.com.evil.test/",
-        "https://evil.test/example.com",
-        "https://evil.test/?u=https://example.com",
-        "https://evil.test#.example.com",
-        "https://example.com@evil.test/",
-        "https://user:pass@example.com/",
-        "https://evil.test\\@example.com/",
-        "https://evil.test%23.example.com/",
-        "https://example.com%2eevil.test/",
-        "https://example.com./",
-        "https://example.com:/",
-        "https://example.com:80@evil.test/",
-        "https://example.com\t.evil.test/",
-        "https://\u212a.example.com/",
-        "https://[::1]/",
-        "https://com/",
-        "https:example.com",
-        "//example.com/",
-        "example.com",
-        "ftp://example.com/",
-        "file:///etc/hosts",
-        "javascript:alert(1)//example.com",
-        "data:text/html,https://example.com/",
-        "view-source:https://example.com/",
-        "chrome://settings/",
-        "chrome-extension://example.com/popup.html",
-        "blob:https://example.com/1",
-        "about:blank#example.com",
-        "about:srcdoc",
-        "",
-    ],
-)
-def test_other_hosts_schemes_and_look_alikes_are_not_allowed(url: str) -> None:
-    assert not real_browser.permitted(url, ALLOWED)
-
-
-def test_nothing_but_a_blank_tab_is_allowed_until_a_site_is_added() -> None:
-    assert not real_browser.permitted("https://example.com/", [])
-    assert real_browser.permitted("about:blank", [])
-
-
-def run(store: Store, *arguments: str) -> int:
-    return cli.execute(cli.parser().parse_args(["browser", *arguments]), store)
-
-
-def test_owner_adds_lists_and_removes_sites(store: Store, capsys: pytest.CaptureFixture) -> None:
-    assert run(store, "sites") == 0
-    assert "No site is allowed yet" in capsys.readouterr().out
-    assert real_browser.sites(store) == []
-
-    assert run(store, "allow", "Studio.Example.COM", "https://example.org:8443/a?b#c") == 0
-    assert "studio.example.com" in capsys.readouterr().out
-    assert run(store, "allow", "example.org", "localhost:3000") == 0
-    assert real_browser.sites(store) == ["example.org", "localhost", "studio.example.com"]
-    saved = json.loads((store.root / "browser/settings.json").read_text())
-    assert saved["real_sites"] == ["example.org", "localhost", "studio.example.com"]
-
-    capsys.readouterr()
-    assert run(store, "sites") == 0
-    assert capsys.readouterr().out == "example.org\nlocalhost\nstudio.example.com\n"
-
-    assert run(store, "disallow", "http://EXAMPLE.org/", "never-added.test") == 0
-    out = capsys.readouterr().out
-    assert "no longer use example.org" in out and "never-added.test was not" in out
-    assert real_browser.sites(store) == ["localhost", "studio.example.com"]
-
-
-def test_allowing_sites_keeps_the_other_browser_settings(store: Store) -> None:
-    real_browser.save_settings(store, installed=True, default="Profile 3")
-    assert run(store, "allow", "example.com") == 0
-    assert real_browser.settings(store) == {
-        "installed": True,
-        "default": "Profile 3",
-        "real_sites": ["example.com"],
-    }
-
-
-@pytest.mark.parametrize(
-    "value",
-    ["", "   ", "https://", "*.example.com", "exa mple.com", "ftp://example.com", "file:///tmp/x"],
-)
-def test_allow_rejects_what_names_no_site(store: Store, value: str) -> None:
-    with pytest.raises(SwitchError, match="is not a site"):
-        run(store, "allow", "example.com", value)
-    assert real_browser.sites(store) == []
-
-
-@pytest.mark.parametrize(
-    ("written", "opened"),
-    [
-        ("example.com", "https://example.com"),
-        ("example.com/a?b=1#c", "https://example.com/a?b=1#c"),
-        ("localhost", "http://localhost"),
-        ("localhost/x", "http://localhost/x"),
-        ("127.0.0.1:8000/x", "http://127.0.0.1:8000/x"),
-        ("[::1]:8000", "http://[::1]:8000"),
-        ("http://example.com", "http://example.com"),
-        ("HTTPS://example.com", "HTTPS://example.com"),
-        ("about:blank", "about:blank"),
-        ("localhost:3000", "localhost:3000"),
-        ("javascript:alert(1)", "javascript:alert(1)"),
-        ("//example.com", "https:////example.com"),
-    ],
-)
-def test_addresses_are_completed_the_way_upstream_completes_them(written: str, opened: str) -> None:
-    assert real_browser.address(written) == opened
+def test_the_site_list_commands_are_gone(
+    arguments: list[str], capsys: pytest.CaptureFixture
+) -> None:
+    with pytest.raises(SystemExit) as refused:
+        cli.parser().parse_args(["browser", *arguments])
+    assert refused.value.code == 2
+    assert f"invalid choice: '{arguments[0]}'" in capsys.readouterr().err
+    assert cli.parser().parse_args(["browser", "real-mcp"]).action == "real-mcp"
 
 
 def test_a_call_is_split_into_commands_like_upstream_splits_it() -> None:
@@ -163,28 +45,43 @@ LISTED = "These are the tabs this chat opened; * is current. The owner's own tab
 def plan(
     command: str, tabs: tuple[str, ...] = ("12",), current: str | None = "12"
 ) -> real_browser.Plan:
-    return real_browser.plan(command, ALLOWED, tabs, current)
+    return real_browser.plan(command, tabs, current)
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "goto example.com",
+        "goto other.test",
+        "goto   https://studio.example.com/a(b",
+        'goto "https://example.com/q?x=\\"1\\""',
+        "goto 'example.com'",
+        "goto https://example.com/é",
+        "goto HTTPS://other.test",
+        "goto https://example.com@other.test",
+        "goto localhost:3000",
+        "goto about:blank",
+        "goto file:///tmp/page.html",
+        "goto view-source:https://example.com",
+        "goto chrome://version/",
+    ],
+)
+def test_a_goto_to_any_address_is_sent_as_the_agent_wrote_it(command: str) -> None:
+    assert plan(command) == real_browser.Plan(sends=(command,))
 
 
 @pytest.mark.parametrize(
     ("command", "sends"),
     [
-        ("goto example.com", ['goto "https://example.com"']),
-        ("goto   https://studio.example.com/a(b", ['goto "https://studio.example.com/a(b"']),
-        ('goto "https://example.com/q?x=\\"1\\""', ['goto "https://example.com/q?x=\\"1\\""']),
-        ("goto https://example.com/é", ['goto "https://example.com/\\u00e9"']),
-        ("goto about:blank", ['goto "about:blank"']),
         ("tab new", ["tab new"]),
-        ("tab new localhost/x", ["tab new", 'goto "http://localhost/x"']),
+        ("tab new localhost/x", ["tab new", 'goto "localhost/x"']),
+        ("tab new https://other.test/a?b=1#c", ["tab new", 'goto "https://other.test/a?b=1#c"']),
+        ('tab new "https://example.com/a b"', ["tab new", 'goto "https://example.com/a b"']),
+        ("tab new https://example.com/é", ["tab new", 'goto "https://example.com/\\u00e9"']),
+        ("tab new file:///tmp/page.html", ["tab new", 'goto "file:///tmp/page.html"']),
         ('tab new --browser "Work Chrome"', ['tab new --browser "Work Chrome"']),
-        (
-            "tab new example.com --browser b2",
-            ['tab new --browser "b2"', 'goto "https://example.com"'],
-        ),
-        (
-            "tab --browser b2 new example.com",
-            ['tab new --browser "b2"', 'goto "https://example.com"'],
-        ),
+        ("tab new example.com --browser b2", ['tab new --browser "b2"', 'goto "example.com"']),
+        ("tab --browser b2 new example.com", ['tab new --browser "b2"', 'goto "example.com"']),
         ("tab close", ["tab close"]),
         ("tab close 12", ["tab close 12"]),
         ("tab close 99", ["tab close 99"]),
@@ -192,20 +89,15 @@ def plan(
         ('tab "select" "12"', ["tab select 12"]),
     ],
 )
-def test_addresses_and_tab_commands_are_rebuilt_for_upstream(
-    command: str, sends: list[str]
-) -> None:
+def test_tab_commands_are_rebuilt_for_upstream(command: str, sends: list[str]) -> None:
     assert plan(command) == real_browser.Plan(sends=tuple(sends))
 
 
 def test_a_goto_with_no_current_tab_of_the_chats_own_opens_one_first() -> None:
-    opened = ("tab new", 'goto "https://example.com/a"')
-    assert plan("goto example.com/a", tabs=(), current=None).sends == opened
-    assert plan("goto example.com/a", tabs=("12",), current=None).sends == opened
-    assert plan("goto example.com/a", tabs=("12",), current="12").sends == opened[1:]
-    for off_list in ("goto other.test", "goto file:///etc/hosts"):
-        refused = plan(off_list, tabs=(), current=None)
-        assert refused.refusal and not refused.sends
+    opened = ("tab new", "goto other.test/a")
+    assert plan("goto other.test/a", tabs=(), current=None).sends == opened
+    assert plan("goto other.test/a", tabs=("12",), current=None).sends == opened
+    assert plan("goto other.test/a", tabs=("12",), current="12").sends == opened[1:]
 
 
 @pytest.mark.parametrize(
@@ -237,11 +129,9 @@ def test_tab_list_is_answered_here_with_the_chats_own_tabs(command: str) -> None
         "tab ls",
         "tab List",
         "tab new example.com other.test",
-        "tab new other.test example.com",
         "tab new --browser",
         "tab new --browser=b2 other.test",
         "tab new (https://other.test )",
-        "tab new 'https://other.test'",
         "tab select 7",
         "tab select 012",
         "tab select 12 7",
@@ -251,47 +141,38 @@ def test_tab_list_is_answered_here_with_the_chats_own_tabs(command: str) -> None
         "tab close all",
         "tab close --browser b2",
         "goto",
-        "goto other.test",
         "goto example.com other.test",
         "goto --wait example.com",
-        "goto https://example.com@other.test",
-        "goto https://other.test\\@example.com",
         "goto https://example.com/a b",
-        "goto 'example.com'",
-        "goto javascript:alert(1)",
-        "goto file:///etc/hosts",
-        "goto view-source:https://example.com",
-        "goto localhost:3000",
-        "goto HTTPS://other.test",
-        "tab new localhost:3000/x",
         "request",
         "request 5",
         "request 5 --body",
     ],
 )
-def test_other_addresses_tab_commands_and_request_details_are_refused(command: str) -> None:
+def test_other_tab_commands_gotos_and_request_details_are_refused(command: str) -> None:
     decided = plan(command)
     assert decided.refusal and not decided.sends and not decided.reply
+    idle = plan(command, tabs=(), current=None)
+    assert idle.refusal and not idle.sends and not idle.reply
 
 
-def test_refusals_tell_the_agent_what_the_owner_can_do() -> None:
-    assert "ds browser allow other.test" in plan("goto https://Other.test/a").refusal
-    assert "ds browser allow other.test" in plan("tab new other.test").refusal
-    assert "only http and https" in plan("goto file:///etc/hosts").refusal
+def test_refusals_say_what_real_mode_takes() -> None:
     assert "not one this chat opened" in plan("tab select 7").refusal
+    assert plan("tab ls").refusal == real_browser.TAB_USAGE
+    assert plan("goto").refusal == "goto takes one address, like: goto https://example.com"
     assert "cookies and tokens" in plan("request 5").refusal
-
-
-@pytest.mark.parametrize(
-    "command", ["back", "forward", "reload", "help", "help tab", "browser list", 'browser use "b2"']
-)
-def test_commands_that_touch_no_page_content_are_sent_as_they_are(command: str) -> None:
-    assert plan(command) == real_browser.Plan(sends=(command,))
 
 
 @pytest.mark.parametrize(
     "command",
     [
+        "back",
+        "forward",
+        "reload",
+        "help",
+        "help tab",
+        "browser list",
+        'browser use "b2"',
         "snapshot -i",
         "click e12",
         'fill getByLabel("Email") "a@example.com"',
@@ -311,8 +192,9 @@ def test_commands_that_touch_no_page_content_are_sent_as_they_are(command: str) 
         'he"lp"',
     ],
 )
-def test_every_other_command_needs_an_allowed_page(command: str) -> None:
-    assert plan(command) == real_browser.Plan(sends=(command,), page=True)
+def test_every_other_command_is_sent_as_it_is(command: str) -> None:
+    assert plan(command) == real_browser.Plan(sends=(command,))
+    assert plan(command, tabs=(), current=None) == real_browser.Plan(sends=(command,))
 
 
 def test_upstream_is_the_pinned_package_with_no_extra_capabilities(
@@ -391,10 +273,6 @@ def sent(upstream: Path) -> list[str]:
     return [json.loads(line) for line in log.read_text().splitlines()] if log.exists() else []
 
 
-def allow(store: Store, *names: str) -> None:
-    real_browser.save_settings(store, real_sites=list(names))
-
-
 def control(upstream: Path, **settings: object) -> None:
     (upstream / "control.json").write_text(json.dumps(settings))
 
@@ -402,13 +280,19 @@ def control(upstream: Path, **settings: object) -> None:
 def test_instructions_carry_the_real_mode_note_and_everything_else_passes_through(
     chat: Chat, upstream: Path
 ) -> None:
-    assert chat.instructions == (
-        f"{real_browser.note([])}\n\nUpstream instructions: act in batches."
-    )
-    assert real_browser.note([]).startswith(real_browser.NOTE)
-    assert "No site was allowed when this chat started." in chat.instructions
-    assert "real Chrome" in real_browser.NOTE and "ds browser allow" in real_browser.NOTE
-    assert "Never read or print cookies, tokens or passwords" in real_browser.NOTE
+    assert chat.instructions == f"{real_browser.NOTE}\n\nUpstream instructions: act in batches."
+    for told in (
+        "the owner's real Chrome",
+        "It can open any site, but only in tabs you open",
+        "the owner's own tabs cannot be selected",
+        "ask the owner",
+        "the owner paused Browser MCP, stop and wait",
+        "Never sign in or out",
+        "Never read or print cookies, tokens or passwords",
+        "Close your tabs",
+    ):
+        assert told in real_browser.NOTE
+    assert "allow" not in chat.instructions
     assert chat.request("tools/list")["result"] == {
         "tools": [{"name": "browser", "inputSchema": {"type": "object"}}]
     }
@@ -418,76 +302,95 @@ def test_instructions_carry_the_real_mode_note_and_everything_else_passes_throug
     assert not error and text == "✓ upload report.pdf\nroot file:///work"
 
 
-def test_instructions_name_the_sites_allowed_when_the_chat_started(
-    store: Store, upstream: Path
-) -> None:
-    allow(store, "example.com", "example.org")
-    client = Chat(store)
-    try:
-        assert (
-            "Sites allowed when this chat started: example.com, example.org (their subdomains "
-            "too). `ds browser sites` shows the list as it is now.\n\nUpstream instructions"
-        ) in client.instructions
-        assert "No site was allowed" not in client.instructions
-    finally:
-        client.close()
-
-
-def test_addresses_off_the_allowlist_never_reach_the_browser(
-    chat: Chat, store: Store, upstream: Path
-) -> None:
-    for command in ("goto example.com", "tab new https://example.com/watch"):
-        text, error = chat.run(command)
-        assert error and "ds browser allow example.com" in text
-        assert text.startswith(f"✗ step 1: {command} — example.com is not an allowed site")
-    allow(store, "example.com")
-    for command in (
-        "goto other.test",
-        "tab new https://notexample.com",
-        "tab new https://example.com.other.test/",
-        "goto https://example.com@other.test/",
-        "goto file:///etc/hosts",
-        "tab new javascript:alert(1)",
-        'goto "https://other.test/"',
-        "tab --browser b2 new other.test",
-    ):
-        text, error = chat.run(command)
-        assert error and text.startswith("✗ step 1: "), command
-    assert sent(upstream) == []
-
-    text, error = chat.run("goto studio.example.com/watch?v=1")
-    assert not error
-    assert text == (
+def test_any_site_opens_with_no_site_ever_allowed(chat: Chat, store: Store, upstream: Path) -> None:
+    assert chat.run("goto other.test/watch?v=1") == (
         "✓ tab new — tab 501\n"
-        '✓ goto "https://studio.example.com/watch?v=1"\n'
-        'Page: https://studio.example.com/watch?v=1 — "Title of studio.example.com"'
+        "✓ goto other.test/watch?v=1\n"
+        'Page: https://other.test/watch?v=1 — "Title of other.test"',
+        False,
     )
-    text, error = chat.run("tab new example.com")
-    assert not error
-    assert text == (
+    assert chat.run("tab new https://example.com/a") == (
         "✓ tab new — tab 502\n"
-        '✓ goto "https://example.com"\n'
-        'Page: https://example.com — "Title of example.com"'
+        '✓ goto "https://example.com/a"\n'
+        'Page: https://example.com/a — "Title of example.com"',
+        False,
+    )
+    assert chat.run("goto file:///tmp/page.html\nget url") == (
+        "✓ goto file:///tmp/page.html\n"
+        "✓ get url\nfile:///tmp/page.html\n"
+        'Page: file:///tmp/page.html — "Title of "',
+        False,
     )
     assert sent(upstream) == [
         "tab new",
-        'goto "https://studio.example.com/watch?v=1"',
+        "goto other.test/watch?v=1",
         "tab new",
-        'goto "https://example.com"',
+        'goto "https://example.com/a"',
+        "goto file:///tmp/page.html",
+        "get url",
     ]
+    assert not (store.root / "browser/settings.json").exists()
 
 
-def test_a_blank_tab_needs_no_allowed_site(chat: Chat, upstream: Path) -> None:
-    text, error = chat.run("tab new\nget url\ngoto about:blank")
+@pytest.mark.parametrize("left", [[], ["example.com"]])
+def test_a_site_list_left_in_old_settings_changes_nothing(
+    store: Store, upstream: Path, left: list[str]
+) -> None:
+    agent_browser.save_settings(store, installed=True, real_sites=left)
+    saved = (store.root / "browser/settings.json").read_bytes()
+    client = Chat(store)
+    try:
+        assert client.instructions == (
+            f"{real_browser.NOTE}\n\nUpstream instructions: act in batches."
+        )
+        for address in ("example.com", "other.test"):
+            assert not client.run(f"goto {address}\nget title")[1]
+    finally:
+        client.close()
+    assert sent(upstream) == [
+        "tab new",
+        "goto example.com",
+        "get title",
+        "goto other.test",
+        "get title",
+    ]
+    assert (store.root / "browser/settings.json").read_bytes() == saved
+
+
+def test_a_goto_that_cannot_run_opens_no_tab(chat: Chat, upstream: Path) -> None:
+    for command in ("goto", "goto example.com other.test"):
+        assert chat.run(f"{command}\nget title") == (
+            f"✗ step 1: {command} — goto takes one address, like: goto https://example.com\n"
+            "Step 2 not run",
+            True,
+        )
+    assert chat.run("tab list")[0].startswith("✓ tab list\nThis chat has no tab open.")
+    assert sent(upstream) == []
+
+
+def test_other_chrome_profiles_are_listed_chosen_and_opened_in(chat: Chat, upstream: Path) -> None:
+    text, error = chat.run(
+        'browser list\nbrowser use "Work"\ntab new example.com --browser "Work 2"\ntab list'
+    )
     assert not error
-    assert text.split("\n")[:3] == ["✓ tab new — tab 501", "✓ get url", "about:blank"]
-    assert sent(upstream) == ["tab new", "get url", "get url", 'goto "about:blank"']
+    assert text == (
+        '✓ browser list\n* b1 "Work" — 3 tabs\n'
+        '✓ browser use "Work"\n* b1 "Work" — 3 tabs\n'
+        '✓ tab new --browser "Work 2" — tab 501 in Work 2\n✓ goto "example.com"\n'
+        f"✓ tab list\n* 501\n{LISTED}\n"
+        'Page: https://example.com — "Title of example.com"'
+    )
+    assert sent(upstream) == [
+        "browser list",
+        'browser use "Work"',
+        'tab new --browser "Work 2"',
+        'goto "example.com"',
+    ]
 
 
 def test_the_owners_tabs_are_never_listed_or_selected(
     chat: Chat, store: Store, upstream: Path
 ) -> None:
-    allow(store, "example.com")
     text, _ = chat.run('tab new example.com\ntab new example.com/b --browser "x — tab 7"')
     assert "✓ tab new — tab 501" in text and "— tab 502 in x — tab 7" in text
     before = sent(upstream)
@@ -508,7 +411,7 @@ def test_the_owners_tabs_are_never_listed_or_selected(
         f"✓ tab list\n* 501\n  502\n{LISTED}\n"
         'Page: https://example.com — "Title of example.com"'
     )
-    assert sent(upstream)[len(before) :] == ["tab select 501", "get url", "get url"]
+    assert sent(upstream)[len(before) :] == ["tab select 501", "get url"]
 
     other = Chat(store)
     listed, _ = other.run("tab list")
@@ -518,44 +421,35 @@ def test_the_owners_tabs_are_never_listed_or_selected(
     assert error and "not one this chat opened" in text
 
 
-def test_a_chat_can_always_get_back_to_a_tab_it_opened(
-    chat: Chat, store: Store, upstream: Path
-) -> None:
-    allow(store, "example.com")
+def test_a_chat_can_always_get_back_to_a_tab_it_opened(chat: Chat, upstream: Path) -> None:
     assert chat.run("goto example.com") == (
         "✓ tab new — tab 501\n"
-        '✓ goto "https://example.com"\n'
+        "✓ goto example.com\n"
         'Page: https://example.com — "Title of example.com"',
         False,
     )
     assert not chat.run("goto example.com/next")[1]
-    assert sent(upstream) == [
-        "tab new",
-        'goto "https://example.com"',
-        'goto "https://example.com/next"',
-    ]
+    assert sent(upstream) == ["tab new", "goto example.com", "goto example.com/next"]
     assert not chat.run("tab new example.com/\ntab close")[1]
     assert chat.run("tab list") == (f"✓ tab list\n  501\n{LISTED}", False)
     before = sent(upstream)
     text, error = chat.run("tab select 501\ngoto example.com/again\nget url")
     assert not error
     assert text == (
-        '✓ tab select 501\n✓ goto "https://example.com/again"\n'
+        "✓ tab select 501\n✓ goto example.com/again\n"
         "✓ get url\nhttps://example.com/again\n"
         'Page: https://example.com/again — "Title of example.com"'
     )
     assert sent(upstream)[len(before) :] == [
         "tab select 501",
-        'goto "https://example.com/again"',
-        "get url",
+        "goto example.com/again",
         "get url",
     ]
 
 
 def test_a_closed_tab_is_forgotten_and_the_next_goto_opens_a_new_one(
-    chat: Chat, store: Store, upstream: Path
+    chat: Chat, upstream: Path
 ) -> None:
-    allow(store, "example.com")
     chat.run("tab new example.com\ntab new example.com/b\ntab new example.com/c")
     assert chat.run("tab close 501\ntab list") == (
         f"✓ tab close 501\n✓ tab list\n  502\n* 503\n{LISTED}",
@@ -580,55 +474,48 @@ def test_a_closed_tab_is_forgotten_and_the_next_goto_opens_a_new_one(
 
     text, error = chat.run("goto example.com/d\ntab list")
     assert not error and text.startswith(
-        f'✓ tab new — tab 504\n✓ goto "https://example.com/d"\n✓ tab list\n  502\n* 504\n{LISTED}'
+        f"✓ tab new — tab 504\n✓ goto example.com/d\n✓ tab list\n  502\n* 504\n{LISTED}"
     )
-    assert sent(upstream)[len(before) :] == ["tab new", 'goto "https://example.com/d"']
+    assert sent(upstream)[len(before) :] == ["tab new", "goto example.com/d"]
 
 
-def test_a_tab_whose_page_fails_to_load_is_still_known(
-    chat: Chat, store: Store, upstream: Path
-) -> None:
-    allow(store, "example.com")
-    for command in ("goto down.example.com", "tab new down.example.com"):
+def test_a_tab_whose_page_fails_to_load_is_still_known(chat: Chat, upstream: Path) -> None:
+    for command, went in (
+        ("goto down.example.com", "goto down.example.com"),
+        ("tab new down.example.com", 'goto "down.example.com"'),
+    ):
         text, error = chat.run(f"{command}\nget title")
         assert error and "✓ tab new — tab " in text
         assert text.split("\n")[1:] == [
-            '✗ step 1: goto "https://down.example.com" — net::ERR_CONNECTION_REFUSED at '
-            "https://down.example.com",
+            f"✗ step 1: {went} — net::ERR_CONNECTION_REFUSED at https://down.example.com",
             "Step 2 not run",
             'Page: about:blank — ""',
         ]
     assert chat.run("tab list") == (f"✓ tab list\n  501\n* 502\n{LISTED}", False)
     before = sent(upstream)
     assert chat.run("goto example.com") == (
-        '✓ goto "https://example.com"\nPage: https://example.com — "Title of example.com"',
+        '✓ goto example.com\nPage: https://example.com — "Title of example.com"',
         False,
     )
-    assert sent(upstream)[len(before) :] == ['goto "https://example.com"']
+    assert sent(upstream)[len(before) :] == ["goto example.com"]
 
 
-def test_tab_list_never_reaches_upstream_and_the_batch_goes_on(
-    chat: Chat, store: Store, upstream: Path
-) -> None:
-    allow(store, "example.com")
+def test_tab_list_never_reaches_upstream_and_the_batch_goes_on(chat: Chat, upstream: Path) -> None:
     text, error = chat.run("tab list\ntab new example.com\ntab list\nget title")
     assert not error
     assert text == (
         "✓ tab list\nThis chat has no tab open. Open one with: tab new <url>\n"
         "The owner's own tabs are never listed.\n"
-        '✓ tab new — tab 501\n✓ goto "https://example.com"\n'
+        '✓ tab new — tab 501\n✓ goto "example.com"\n'
         f"✓ tab list\n* 501\n{LISTED}\n"
         "✓ get title\nTitle of example.com\n"
         'Page: https://example.com — "Title of example.com"'
     )
     assert "owner.test" not in text
-    assert sent(upstream) == ["tab new", 'goto "https://example.com"', "get url", "get title"]
+    assert sent(upstream) == ["tab new", 'goto "example.com"', "get title"]
 
 
-def test_a_requests_headers_and_body_are_never_shown(
-    chat: Chat, store: Store, upstream: Path
-) -> None:
-    allow(store, "example.com")
+def test_a_requests_headers_and_body_are_never_shown(chat: Chat, upstream: Path) -> None:
     chat.run("tab new example.com")
     before = sent(upstream)
     for command in ("request 5", "request 5 --body"):
@@ -636,68 +523,60 @@ def test_a_requests_headers_and_body_are_never_shown(
             f"✗ step 1: {command} — {real_browser.NO_REQUEST}",
             True,
         )
-    assert sent(upstream) == before
-    assert chat.run("requests") == ("✓ requests\n5 GET 200 https://example.com/api", False)
-    assert sent(upstream)[len(before) :] == ["get url", "requests"]
-
-
-def test_a_click_that_leaves_the_allowed_sites_stops_the_batch_and_blocks_the_tab(
-    chat: Chat, store: Store, upstream: Path
-) -> None:
-    allow(store, "example.com")
-    control(upstream, moves={"click": "https://other.test/landing"})
-    text, error = chat.run("tab new example.com\nclick e1\nget text\nsnapshot")
-    assert error
+    text, error = chat.run("get title\nrequest 5 --body\nget url")
+    assert error and "secret" not in text
     assert text == (
-        '✓ tab new — tab 501\n✓ goto "https://example.com"\n'
-        "✓ click e1\n"
-        f"✗ after step 2: {real_browser.off_site('https://other.test/landing')}\n"
-        "Steps 3–4 not run\n"
-        'Page: https://other.test/landing — "Title of other.test"'
+        "✓ get title\nTitle of example.com\n"
+        f"✗ step 2: request 5 --body — {real_browser.NO_REQUEST}\n"
+        "Step 3 not run"
     )
-    assert "The tab is on other.test, which is not an allowed site" in text
-    assert "ds browser allow other.test" in text and "`back`" in text and "tab close" in text
-    assert sent(upstream) == ["tab new", 'goto "https://example.com"', "get url", "click e1"]
+    assert sent(upstream)[len(before) :] == ["get title"]
+    assert chat.run("requests") == ("✓ requests\n5 GET 200 https://example.com/api", False)
+    assert sent(upstream)[len(before) :] == ["get title", "requests"]
 
-    for command in ("snapshot", "get text", 'eval "document.title"', "click e2", "screenshot"):
-        result = chat.browser(command)
-        text = result["content"][0]["text"]
-        assert result["isError"] and len(result["content"]) == 1
-        assert text == f"✗ step 1: {command} — {real_browser.off_site('https://other.test/x')}"
-    assert sent(upstream)[4:] == ["get url"] * 5
 
-    text, error = chat.run("tab close 7\nhelp")
-    assert error and text.split("\n") == [
-        "✗ step 1: tab close 7 — Tab 7 isn't one you opened, so it stays open. Switch away "
-        "with `tab select <id>`",
-        f"✗ after step 1: {real_browser.off_site('https://other.test/landing')}",
-        "Step 2 not run",
-        'Page: https://other.test/landing — "Title of other.test"',
+def test_leaving_a_site_by_a_link_or_a_redirect_does_not_stop_the_batch(
+    chat: Chat, upstream: Path
+) -> None:
+    chat.run("tab new example.com")
+    control(upstream, moves={"click": "https://other.test/landing"})
+    result = chat.browser("click e1\nget text\nsnapshot\nscreenshot")
+    assert result["isError"] is False
+    assert result["content"] == [
+        {
+            "type": "text",
+            "text": (
+                "✓ click e1\n"
+                "✓ get text\ntext of https://other.test/landing\n"
+                "✓ snapshot\nsnapshot of https://other.test/landing\n"
+                "✓ screenshot — 2×2 JPEG\n"
+                'Page: https://other.test/landing — "Title of other.test"'
+            ),
+        },
+        {"type": "image", "data": "aW1hZ2U=", "mimeType": "image/jpeg"},
     ]
-    text, error = chat.run("back\nsnapshot")
-    assert not error and "snapshot of https://example.com" in text
-    assert sent(upstream)[9:] == ["tab close 7", "back", "get url", "snapshot"]
+    control(upstream, moves={"goto": "https://elsewhere.test/moved"})
+    assert chat.run("goto example.com/next\nget url") == (
+        "✓ goto example.com/next\n"
+        "✓ get url\nhttps://elsewhere.test/moved\n"
+        'Page: https://elsewhere.test/moved — "Title of elsewhere.test"',
+        False,
+    )
+    assert sent(upstream) == [
+        "tab new",
+        'goto "example.com"',
+        "click e1",
+        "get text",
+        "snapshot",
+        "screenshot",
+        "goto example.com/next",
+        "get url",
+    ]
 
 
-def test_allowing_the_site_unblocks_the_same_chat_without_a_restart(
-    chat: Chat, store: Store, upstream: Path
+def test_a_batch_reaches_upstream_one_command_per_call_in_order_and_nothing_else_does(
+    chat: Chat, upstream: Path
 ) -> None:
-    allow(store, "example.com")
-    control(upstream, moves={"click": "https://app.other.test/landing"})
-    chat.run("tab new example.com\nclick e1")
-    text, error = chat.run("snapshot")
-    assert error and "ds browser allow app.other.test" in text
-    assert cli.execute(cli.parser().parse_args(["browser", "allow", "other.test"]), store) == 0
-    text, error = chat.run("snapshot")
-    assert not error and text == "✓ snapshot\nsnapshot of https://app.other.test/landing"
-    assert cli.execute(cli.parser().parse_args(["browser", "disallow", "other.test"]), store) == 0
-    assert chat.run("snapshot")[1]
-
-
-def test_a_batch_reaches_upstream_one_command_per_call_in_order(
-    chat: Chat, store: Store, upstream: Path
-) -> None:
-    allow(store, "example.com")
     result = chat.browser(
         "# open it\r\ntab new example.com\r\n\r\n  get title  \nhelp\nscreenshot\nget url\n"
     )
@@ -706,7 +585,7 @@ def test_a_batch_reaches_upstream_one_command_per_call_in_order(
         {
             "type": "text",
             "text": (
-                '✓ tab new — tab 501\n✓ goto "https://example.com"\n'
+                '✓ tab new — tab 501\n✓ goto "example.com"\n'
                 "✓ get title\nTitle of example.com\n"
                 "✓ help\ngoto <url>\n"
                 "✓ screenshot — 2×2 JPEG\n"
@@ -718,17 +597,14 @@ def test_a_batch_reaches_upstream_one_command_per_call_in_order(
     ]
     assert sent(upstream) == [
         "tab new",
-        'goto "https://example.com"',
-        "get url",
+        'goto "example.com"',
         "get title",
         "help",
-        "get url",
         "screenshot",
-        "get url",
         "get url",
     ]
     assert chat.browser(["goto example.com/b\nget title", "back"])["isError"] is False
-    assert sent(upstream)[9:] == ['goto "https://example.com/b"', "get url", "get title", "back"]
+    assert sent(upstream)[6:] == ["goto example.com/b", "get title", "back"]
 
 
 def test_two_calls_at_once_never_interleave_upstream(chat: Chat, upstream: Path) -> None:
@@ -743,27 +619,23 @@ def test_two_calls_at_once_never_interleave_upstream(chat: Chat, upstream: Path)
     assert sent(upstream) == [f"help {name}{number}" for name in "ab" for number in range(1, 5)]
 
 
-def test_only_the_last_page_line_is_kept(chat: Chat, store: Store, upstream: Path) -> None:
-    allow(store, "example.com")
+def test_only_the_last_page_line_is_kept(chat: Chat) -> None:
     text, _ = chat.run("tab new example.com\ngoto example.com/b\nget title\ntab close")
     assert text.count("Page: ") == 1
     assert text.endswith('✓ tab close\nPage: https://example.com/b — "Title of example.com"')
 
 
-def test_failures_are_numbered_by_their_place_in_the_batch(
-    chat: Chat, store: Store, upstream: Path
-) -> None:
-    allow(store, "example.com")
+def test_failures_are_numbered_by_their_place_in_the_batch(chat: Chat, upstream: Path) -> None:
     text, error = chat.run("tab new example.com\nget title\nclick missing\nget url\nsnapshot")
     assert error
     assert text == (
-        '✓ tab new — tab 501\n✓ goto "https://example.com"\n'
+        '✓ tab new — tab 501\n✓ goto "example.com"\n'
         "✓ get title\nTitle of example.com\n"
         "✗ step 3: click missing — No element matches missing\n"
         "Steps 4–5 not run\n"
         'Page: https://example.com — "Title of example.com"'
     )
-    assert sent(upstream)[-2:] == ["get url", "click missing"]
+    assert sent(upstream)[-2:] == ["get title", "click missing"]
 
     text, error = chat.run("get title\nfrobnicate now\nsnapshot")
     assert error
@@ -780,76 +652,29 @@ def test_failures_are_numbered_by_their_place_in_the_batch(
     assert error and text.endswith(
         f"✗ step 2: tab ls — {real_browser.TAB_USAGE}\nSteps 3–4 not run"
     )
-    text, error = chat.run("get title\ngoto other.test")
-    assert error and "✗ step 2: goto other.test — other.test is not" in text
+    text, error = chat.run("get title\nrequest 5")
+    assert error and text.endswith(f"✗ step 2: request 5 — {real_browser.NO_REQUEST}")
     assert "not run" not in text
+
+    text, error = chat.run("get title\ntab new down.example.com\nhelp")
+    assert error and text.split("\n")[2:] == [
+        "✓ tab new — tab 502",
+        '✗ step 2: goto "down.example.com" — net::ERR_CONNECTION_REFUSED at '
+        "https://down.example.com",
+        "Step 3 not run",
+        'Page: about:blank — ""',
+    ]
 
 
 @pytest.mark.parametrize("message", [PAUSED, NOT_CONNECTED])
-def test_upstream_errors_come_back_unchanged(
-    chat: Chat, store: Store, upstream: Path, message: str
-) -> None:
-    allow(store, "example.com")
+def test_upstream_errors_come_back_unchanged(chat: Chat, upstream: Path, message: str) -> None:
     control(upstream, error=message)
     for command in ("snapshot", "tab new example.com", "back"):
         assert chat.run(command) == (message, True)
     assert chat.run("get title\nsnapshot") == (f"{message}\nStep 2 not run", True)
-    assert sent(upstream)[-2:] == ["get url", "get title"]
-
-
-def test_a_late_redirect_is_seen_before_the_next_command_reads_the_page(
-    chat: Chat, store: Store, upstream: Path
-) -> None:
-    allow(store, "example.com")
-    control(upstream, moves={"click": "https://other.test/late"}, late=True)
-    text, error = chat.run("tab new example.com\nclick e1\nsnapshot\nget text")
-    assert error and "snapshot of" not in text
-    assert text.split("\n")[2:] == [
-        "✓ click e1",
-        f"✗ step 3: snapshot — {real_browser.off_site('https://other.test/late')}",
-        "Step 4 not run",
-        'Page: https://example.com — "Title of example.com"',
-    ]
-    assert sent(upstream) == [
-        "tab new",
-        'goto "https://example.com"',
-        "get url",
-        "click e1",
-        "get url",
-    ]
-
-
-def test_what_a_command_read_while_leaving_the_allowed_sites_is_withheld(
-    chat: Chat, store: Store, upstream: Path
-) -> None:
-    allow(store, "example.com")
-    moved = "https://other.test/private"
-    control(upstream, moves={"eval": moved, "screenshot": moved})
-    for command in ('eval "document.body.innerText"', "screenshot"):
-        chat.run("tab new example.com")
-        result = chat.browser(f"{command}\nget title")
-        assert result["isError"] and len(result["content"]) == 1
-        lines = result["content"][0]["text"].split("\n")
-        assert lines[0].startswith(f"✓ {command}")
-        assert lines[1:] == [
-            f"✗ after step 1: {real_browser.off_site(moved)}",
-            "Step 2 not run",
-            'Page: https://other.test/private — "Title of other.test"',
-        ]
-
-
-def test_a_probe_answer_that_names_no_page_blocks_the_command(store: Store) -> None:
-    proxy = real_browser.Proxy(store)
-    asked = []
-
-    async def ask(command: str) -> real_browser.Answer:
-        asked.append(command)
-        return real_browser.Answer("✓ get url")
-
-    proxy.ask = ask
-    [blocked] = asyncio.run(proxy.step(1, "snapshot", ["example.com"]))
-    assert blocked.failed and blocked.text.startswith("✗ step 1: snapshot — The tab is on")
-    assert asked == ["get url"]
+    assert sent(upstream) == ["snapshot", "tab new", "back", "get title"]
+    control(upstream)
+    assert chat.run("tab list")[0].startswith("✓ tab list\nThis chat has no tab open.")
 
 
 def test_other_tools_and_unreadable_commands_are_answered_without_upstream(

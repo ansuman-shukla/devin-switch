@@ -292,7 +292,7 @@ CLI removal requires explicit confirmation: `ds remove work --yes`.
 
 `ds browser install` registers two MCP servers for every chat (Switch's shared MCP config and
 your user-level `~/.config/devin/mcp_config.json`): `browser`, the test browser described here,
-and `real-browser`, [real mode](#real-mode-let-agents-use-your-own-chrome-on-sites-you-allow).
+and `real-browser`, [real mode](#real-mode-let-agents-use-your-own-chrome).
 It also allows their tools (`mcp__browser__*`, `mcp__real-browser__*`) in every saved login, in
 the user config, and in logins you add later. Old `chrome-devtools-mcp` entries are replaced.
 Restart open chats afterwards.
@@ -354,17 +354,17 @@ Agents (or you) can copy other items with
 `ds browser status` lists profiles and running instances, and `ds browser stop` closes them
 immediately. The server runs `npx -y chrome-devtools-mcp@1.10.1`, so Node.js is required.
 
-### Real mode: let agents use your own Chrome on sites you allow
+### Real mode: let agents use your own Chrome
 
 Some websites can tell the test browser is a robot and turn it away. For those, agents can use
 the `real-browser` server, which drives the Chrome you are signed into through the
-[Browser MCP](https://browsermcp.io) extension.
+[Browser MCP](https://browsermcp.io) extension. It can open any website, as you can.
 
 | | Test mode (`browser`) | Real mode (`real-browser`) |
 | --- | --- | --- |
 | Which Chrome | A separate headless copy of a profile | Your own running Chrome |
 | Use it for | Everyday browsing, checks and screenshots | Sites that refuse the test browser |
-| Websites | Any | Only the sites you allow; none to begin with |
+| Websites | Any, with the logins Switch copied | Any, signed in as you |
 | Your tabs | Never touched | Never listed or selected; agents work in tabs they open |
 | Your off switch | `ds browser stop` | The extension's **Stop** / **Resume** button |
 
@@ -372,39 +372,33 @@ Set it up once:
 
 1. Install the Browser MCP extension in your Chrome.
 2. Run `ds browser install` and restart open chats.
-3. Allow the sites agents may use (see below).
-4. The first time an agent uses real mode, the extension's popup shows a code: click **Allow**.
+3. The first time an agent uses real mode, the extension's popup shows a code: click **Allow**.
 
-You decide which websites real mode may touch. Nothing is allowed until you add a site, and a
-site covers its subdomains (`example.com` also allows `app.example.com`, but not
-`notexample.com`):
+Agents can use several Chrome profiles. Add the extension to each profile and click **Allow**
+once there; up to 8 can be connected at the same time, and a profile is connected only while
+it is open in Chrome. You can give each browser a name in the extension's settings. Agents see
+the connected browsers with `browser list`, and choose one with `browser use "<name>"` or
+`tab new example.com --browser "<name>"`.
 
-```sh
-ds browser allow example.com       # a host or a full address; several at once work too
-ds browser sites                   # what is allowed now
-ds browser disallow example.com
-```
+There is no list of allowed sites: real mode goes wherever an agent sends it, signed in as
+you. What protects you:
 
-Changes apply to open chats at their next browser call, and the server tells each new chat
-which sites are allowed, so agents know where they may use real mode. Under that list, real
-mode:
+- **Stop and Resume.** Each browser's extension has its own **Stop** button. Click it whenever
+  you want agents out of that browser; calls then tell the agent to wait until you click
+  **Resume**.
+- **Agents work only in tabs they opened.** A chat's `tab list` shows just its own tabs, and
+  your tabs are never listed or selected. A tab that a page opens by itself (a pop-up) can't
+  be used yet.
+- **Request details are never shown.** `request <id>` prints a request's headers and body,
+  which would put your cookies and tokens into the chat's history, so it is refused. The list
+  of requests (`requests`) still works.
+- **Rules for agents.** They are told to ask you before paying, sending, posting, deleting or
+  changing account settings unless the task asked for exactly that, never to sign in or out,
+  never to read or print cookies, tokens or passwords, and to close their tabs when done.
 
-- opens only allowed sites (and blank tabs), and only `http` and `https` pages;
-- reads and acts only while the tab is on an allowed site. If a link or redirect leaves the
-  allowed sites, the agent's batch stops there, and the tab stays closed to it until it goes
-  back, closes the tab, or you allow the site;
-- works only in tabs the chat opened itself. Its `tab list` shows just those, and your own
-  tabs are never listed or selected. A tab that a page opens by itself (a pop-up) can't be
-  used yet;
-- never shows a request's headers or body (`request <id>`), because they would put your
-  cookies and tokens into the chat's history. The list of requests (`requests`) still works.
-
-Agents are told to ask you before paying, sending, posting, deleting or changing account
-settings unless the task asked for exactly that, never to sign in or out, and never to read or
-print cookies, tokens or passwords. That is an instruction, not a lock: the locks are the site
-list and **Stop**. Unattended jobs can use real mode too and run without permission prompts,
-so allow only sites you are comfortable with. Click **Stop** in the extension whenever you
-want agents out of your Chrome; calls then tell the agent to wait until you click **Resume**.
+The rules are instructions, not locks. Unattended jobs can use real mode too and run without
+permission prompts, so what a page says can steer an agent on any site you are signed into.
+**Stop** is the switch that always works.
 
 The server runs `npx -y @browsermcp/mcp@2.4.0`, so Node.js is required.
 
@@ -613,9 +607,6 @@ extension.
 | `ds browser refresh PROFILE` | Copy a Chrome profile's logins into its agent profile again |
 | `ds chrome copy ITEM... --to DIR --reason TEXT` | Copy from Chrome's data folder, asking with a popup when macOS blocks it |
 | `ds browser stop [PROFILE]` | Close running agent browsers now |
-| `ds browser allow SITE...` | Let real mode use these sites (and their subdomains) in your own Chrome |
-| `ds browser disallow SITE...` | Take sites back from real mode |
-| `ds browser sites` | List the sites real mode may use |
 | `ds chat id` | Print the conversation a Desktop chat's process belongs to |
 
 `ds verify` makes no model request. Matching history across accounts is separate from a
@@ -649,9 +640,9 @@ selected
 - Agent browser profiles hold copies of Chrome cookies and site storage. They are as
   sensitive as your browser profile: the folders are private to your user, and the
   `browser` MCP server gives agents full control of these logged-in sessions.
-- Real mode acts in your own Chrome, signed in as you, on the sites listed under `real_sites`
-  in `browser/settings.json`. Pages on those sites, and what agents do there, reach the chat
-  like any other tool output. Browser MCP keeps its own state in `~/.browsermcp`.
+- Real mode acts in your own Chrome, signed in as you, on any site. The pages agents open,
+  and what they do there, reach the chat like any other tool output. Browser MCP keeps its own
+  state in `~/.browsermcp`.
 
 - Native credentials are local files restricted to the current user, **not Keychain-encrypted**.
   Protect this directory and its backups as sensitive data.

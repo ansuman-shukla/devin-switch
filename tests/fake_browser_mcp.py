@@ -2,10 +2,10 @@
 
 It keeps tabs of its own next to one that belongs to the owner, logs every `commands` string
 it receives, and reads `control.json` beside the log before each call:
-`moves` maps a command name to the URL the tab is on once that command ran, `late` makes the
-move happen only when the next call starts (so no Page line reports it), and `error` is
-returned instead of running anything. Addresses on a host that starts with `down.` fail to
-load: like upstream, `tab new <url>` then leaves a new current tab without naming it.
+`moves` maps a command name to the URL the tab is on once that command ran (a link or a
+redirect), and `error` is returned instead of running anything. Addresses on a host that
+starts with `down.` fail to load: like upstream, `tab new <url>` then leaves a new current tab
+without naming it.
 """
 
 import json
@@ -26,7 +26,7 @@ NO_TAB = (
 )
 histories = {OWNER_TAB: ["https://owner.test/inbox"]}
 opened: set[int] = set()
-state: dict = {"current": None, "last": 500, "late": None}
+state: dict = {"current": None, "last": 500}
 
 
 class Failure(Exception):
@@ -154,22 +154,13 @@ def step(line: str, notes: list[str], printed: list[str], images: list[dict]) ->
             printed.append(f"5 GET 200 {url}/api")
         elif name == "request":
             printed.append("cookie: session=secret")
-    target = control().get("moves", {}).get(name)
-    if target and control().get("late"):
-        state["late"] = (state["current"], target)
-    elif target:
+    if target := control().get("moves", {}).get(name):
         history().append(target)
-        if name == "eval":
-            printed[-1] = f"eval of {target}"
 
 
 def call(commands: str) -> dict:
     if error := control().get("error"):
         return {"content": [{"type": "text", "text": error}], "isError": True}
-    if state["late"]:
-        tab, url = state["late"]
-        histories[tab].append(url)
-        state["late"] = None
     lines = [line.strip() for line in re.split(r"\r?\n", commands)]
     lines = [line for line in lines if line and not line.startswith("#")]
     invalid = [

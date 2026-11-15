@@ -1082,8 +1082,8 @@ def install(store: Store, default: str | None) -> str:
         else "No default profile; set one with: ds browser default PROFILE"
     )
     lines.append(
-        "'real-browser' is real mode: your own Chrome through the Browser MCP extension, only "
-        "on sites you allow with: ds browser allow SITE"
+        "'real-browser' is real mode: your own Chrome through the Browser MCP extension, on any "
+        "site, in tabs the agents open. The extension's Stop button pauses them."
     )
     lines.append("Restart open chats (or Desktop) so they load the servers.")
     return "\n".join(lines)

@@ -1,64 +1,52 @@
 """Real mode: agents drive the owner's own Chrome through the Browser MCP extension.
 
 Websites can tell the agent browser's headless copy is a robot, so real mode works in the
-Chrome the owner is signed into. The owner keeps two locks: the extension's own Stop/Resume
-button, and the site allowlist kept here, which starts empty.
+Chrome the owner is signed into, on any site. The owner's switch is the extension's own
+Stop/Resume button.
 
 `ds browser real-mcp` is a per-chat stdio proxy around the pinned `@browsermcp/mcp` server. It
-splits a chat's batch and sends upstream one command per call, so every command passes the
-policy first: only allowed sites are opened, read or acted on, and only in tabs the chat opened.
+splits a chat's batch and sends upstream one command per call, so it learns the id of every
+tab the chat opens before the next command runs: agents work only in tabs they opened, and a
+request's headers and body are never shown.
 """
 
 import asyncio
 import json
 import re
-from collections.abc import Collection, Sequence
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 
 from devin_switch.agent_browser import (
     LINE_LIMIT,
     messages,
     package_command,
-    save_settings,
     send,
-    settings,
     stdin_reader,
     tool_result,
     write,
 )
-from devin_switch.store import Store, SwitchError
+from devin_switch.store import SwitchError
 
 MCP_PACKAGE = "@browsermcp/mcp@2.4.0"
 OVERRIDE = "DS_REAL_BROWSER_MCP"
 TOOL = "browser"
-ACTIONS = ("allow", "disallow", "sites", "real-mcp")
-BLANK = "about:blank"
-PROBE = "get url"
-# Commands that neither read nor act on a page's content, so they need no allowed page.
-FREE = ("back", "forward", "reload", "help")
 ECHO_LIMIT = 300
 # What JavaScript's trim() and \s count as white space: the upstream parser splits on these.
 SPACE = "\t\n\v\f\r \u00a0\u1680\u2000-\u200a\u2028\u2029\u202f\u205f\u3000\ufeff"
 EDGES = re.compile(rf"^[{SPACE}]+|[{SPACE}]+$")
 GAP = re.compile(rf"[{SPACE}]")
 WORD = re.compile(rf'"(?:[^"\\]|\\.)*"(?=[{SPACE}]|$)|[^{SPACE}]+')
-SCHEME = re.compile(r"[a-z][a-z0-9+.-]*:", re.IGNORECASE)
-LOCAL = ("localhost", "127.", "[::1]")
-WEB = re.compile(
-    rf"https?://([a-z0-9-]+(?:\.[a-z0-9-]+)*)(?::[0-9]+)?(?:[/?#][^{SPACE}]*)?",
-    re.ASCII | re.IGNORECASE,
-)
 TAB_ID = re.compile(r"[0-9]+")
-PAGE = re.compile(r'Page: (.*?) — ".*"')
+PAGE = re.compile(r'Page: .* — ".*"')
 FIRST_STEP = re.compile(r"^✗ step 1:", re.MULTILINE)
 NOTHING_RAN = "Nothing ran: fix this line and send the call again"
-NO_SITES = "No site is allowed yet, so real mode opens nothing. Add one: ds browser allow SITE"
 OWN_TABS = "Real mode works only in tabs it opened, never in the owner's own tabs."
 NOT_LISTED = "The owner's own tabs are never listed."
 TAB_USAGE = (
     'Real mode takes: tab list, tab new [<url>] [--browser "<name>"], tab select <id> for a '
     "tab it opened, and tab close [<id>]."
 )
+ONE_ADDRESS = "goto takes one address, like: goto https://example.com"
 NO_REQUEST = (
     "Real mode never shows a request's headers or body, because they hold the owner's cookies "
     "and tokens. `requests` lists the requests."
@@ -66,59 +54,16 @@ NO_REQUEST = (
 STOPPED = "The Browser MCP server behind real mode stopped."
 NOTE = (
     "This is the owner's real Chrome, signed in as them, not the test browser. Use it only when "
-    "the task says to use the real browser or needs a site the test browser cannot do. It works "
-    "only on sites the owner allowed (`ds browser allow SITE`) and only in tabs you open: `tab "
-    "list` shows just those, and the owner's own tabs cannot be selected. Before paying, "
-    "sending, posting, deleting or changing account settings, ask the owner, unless the task "
-    "itself asked for exactly that action. If a call says the owner paused Browser MCP, stop "
-    "and wait for them. Never sign in or out. Never read or print cookies, tokens or "
-    "passwords. Close your tabs when the work is done."
+    "the task says to use the real browser or needs a site the test browser cannot do. It can "
+    "open any site, but only in tabs you open: `tab list` shows just those, and the owner's own "
+    "tabs cannot be selected. Several Chrome profiles can be connected: `browser list` names "
+    'them and `browser use "<name>"` chooses where your next tabs open; a profile is connected '
+    "only while it is open in Chrome and has the extension. Before paying, sending, posting, "
+    "deleting or changing account settings, ask the owner, unless the task itself asked for "
+    "exactly that action. If a call says the owner paused Browser MCP, stop and wait for them. "
+    "Never sign in or out. Never read or print cookies, tokens or passwords. Close your tabs "
+    "when the work is done."
 )
-
-
-def web_host(url: str) -> str | None:
-    """The host of a plain http(s) URL; None for every other scheme and anything unusual.
-
-    Narrow on purpose (no user name, no escapes, only letters, digits, dots and hyphens in the
-    host), so this reading of a URL and Chrome's can never name different hosts.
-    """
-    found = WEB.fullmatch(url)
-    return found[1].lower() if found else None
-
-
-def permitted(url: str, allowed: Collection[str]) -> bool:
-    """Whether real mode may open, read and act on this URL: a blank tab or an allowed site."""
-    if url == BLANK:
-        return True
-    host = web_host(url)
-    return host is not None and any(host == site or host.endswith(f".{site}") for site in allowed)
-
-
-def sites(store: Store) -> list[str]:
-    value = settings(store).get("real_sites")
-    return [site for site in value if isinstance(site, str)] if isinstance(value, list) else []
-
-
-def note(allowed: Sequence[str]) -> str:
-    """The real-mode note for a new chat, naming the sites it may use so every agent knows."""
-    listed = (
-        f"Sites allowed when this chat started: {', '.join(allowed)} (their subdomains too)."
-        if allowed
-        else "No site was allowed when this chat started."
-    )
-    return f"{NOTE} {listed} `ds browser sites` shows the list as it is now."
-
-
-def named_site(value: str) -> str:
-    """The host the owner named, given as a host or as a full address."""
-    text = value.strip()
-    host = web_host(text if "://" in text else f"https://{text}")
-    if host is None:
-        raise SwitchError(
-            f"{value!r} is not a site. Name a host such as example.com (its subdomains are "
-            "included) or paste an http(s) address."
-        )
-    return host
 
 
 def split(commands: object) -> list[str]:
@@ -141,56 +86,19 @@ def words(text: str) -> list[str]:
     return found
 
 
-def address(value: str) -> str:
-    """The URL the upstream server opens for what follows `goto` or `tab new`."""
-    if SCHEME.match(value):
-        return value
-    return f"{'http' if value.startswith(LOCAL) else 'https'}://{value}"
-
-
 def echo(command: str) -> str:
     """A command as upstream echoes it in its answer: cut after ECHO_LIMIT characters."""
     return command if len(command) <= ECHO_LIMIT else f"{command[: ECHO_LIMIT - 1]}…"
 
 
-def off_site(url: str) -> str:
-    """Why a tab that left the allowed sites is closed to reads and actions."""
-    host = web_host(url)
-    owner = f", or ask the owner to allow it with: ds browser allow {host}" if host else ""
-    return (
-        f"The tab is on {host or url}, which is not an allowed site, so reads and actions are "
-        f"blocked there. Go `back`, close it with `tab close`{owner}"
-    )
-
-
 @dataclass(frozen=True)
 class Plan:
-    """The policy's answer for one command: what goes upstream (one call each), a reply made
-    here without upstream, or a refusal."""
+    """What to do with one command: what goes upstream (one call each), a reply made here
+    without upstream, or a refusal."""
 
     sends: tuple[str, ...] = ()
     reply: str = ""
     refusal: str = ""
-    page: bool = False
-
-
-def visit(opening: tuple[str, ...], target: str, allowed: Collection[str]) -> Plan:
-    """Open an allowed address, after `opening` a blank tab for it when one is needed.
-
-    The URL goes as a JSON string, so upstream reads exactly the URL that was checked. A new
-    tab is opened blank first: upstream names a tab only once its page has loaded, so a load
-    that fails would leave the chat with a tab it cannot name.
-    """
-    url = address(target)
-    if permitted(url, allowed):
-        return Plan(sends=(*opening, f"goto {json.dumps(url)}"))
-    host = web_host(url)
-    if host is None:
-        return Plan(refusal=f"Real mode opens only http and https pages, not {url}")
-    return Plan(
-        refusal=f"{host} is not an allowed site. The owner can allow it with: "
-        f"ds browser allow {host}"
-    )
 
 
 def listing(tabs: Sequence[str], current: str | None) -> str:
@@ -201,12 +109,12 @@ def listing(tabs: Sequence[str], current: str | None) -> str:
     return "\n".join([*lines, f"These are the tabs this chat opened; * is current. {NOT_LISTED}"])
 
 
-def tab(
-    arguments: list[str], allowed: Collection[str], tabs: Sequence[str], current: str | None
-) -> Plan:
+def tab(arguments: list[str], tabs: Sequence[str], current: str | None) -> Plan:
     flag = ""
-    if "--browser" in arguments[:-1]:
+    if "--browser" in arguments:
         at = arguments.index("--browser")
+        if at + 1 == len(arguments):
+            return Plan(refusal=TAB_USAGE)
         flag = f" --browser {json.dumps(arguments[at + 1])}"
         arguments = arguments[:at] + arguments[at + 2 :]
     action, rest = arguments[:1], arguments[1:]
@@ -215,7 +123,10 @@ def tab(
     if action == ["new"] and not rest:
         return Plan(sends=(f"tab new{flag}",))
     if action == ["new"] and len(rest) == 1:
-        return visit((f"tab new{flag}",), rest[0], allowed)
+        # Blank first: upstream names a tab only once its page has loaded, so a load that
+        # fails would leave the chat with a tab it cannot name. The address goes as a JSON
+        # string, which upstream reads back as the one word that was read here.
+        return Plan(sends=(f"tab new{flag}", f"goto {json.dumps(rest[0])}"))
     if flag or len(rest) > 1 or not all(TAB_ID.fullmatch(word) for word in rest):
         return Plan(refusal=TAB_USAGE)
     if action == ["close"]:
@@ -227,26 +138,27 @@ def tab(
     return Plan(refusal=TAB_USAGE)
 
 
-def plan(command: str, allowed: Collection[str], tabs: Sequence[str], current: str | None) -> Plan:
+def plan(command: str, tabs: Sequence[str], current: str | None) -> Plan:
     """What to do with one command, given the chat's own open tabs and its current one.
 
-    `goto` and `tab` are rebuilt from what was understood, so the check and upstream can never
-    read them differently; anything about them that is not understood is refused. A `goto`
-    with no current tab of the chat's own opens one first, so its id is known.
+    `tab` is rebuilt from what was understood and anything else about it is refused, so the
+    chat can only be in a tab whose id is known here. A `goto` with no current tab of the
+    chat's own opens a blank one first, for the same reason. Every other command but
+    `request` goes upstream as the agent wrote it.
     """
     name = GAP.split(command, maxsplit=1)[0]
     arguments = words(command[len(name) :])
     if name == "goto":
+        # Upstream takes one address as well. Refused here, so that a goto which cannot run
+        # never opens the blank tab first.
         if len(arguments) != 1:
-            return Plan(refusal="goto takes one address, like: goto https://example.com")
-        return visit(() if current else ("tab new",), arguments[0], allowed)
+            return Plan(refusal=ONE_ADDRESS)
+        return Plan(sends=(command,) if current else ("tab new", command))
     if name == "tab":
-        return tab(arguments, allowed, tabs, current)
+        return tab(arguments, tabs, current)
     if name == "request":
         return Plan(refusal=NO_REQUEST)
-    if name in FREE or (name == "browser" and arguments[:1] in (["list"], ["use"])):
-        return Plan(sends=(command,))
-    return Plan(sends=(command,), page=True)
+    return Plan(sends=(command,))
 
 
 @dataclass
@@ -304,10 +216,9 @@ def upstream_command() -> tuple[list[str], dict[str, str]]:
 
 
 class Proxy:
-    """Serve @browsermcp/mcp to one chat, behind the owner's site allowlist."""
+    """Serve @browsermcp/mcp to one chat, which works only in the tabs it opened."""
 
-    def __init__(self, store: Store) -> None:
-        self.store = store
+    def __init__(self) -> None:
         self.child: asyncio.subprocess.Process | None = None
         self.stopped = False
         self.pending: dict[object, str] = {}
@@ -337,18 +248,6 @@ class Proxy:
         )
         return answer(await reply)
 
-    async def current(self) -> str | None:
-        """The URL of the tab the next command acts on; None when upstream has none to name.
-
-        Asked before every page command: upstream reports a new page only when it changed
-        during a call, so a late redirect or a tab the owner handed over would go unseen.
-        """
-        probe = await self.ask(PROBE)
-        if probe.failed:
-            return None
-        lines = probe.text.split("\n")
-        return lines[1] if len(lines) > 1 else probe.text
-
     def track(self, sent: str, text: str) -> None:
         """Follow a tab command that worked, so every tab the chat has open is known by id."""
         if not sent.startswith("tab "):
@@ -366,48 +265,28 @@ class Proxy:
             if closed == self.tab:
                 self.tab = None
 
-    async def forward(self, number: int, sent: str, page: bool, allowed: Collection[str]) -> Answer:
-        """Run one command upstream, then check where it left the tab."""
-        result = await self.ask(sent)
-        if result.failed:
-            result.text = renumbered(result.text, number)
-        else:
-            self.track(sent, result.text)
-        landed = PAGE.fullmatch(result.page)[1] if result.page else None
-        if landed is None or permitted(landed, allowed):
-            return result
-        kept = result.text.split("\n")
-        if page:
-            # What it read may be the page it left the allowed sites for: only its ✓ line stays.
-            kept = [line for line in kept[:1] if line.startswith("✓ ")]
-        note = f"✗ after step {number}: {off_site(landed)}"
-        return Answer("\n".join([*kept, note]), result.page, failed=True)
-
-    async def step(self, number: int, command: str, allowed: Collection[str]) -> list[Answer]:
-        decided = plan(command, allowed, self.tabs, self.tab)
-        refusal = decided.refusal
-        if decided.page:
-            url = await self.current()
-            if url is not None and not permitted(url, allowed):
-                refusal = off_site(url)
-        if refusal:
-            return [Answer(f"✗ step {number}: {echo(command)} — {refusal}", failed=True)]
+    async def step(self, number: int, command: str) -> list[Answer]:
+        decided = plan(command, self.tabs, self.tab)
+        if decided.refusal:
+            return [Answer(f"✗ step {number}: {echo(command)} — {decided.refusal}", failed=True)]
         if decided.reply:
             return [Answer(f"✓ {echo(command)}\n{decided.reply}")]
         parts: list[Answer] = []
         for sent in decided.sends:
-            parts.append(await self.forward(number, sent, decided.page, allowed))
-            if parts[-1].failed:
+            result = await self.ask(sent)
+            parts.append(result)
+            if result.failed:
+                result.text = renumbered(result.text, number)
                 break
+            self.track(sent, result.text)
         return parts
 
     async def batch(self, commands: list[str]) -> dict:
         if not commands:
             return tool_result("No commands. Run `help`", error=True)
-        allowed = sites(self.store)
         parts: list[Answer] = []
         for number, command in enumerate(commands, 1):
-            parts += await self.step(number, command, allowed)
+            parts += await self.step(number, command)
             if parts[-1].failed:
                 break
         return joined(parts, number, len(commands))
@@ -451,8 +330,8 @@ class Proxy:
         elif self.pending.pop(key, None) == "initialize":
             result = message.get("result")
             if isinstance(result, dict):
-                head, upstream = note(sites(self.store)), result.get("instructions")
-                result["instructions"] = f"{head}\n\n{upstream}" if upstream else head
+                upstream = result.get("instructions")
+                result["instructions"] = f"{NOTE}\n\n{upstream}" if upstream else NOTE
         send(message)
 
     def fail(self) -> None:
@@ -501,25 +380,6 @@ class Proxy:
                 child.terminate()
 
 
-def command(args, store: Store) -> int:
-    if args.action == "real-mcp":
-        asyncio.run(Proxy(store).run())
-        return 0
-    if args.action == "sites":
-        print("\n".join(sites(store)) or NO_SITES)
-        return 0
-    named = list(dict.fromkeys(named_site(value) for value in args.sites))
-    current = sites(store)
-    if args.action == "allow":
-        save_settings(store, real_sites=sorted({*current, *named}))
-        for site in named:
-            print(f"Real mode may use {site} and its subdomains.")
-    else:
-        save_settings(store, real_sites=[site for site in current if site not in named])
-        for site in named:
-            print(
-                f"Real mode may no longer use {site}."
-                if site in current
-                else f"{site} was not an allowed site."
-            )
+def serve() -> int:
+    asyncio.run(Proxy().run())
     return 0

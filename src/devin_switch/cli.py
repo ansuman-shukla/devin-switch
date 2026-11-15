@@ -108,13 +108,6 @@ def parser() -> argparse.ArgumentParser:
     stop = actions.add_parser("stop", help="Close running agent browsers now")
     stop.add_argument("profile", nargs="?")
     actions.add_parser("mcp", help="Serve the browser MCP server over stdio (started by Devin)")
-    allow = actions.add_parser(
-        "allow", help="Let real mode (the real-browser server) use these sites in your Chrome"
-    )
-    allow.add_argument("sites", nargs="+", metavar="SITE", help="A host or a full address")
-    disallow = actions.add_parser("disallow", help="Take sites back from real mode")
-    disallow.add_argument("sites", nargs="+", metavar="SITE", help="A host or a full address")
-    actions.add_parser("sites", help="List the sites real mode may use")
     actions.add_parser(
         "real-mcp", help="Serve the real-browser MCP server over stdio (started by Devin)"
     )
@@ -181,8 +174,8 @@ def execute(args: argparse.Namespace, store: Store) -> int:
     if args.command == "browser":
         from devin_switch import agent_browser, real_browser
 
-        if args.action in real_browser.ACTIONS:
-            return real_browser.command(args, store)
+        if args.action == "real-mcp":
+            return real_browser.serve()
         return agent_browser.command(args, store)
     if args.command == "chat":
         from devin_switch import acp_state

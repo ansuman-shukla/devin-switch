@@ -20,34 +20,26 @@ from devin_switch.agent_browser import (
     LINE_LIMIT,
     messages,
     package_command,
-    save_settings,
     send,
-    settings,
     stdin_reader,
     tool_result,
     write,
 )
-from devin_switch.store import Store, SwitchError
+from devin_switch.store import SwitchError
 
 MCP_PACKAGE = "@browsermcp/mcp@2.4.0"
 OVERRIDE = "DS_REAL_BROWSER_MCP"
 TOOL = "browser"
-ACTIONS = ("allow", "disallow", "sites", "real-mcp")
 ECHO_LIMIT = 300
 # What JavaScript's trim() and \s count as white space: the upstream parser splits on these.
 SPACE = "\t\n\v\f\r \u00a0\u1680\u2000-\u200a\u2028\u2029\u202f\u205f\u3000\ufeff"
 EDGES = re.compile(rf"^[{SPACE}]+|[{SPACE}]+$")
 GAP = re.compile(rf"[{SPACE}]")
 WORD = re.compile(rf'"(?:[^"\\]|\\.)*"(?=[{SPACE}]|$)|[^{SPACE}]+')
-WEB = re.compile(
-    rf"https?://([a-z0-9-]+(?:\.[a-z0-9-]+)*)(?::[0-9]+)?(?:[/?#][^{SPACE}]*)?",
-    re.ASCII | re.IGNORECASE,
-)
 TAB_ID = re.compile(r"[0-9]+")
 PAGE = re.compile(r'Page: .* — ".*"')
 FIRST_STEP = re.compile(r"^✗ step 1:", re.MULTILINE)
 NOTHING_RAN = "Nothing ran: fix this line and send the call again"
-NO_SITES = "No site is allowed yet, so real mode opens nothing. Add one: ds browser allow SITE"
 OWN_TABS = "Real mode works only in tabs it opened, never in the owner's own tabs."
 NOT_LISTED = "The owner's own tabs are never listed."
 TAB_USAGE = (
@@ -72,33 +64,6 @@ NOTE = (
     "Never sign in or out. Never read or print cookies, tokens or passwords. Close your tabs "
     "when the work is done."
 )
-
-
-def web_host(url: str) -> str | None:
-    """The host of a plain http(s) URL; None for every other scheme and anything unusual.
-
-    Narrow on purpose (no user name, no escapes, only letters, digits, dots and hyphens in the
-    host), so this reading of a URL and Chrome's can never name different hosts.
-    """
-    found = WEB.fullmatch(url)
-    return found[1].lower() if found else None
-
-
-def sites(store: Store) -> list[str]:
-    value = settings(store).get("real_sites")
-    return [site for site in value if isinstance(site, str)] if isinstance(value, list) else []
-
-
-def named_site(value: str) -> str:
-    """The host the owner named, given as a host or as a full address."""
-    text = value.strip()
-    host = web_host(text if "://" in text else f"https://{text}")
-    if host is None:
-        raise SwitchError(
-            f"{value!r} is not a site. Name a host such as example.com (its subdomains are "
-            "included) or paste an http(s) address."
-        )
-    return host
 
 
 def split(commands: object) -> list[str]:
@@ -415,25 +380,6 @@ class Proxy:
                 child.terminate()
 
 
-def command(args, store: Store) -> int:
-    if args.action == "real-mcp":
-        asyncio.run(Proxy().run())
-        return 0
-    if args.action == "sites":
-        print("\n".join(sites(store)) or NO_SITES)
-        return 0
-    named = list(dict.fromkeys(named_site(value) for value in args.sites))
-    current = sites(store)
-    if args.action == "allow":
-        save_settings(store, real_sites=sorted({*current, *named}))
-        for site in named:
-            print(f"Real mode may use {site} and its subdomains.")
-    else:
-        save_settings(store, real_sites=[site for site in current if site not in named])
-        for site in named:
-            print(
-                f"Real mode may no longer use {site}."
-                if site in current
-                else f"{site} was not an allowed site."
-            )
+def serve() -> int:
+    asyncio.run(Proxy().run())
     return 0

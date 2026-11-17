@@ -226,6 +226,9 @@ restart needed. If the setting file is unreadable, automatic switching stays off
   over) uses the native CLI's typed quota signals: a `-32011` / `resource_exhausted`
   prompt error, or an `agent_stopped` event with cause `quota_exhausted`. The switch and the
   `continue` happen inside the same Desktop turn, so output keeps streaming into the chat.
+  If the login ran out before the agent could start on your message, the CLI (3000.14 and
+  newer) takes that message out of the conversation; Switch then sends **your message again**
+  on the new login instead of `continue`.
   Rate limits that include a retry delay do not trigger a switch. Stopping the turn in Desktop
   cancels the pending `continue`. Each turn switches at most three times and never goes back
   to a login it already tried. If no login has confirmed remaining usage, the original quota

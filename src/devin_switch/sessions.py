@@ -284,6 +284,22 @@ def resume_arguments(
     return tuple(arguments), session_id
 
 
+def own_config(arguments: tuple[str, ...]) -> bool:
+    """Whether the arguments name the user's own CLI config: such a launch is left as it is."""
+    for value in arguments:
+        if value == "--":
+            break
+        if value.partition("=")[0] == "--config":
+            return True
+    return False
+
+
+def adopt(store: Store, run_id: str, account: Account) -> None:
+    """Record that a live run now uses another login; the caller holds the store lock."""
+    path = store.root / "runs" / f"{run_id}.json"
+    write_json(path, {**json.loads(path.read_text()), "account": account.name})
+
+
 @contextmanager
 def managed(
     native: Native,
@@ -319,7 +335,14 @@ def managed(
                 lock_fds=(account_fd, run_fd),
                 run_id=run.id if can_handoff else None,
                 launch_id=run.id,
+                relays=kind == "chat" and not own_config(arguments),
             )
             yield runner, account, arguments
         finally:
-            write_json(directory / f"{run.id}.json", asdict(replace(run, ended_at=time.time())))
+            path = directory / f"{run.id}.json"
+            try:
+                # Its relay may have moved the run to another login meanwhile.
+                saved = json.loads(path.read_text())
+            except (OSError, ValueError):
+                saved = asdict(run)
+            write_json(path, {**saved, "ended_at": time.time()})

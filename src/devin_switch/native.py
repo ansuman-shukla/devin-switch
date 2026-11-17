@@ -130,6 +130,8 @@ class Native:
     run_id: str | None = None
     select_on_start: bool = False
     launch_id: str | None = None
+    # A terminal chat whose API traffic goes through a relay (never a login or a command).
+    relays: bool = False
 
     def track_process(self, pid: int) -> None:
         if self.launch_id:
@@ -260,17 +262,31 @@ class Native:
     def interactive(self, account: Account, arguments: tuple[str, ...]) -> int:
         previous_umask = os.umask(0o077)
         try:
+            from devin_switch import terminal
+
             self.retire_daemon(account)
             if self.run_id and sys.stdin.isatty() and sys.stdout.isatty():
-                from devin_switch import terminal
-
                 return terminal.run(self, account, arguments)
             with ExitStack() as stack:
+                environment = self.environment(account)
+                # A piped or scripted chat has no terminal to restart in: its relay is the only
+                # way it gets past a login that ran out of usage.
+                environment.update(
+                    stack.enter_context(
+                        terminal.relayed(
+                            self,
+                            account,
+                            lambda message, chosen: print(
+                                f"ds: {message}", file=sys.stderr, flush=True
+                            ),
+                        )
+                    )
+                )
                 with self.launch_selection(account):
                     process = stack.enter_context(
                         subprocess.Popen(
                             self.command(*arguments),
-                            env=self.environment(account),
+                            env=environment,
                             pass_fds=self.lock_fds,
                         )
                     )

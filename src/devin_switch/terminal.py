@@ -13,12 +13,13 @@ import termios
 import threading
 import time
 import tty
-from contextlib import ExitStack
+from collections.abc import Callable, Iterator
+from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass, field
 
-from devin_switch import handoff, otel
-from devin_switch.native import TELEMETRY_VARIABLE
-from devin_switch.store import Store, SwitchError
+from devin_switch import handoff, otel, relay, sessions
+from devin_switch.native import API_SERVER_VARIABLE, TELEMETRY_VARIABLE
+from devin_switch.store import Account, Store, SwitchError
 
 
 def process_exists(pid: int) -> bool:
@@ -153,6 +154,50 @@ class QuotaWatch:
             return ""
 
 
+@contextmanager
+def relayed(
+    native, account: Account, announce: Callable[[str, Account], None]
+) -> Iterator[dict[str, str]]:
+    """The environment that puts a terminal chat on a relay, as GUI chats are.
+
+    A CLI started on the relay sends its saved login there, also from the agent process it
+    starts, and the relay answers a request that ran out of usage again on the next login with
+    credits: the chat goes on without restarting. Only a CLI that takes its API server from the
+    environment, and only chats: a login or another command must reach the server itself.
+    """
+    store = native.store
+    issued = relay.login(store, account) if native.relays and native.pins_server() else None
+    if issued is None:
+        yield {}
+        return
+    with ExitStack() as held:
+
+        def rotate(current: relay.Login, tried: frozenset[str]) -> relay.Login | None:
+            try:
+                if not handoff.auto_switch_enabled(store):
+                    return None
+                chosen, _ = handoff.choose_best(native, current.account.name, tried)
+                replacement = relay.login(store, chosen)
+                if replacement is None or not relay.compatible(issued, replacement):
+                    return None
+                with store.lock(timeout=5):
+                    held.enter_context(store.account_lock(chosen, shared=True))
+                    sessions.adopt(store, native.launch_id, chosen)
+                    store.select(chosen)
+            except (SwitchError, OSError, ValueError):
+                return None
+            announce(
+                f"Out of usage on {current.account.name}. Continuing on {chosen.name} "
+                "in this chat.",
+                chosen,
+            )
+            return replacement
+
+        served = relay.Relay(issued, rotate, store.root / "logs" / "relay.log")
+        held.callback(served.close)
+        yield {API_SERVER_VARIABLE: served.url}
+
+
 def write_all(descriptor: int, data: bytes) -> None:
     remaining = memoryview(data)
     while remaining:
@@ -180,7 +225,14 @@ def run(native, account, arguments: tuple[str, ...]) -> int:
         with ExitStack() as stack:
             stack.enter_context(native.store.lock(f"controller-{native.run_id}.lock"))
             watch = QuotaWatch(native, account)
+
+            def moved(message: str, chosen: Account) -> None:
+                # A quota error that still gets through is about the login now in use.
+                watch.account = chosen
+                watch.messages.put(message)
+
             environment = native.environment(account)
+            environment.update(stack.enter_context(relayed(native, account, moved)))
             if handoff.telemetry_enabled(native.store, account):
                 receiver = stack.enter_context(otel.Receiver(watch.record))
                 environment[TELEMETRY_VARIABLE] = receiver.endpoint

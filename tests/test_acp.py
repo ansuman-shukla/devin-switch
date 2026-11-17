@@ -1116,7 +1116,7 @@ def test_gui_native_crash_is_reported_without_leaking_diagnostics(acp_native, tm
 
 
 @asynccontextmanager
-async def in_process(native):
+async def in_process(native, capabilities=None):
     messages = []
 
     async def emit(message):
@@ -1124,7 +1124,9 @@ async def in_process(native):
 
     bridge = acp.Bridge(native, emit)
     try:
-        await bridge.dispatch("initialize", {"protocolVersion": 1, "clientCapabilities": {}})
+        await bridge.dispatch(
+            "initialize", {"protocolVersion": 1, "clientCapabilities": capabilities or {}}
+        )
         yield bridge, messages
     finally:
         await bridge.close()
@@ -2910,6 +2912,8 @@ def test_gui_reload_while_a_prompt_changes_logins_is_answered_at_once(
 REWIND = "_cognition.ai/revert/historyRewound"
 # What the native sends from the rewind on, until it answers the prompt with the error.
 TAKEN_BACK = [REWIND, "_cognition.ai/turn_stats", "_cognition.ai/agent_stopped"]
+# Like Desktop, a client that shows revert steps: the native tells only those of a rewind.
+REVERTING = {"_meta": {"cognition.ai/revert": True}}
 
 
 def asked(session_id, text, identifier="prompt-1"):
@@ -2924,26 +2928,31 @@ def methods(messages):
     return [message.get("method") for message in messages]
 
 
+@pytest.mark.parametrize("client", [REVERTING, {}], ids=["desktop", "plain-client"])
 def test_gui_prompt_the_native_took_back_is_sent_again_after_the_switch(
-    acp_native, tmp_path, monkeypatch
+    acp_native, tmp_path, monkeypatch, client
 ):
     """CLI 3000.14 removes a prompt whose first model call failed: `continue` has no context.
 
     Desktop 3.14 drops the message and reloads the chat when it hears of the rewind, so the
-    failed attempt stays between the bridge and the native.
+    failed attempt stays between the bridge and the native. The native announces a rewind
+    only to a client that shows revert steps, so the bridge asks for that itself.
     """
     monkeypatch.setattr(usage, "refresh_account", fresh_usage())
     monkeypatch.setenv("FAKE_QUOTA_ACCOUNTS", "ansuman-1")
     monkeypatch.setenv("FAKE_QUOTA_STYLE", "rewound")
 
     async def scenario():
-        async with in_process(acp_native) as (bridge, messages):
+        async with in_process(acp_native, client) as (bridge, messages):
             created = await bridge.dispatch("session/new", {"cwd": str(tmp_path), "mcpServers": []})
             session_id = created["sessionId"]
             result = await bridge.dispatch("session/prompt", asked(session_id, "work"))
             assert result == {"stopReason": "end_turn"}
             assert prompts(acp_native) == [("ansuman-1", "work"), ("ansuman-2", "work")]
             assert not set(TAKEN_BACK) & set(methods(messages))
+            # Only a client that asked for them gets the revert steps of the turn.
+            steps = [m for m in methods(messages) if str(m).startswith("_cognition.ai/revert/")]
+            assert steps == (["_cognition.ai/revert/stepsUpdated"] if client else [])
             notes = "".join(texts(messages))
             assert "Sending your message again…" in notes and "continue" not in notes
             chat = bridge.chats[session_id]
@@ -2964,7 +2973,7 @@ def test_gui_prompt_the_native_took_back_is_sent_again_in_the_same_process(
     relayed.exhausted = {"ansuman-1"}
 
     async def scenario():
-        async with in_process(acp_native) as (bridge, messages):
+        async with in_process(acp_native, REVERTING) as (bridge, messages):
             created = await bridge.dispatch("session/new", {"cwd": str(tmp_path), "mcpServers": []})
             session_id = created["sessionId"]
             backend = bridge.chats[session_id].backend
@@ -2985,8 +2994,9 @@ def test_gui_prompt_the_native_took_back_is_sent_again_in_the_same_process(
     asyncio.run(scenario())
 
 
+@pytest.mark.parametrize("client", [REVERTING, {}], ids=["desktop", "plain-client"])
 def test_gui_rewind_reaches_desktop_when_the_prompt_is_not_sent_again(
-    acp_native, tmp_path, monkeypatch
+    acp_native, tmp_path, monkeypatch, client
 ):
     monkeypatch.setattr(usage, "refresh_account", fresh_usage())
     monkeypatch.setenv("FAKE_QUOTA_ACCOUNTS", "ansuman-1")
@@ -2994,18 +3004,21 @@ def test_gui_rewind_reaches_desktop_when_the_prompt_is_not_sent_again(
     acp.handoff.set_auto_switch(acp_native.store, False)
 
     async def scenario():
-        async with in_process(acp_native) as (bridge, messages):
+        async with in_process(acp_native, client) as (bridge, messages):
             created = await bridge.dispatch("session/new", {"cwd": str(tmp_path), "mcpServers": []})
             session_id = created["sessionId"]
             start = len(messages)
             error = await wire_error(bridge, messages, "session/prompt", asked(session_id, "work"))
             assert error["code"] == -32011
-            # Desktop hears what the native said, in its order, and then the error.
+            # Desktop hears what the native said, in its order, and then the error. A client
+            # that never asked for revert notices gets the rest without the rewind.
             told = [method for method in methods(messages[start:]) if method in TAKEN_BACK]
-            assert told == TAKEN_BACK
+            assert told == (TAKEN_BACK if client else TAKEN_BACK[1:])
             assert "error" in messages[-1]
-            (rewind,) = [message for message in messages if message.get("method") == REWIND]
-            assert rewind["params"]["firstRemovedUserMessageId"] == "prompt-1"
+            rewinds = [message for message in messages if message.get("method") == REWIND]
+            assert [rewind["params"]["firstRemovedUserMessageId"] for rewind in rewinds] == (
+                ["prompt-1"] if client else []
+            )
             assert prompts(acp_native) == [("ansuman-1", "work")]
             chat = bridge.chats[session_id]
             assert recorded_prompts(chat.backend) == [] and chat.rewound is None

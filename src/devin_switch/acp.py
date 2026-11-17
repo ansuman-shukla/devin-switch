@@ -65,7 +65,10 @@ LOCAL_COMMANDS = [
 ]
 LOCAL_NAMES = {"/" + command["name"] for command in LOCAL_COMMANDS}
 AGENT_STOPPED = "_cognition.ai/agent_stopped"
-HISTORY_REWOUND = "_cognition.ai/revert/historyRewound"
+# The native says that it took a prompt back only to a client able to show revert steps.
+REVERT = "cognition.ai/revert"
+REVERT_NOTICES = "_cognition.ai/revert/"
+HISTORY_REWOUND = REVERT_NOTICES + "historyRewound"
 CONTINUING = f"Sending “{handoff.CONTINUE_PROMPT}”…"
 ASKING_AGAIN = "Sending your message again…"
 CANCEL_REQUEST = "$/cancel_request"
@@ -752,6 +755,8 @@ class Bridge:
         self.side_server = None
         self.side_sinks = {}
         self.roster = subagent_tab.Roster()
+        # Whether Desktop itself asked for the native's revert notices.
+        self.reverts = False
 
     def spawn(self, coroutine):
         task = asyncio.create_task(coroutine)
@@ -856,14 +861,18 @@ class Bridge:
             if backend.suppress_replay:
                 return
         chat = self.chats.get(backend.session_id)
+        unasked = str(message.get("method")).startswith(REVERT_NOTICES) and not self.reverts
         if chat is not None and chat.backend is backend and chat.controls is not None:
             if message.get("method") == HISTORY_REWOUND and chat.rewound is None:
                 # CLI 3000.14 takes back a prompt whose first model call failed. Desktop then
                 # drops the message and reloads the chat, but the prompt may be sent again.
                 chat.rewound = []
             if chat.rewound is not None:
-                chat.rewound.append(message)
+                if not unasked:
+                    chat.rewound.append(message)
                 return
+        if unasked:
+            return
         if not backend.stopping:
             async with backend.emitting:
                 await self.emit(message)
@@ -932,6 +941,10 @@ class Bridge:
             client.setdefault("_meta", {}).setdefault("cognition.ai/diagnosticsSessionExport", True)
             # Side answers go to the Switch side panel; Desktop never sees them.
             client["_meta"][side.CAPABILITY] = True
+            # The bridge needs the revert notices whatever the client is: without them a
+            # prompt the native took back looks like one that is still in the conversation.
+            self.reverts = client["_meta"].get(REVERT) is True
+            client["_meta"][REVERT] = True
             account = self.default_account()
             # Before any chat loads: a daemon left by an earlier launch keeps chats locked.
             await asyncio.to_thread(self.native.retire_daemon, account)

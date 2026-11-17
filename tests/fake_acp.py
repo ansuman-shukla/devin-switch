@@ -46,6 +46,7 @@ if os.environ.get("FAKE_PROCESS_MODEL") and os.environ.get("WINDSURF_API_SERVER_
 canceled = asyncio.Event()
 side_canceled = asyncio.Event()
 chains = False
+reverts = False
 # Running "busy" turns by request ID. A session/load ended them up to CLI 3000.11.216; from
 # 3000.14 on (FAKE_PROCESS_MODEL) the native replays under the turn and the turn goes on.
 turns = {}
@@ -216,7 +217,10 @@ def emit(message):
 
 
 def take_back(params):
-    """What CLI 3000.14 sends, before the error, for a prompt whose first model call failed."""
+    """What CLI 3000.14 sends, before the error, for a prompt whose first model call failed.
+
+    It takes the prompt back either way, and says so only to a client that shows revert steps.
+    """
     session_id = params["sessionId"]
     prompt_id = (params.get("_meta") or {}).get("cognition.ai/clientMessageId", "generated-id")
     for method, details in (
@@ -228,7 +232,13 @@ def take_back(params):
         ("turn_stats", {"turnClientMessageId": prompt_id}),
         ("agent_stopped", {"cause": "quota_exhausted", "errorMessage": "Quota exhausted."}),
     ):
-        emit({"method": f"_cognition.ai/{method}", "params": {"sessionId": session_id, **details}})
+        if reverts or not method.startswith("revert/"):
+            emit(
+                {
+                    "method": f"_cognition.ai/{method}",
+                    "params": {"sessionId": session_id, **details},
+                }
+            )
 
 
 def configs():
@@ -304,7 +314,7 @@ def whiteboard_chat(params):
 
 
 async def handle(message):
-    global loaded, project, host, chains, foreground, parked
+    global loaded, project, host, chains, reverts, foreground, parked
     method, params = message["method"], message.get("params", {})
     if path := os.environ.get("FAKE_ACP_LOG"):
         with open(path, "a") as handle:
@@ -338,6 +348,7 @@ async def handle(message):
     if method == "initialize":
         meta = (params.get("clientCapabilities") or {}).get("_meta") or {}
         chains = meta.get("cognition.ai/chains") is True
+        reverts = meta.get("cognition.ai/revert") is True
         result = {
             "protocolVersion": 1,
             "agentCapabilities": {

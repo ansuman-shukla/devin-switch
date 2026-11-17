@@ -692,6 +692,8 @@ class Chat:
     backend: Backend
     gate: asyncio.Lock = field(default_factory=asyncio.Lock)
     controls: set[asyncio.Task] | None = None
+    # A prompt holds the chat until it is answered, also while it changes logins between turns.
+    prompting: bool = False
     suspended: bool = False
     blank: bool = False
     canceled: bool = False
@@ -1049,11 +1051,15 @@ class Bridge:
             if method == "session/prompt":
                 # A Stop from before this prompt arrived was for an earlier turn.
                 chat.canceled = chat.early_stops != stops
-                if (result := await self.local_prompt(chat, params)) is not None:
-                    return result
-                await self.reconnect(chat)
-                chat.blank = False
-                return await self.prompt_turn(chat, params)
+                chat.prompting = True
+                try:
+                    if (result := await self.local_prompt(chat, params)) is not None:
+                        return result
+                    await self.reconnect(chat)
+                    chat.blank = False
+                    return await self.prompt_turn(chat, params)
+                finally:
+                    chat.prompting = False
             if method == "session/cancel" and chat.suspended:
                 return {}
             await self.reconnect(chat)
@@ -1510,8 +1516,12 @@ class Bridge:
             acp_state.session_key(session_id)
             if session_id in self.chats:
                 chat = self.chats[session_id]
-                if chat.controls is not None:
-                    if method == "session/load" and chat.backend.loads_under_a_turn:
+                if chat.prompting:
+                    if (
+                        chat.controls is not None
+                        and method == "session/load"
+                        and chat.backend.loads_under_a_turn
+                    ):
                         return await self.reload(chat, method, setup, running=True)
                     return await self.replay(chat, method)
                 async with chat.access():
@@ -1585,9 +1595,11 @@ class Bridge:
             backend.live, backend.reloading = True, False
 
     async def replay(self, chat, method):
-        """Reopen a chat whose turn is running, for a native that cannot load under a turn.
+        """Reopen a chat whose prompt is running, from what Desktop was already sent.
 
-        Its session/load would end the turn, so replay what Desktop was already sent.
+        For a native whose session/load would end the turn, and for any native between a
+        prompt's turns: the prompt keeps the chat while it changes logins, and waiting for the
+        chat would last until the prompt is answered.
         """
         backend = chat.backend
         async with backend.emitting:

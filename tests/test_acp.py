@@ -2863,6 +2863,50 @@ def test_gui_quota_exhaustion_switches_and_continues_in_the_same_turn(
     asyncio.run(scenario())
 
 
+def test_gui_reload_while_a_prompt_changes_logins_is_answered_at_once(
+    acp_native, tmp_path, monkeypatch
+):
+    """No turn is open between the failed prompt and its follow-up, yet the prompt holds the chat.
+
+    Desktop 3.14 shows only a loader, and queues what is typed, until its reload is answered.
+    """
+    monkeypatch.setattr(usage, "refresh_account", fresh_usage())
+    monkeypatch.setenv("FAKE_QUOTA_ACCOUNTS", "ansuman-1")
+
+    async def scenario():
+        async with in_process(acp_native) as (bridge, messages):
+            created = await bridge.dispatch("session/new", {"cwd": str(tmp_path), "mcpServers": []})
+            session_id = created["sessionId"]
+            switch = bridge.switch
+            switching, proceed = asyncio.Event(), asyncio.Event()
+
+            async def slow_switch(chat, *arguments, **options):
+                switching.set()
+                await proceed.wait()
+                await switch(chat, *arguments, **options)
+
+            monkeypatch.setattr(bridge, "switch", slow_switch)
+            turn = bridge.spawn(
+                bridge.dispatch("session/prompt", prompt_params(session_id, "work"))
+            )
+            await asyncio.wait_for(switching.wait(), 5)
+            start = len(messages)
+            params = {"sessionId": session_id, "cwd": str(tmp_path), "mcpServers": []}
+            loaded = await asyncio.wait_for(bridge.dispatch("session/load", params), 5)
+            assert "configOptions" in loaded
+            assert replayed_texts(messages[start:], "user_message_chunk") == ["work"]
+            assert not turn.done()
+            proceed.set()
+            assert await turn == {"stopReason": "end_turn"}
+            assert prompts(acp_native) == [("ansuman-1", "work"), ("ansuman-2", "continue")]
+            loads = [
+                call["account"] for call in logged(acp_native) if call["method"] == "session/load"
+            ]
+            assert loads == ["ansuman-2"], "only the switch loaded the chat, in the new native"
+
+    asyncio.run(scenario())
+
+
 def cold_catalog(native, monkeypatch, starts):
     counter = native.store.root.parent / "cold-starts"
     counter.write_text(str(starts))

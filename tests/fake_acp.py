@@ -10,8 +10,11 @@ import uuid
 from datetime import UTC, datetime
 from pathlib import Path
 
+if sys.argv[1:] == ["--help"]:
+    print("--process-model <PROCESS_MODEL>" if os.environ.get("FAKE_PROCESS_MODEL") else "Usage")
+    sys.exit(0)
 account = Path(os.environ["XDG_DATA_HOME"]).parent.name
-if sys.argv[1:] == ["auth", "status"]:
+if sys.argv[-2:] == ["auth", "status"]:
     print("Logged in as test@example.invalid")
     sys.exit(0)
 
@@ -36,6 +39,10 @@ replies = {}
 loaded = None
 project = None
 host = None
+if os.environ.get("FAKE_PROCESS_MODEL") and os.environ.get("WINDSURF_API_SERVER_URL"):
+    # Like CLI 3000.14, the saved login goes to the API server the process was started on.
+    saved = (Path(os.environ["XDG_DATA_HOME"]) / "devin/credentials.toml").read_text()
+    host = {"key": saved.split('"')[1], "url": os.environ["WINDSURF_API_SERVER_URL"]}
 canceled = asyncio.Event()
 side_canceled = asyncio.Event()
 chains = False
@@ -333,6 +340,11 @@ async def handle(message):
             "agentInfo": {"name": "fake", "version": "1"},
         }
     elif method == "authenticate" and params.get("methodId") == "windsurf-api-key":
+        # CLI 3000.14 takes a host login only for the API server its process was started on.
+        used = os.environ.get("WINDSURF_API_SERVER_URL")
+        if os.environ.get("FAKE_PROCESS_MODEL") and used != params["_meta"]["api_server_url"]:
+            emit({"id": message["id"], "error": {"code": -32603, "message": "Another server"}})
+            return
         previous, host = (
             host,
             {

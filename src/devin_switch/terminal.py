@@ -186,7 +186,7 @@ def run(native, account, arguments: tuple[str, ...]) -> int:
                 environment[TELEMETRY_VARIABLE] = receiver.endpoint
             with native.launch_selection(account):
                 process = subprocess.Popen(
-                    (str(native.binary), *arguments),
+                    native.command(*arguments),
                     stdin=slave,
                     stdout=slave,
                     stderr=slave,

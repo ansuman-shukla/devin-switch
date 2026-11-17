@@ -245,6 +245,33 @@ def test_gui_switch_a_b_a_keeps_exact_chat_settings_and_other_chat(acp_native, t
     asyncio.run(scenario())
 
 
+def test_gui_agents_stay_out_of_the_clis_shared_daemon(acp_native, tmp_path, monkeypatch):
+    """A daemon runs every chat on the login that started it, whatever login Switch chose."""
+    monkeypatch.setenv("FAKE_PROCESS_MODEL", "1")
+
+    async def scenario():
+        async with connect(acp_native, "--sandbox") as client:
+            chat = await client.new(tmp_path)
+            await client.prompt(chat, "/switch ansuman-2")
+            await client.prompt(chat, "continue")
+            calls = logged(acp_native)
+            assert {call["account"] for call in calls} == {"ansuman-1", "ansuman-2"}
+            assert all(
+                call["args"] == ["--process-model=in-process", "--sandbox", "acp"] for call in calls
+            )
+
+    asyncio.run(scenario())
+
+
+def test_gui_agents_get_no_process_flag_from_a_cli_without_one(acp_native, tmp_path):
+    async def scenario():
+        async with connect(acp_native) as client:
+            await client.prompt(await client.new(tmp_path), "continue")
+            assert all(call["args"] == ["acp"] for call in logged(acp_native))
+
+    asyncio.run(scenario())
+
+
 def test_gui_chats_and_handoffs_share_user_github_config(acp_native, tmp_path, monkeypatch):
     monkeypatch.setenv("HOME", str(tmp_path / "home"))
     monkeypatch.delenv("GH_CONFIG_DIR", raising=False)
@@ -3789,6 +3816,57 @@ def test_gui_failed_host_login_keeps_saved_credentials(acp_native, relayed, tmp_
             }
 
     asyncio.run(scenario())
+
+
+def test_gui_relay_login_reaches_a_cli_that_checks_its_api_server(
+    acp_native, relayed, tmp_path, monkeypatch
+):
+    """CLI 3000.14 refuses a host login for another server than the one it was started on."""
+    monkeypatch.setenv("FAKE_PROCESS_MODEL", "1")
+    monkeypatch.setattr(usage, "refresh_account", fresh_usage(exhausted={"ansuman-3"}))
+    relayed.exhausted = {"ansuman-1"}
+
+    async def scenario():
+        async with in_process(acp_native) as (bridge, _):
+            created = await bridge.dispatch("session/new", {"cwd": str(tmp_path), "mcpServers": []})
+            session_id = created["sessionId"]
+            backend = bridge.chats[session_id].backend
+            assert backend.relay is not None
+            assert await bridge.dispatch("session/prompt", prompt_params(session_id, "infer")) == {
+                "stopReason": "end_turn"
+            }
+            # Usage ran out, and the same native went on with the next login.
+            assert bridge.chats[session_id].backend is backend
+            assert relayed.inference()[-1] == ("ansuman-2", "ansuman-2")
+
+    asyncio.run(scenario())
+
+
+def test_gui_failed_host_login_goes_through_the_relay_the_cli_was_started_on(
+    acp_native, relayed, tmp_path, monkeypatch
+):
+    monkeypatch.setenv("FAKE_PROCESS_MODEL", "1")
+    monkeypatch.setattr(acp.Backend, "request", refuse_host_login(acp.Backend.request))
+
+    async def scenario():
+        async with in_process(acp_native) as (bridge, _):
+            created = await bridge.dispatch("session/new", {"cwd": str(tmp_path), "mcpServers": []})
+            session_id = created["sessionId"]
+            # Closing it would cut the native off: its saved login uses the relay's address too.
+            assert bridge.chats[session_id].backend.relay is not None
+            await bridge.dispatch("session/prompt", prompt_params(session_id, "infer"))
+            assert relayed.inference() == [("ansuman-1", "ansuman-1")]
+
+    asyncio.run(scenario())
+
+
+def refuse_host_login(request):
+    async def refusing(backend, method, params, *arguments):
+        if method == "authenticate":
+            raise acp.RpcError("Authentication failed", -32603)
+        return await request(backend, method, params, *arguments)
+
+    return refusing
 
 
 def test_gui_chats_without_a_saved_api_login_skip_the_relay(acp_native, tmp_path):

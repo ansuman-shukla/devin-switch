@@ -2,6 +2,8 @@ import asyncio
 import json
 import os
 import sqlite3
+import subprocess
+import tempfile
 from contextlib import asynccontextmanager
 from pathlib import Path
 
@@ -9,7 +11,7 @@ import pytest
 
 from devin_switch import acp, acp_state, sessions
 from devin_switch.acp import Bridge
-from devin_switch.native import Native
+from devin_switch.native import Native, listening
 from devin_switch.store import Store, SwitchError
 
 pytestmark = pytest.mark.skipif(
@@ -18,12 +20,11 @@ pytestmark = pytest.mark.skipif(
 
 
 @asynccontextmanager
-async def native_acp(native, account, project, client_name="windsurf"):
+async def native_acp(native, account, project, client_name="windsurf", flags=()):
     environment = native.environment(account)
     environment["HOME"] = str(project)
     process = await asyncio.create_subprocess_exec(
-        str(native.binary),
-        "acp",
+        *native.command(*flags, "acp"),
         env=environment,
         cwd=project,
         stdin=asyncio.subprocess.PIPE,
@@ -115,6 +116,69 @@ def test_installed_acp_shared_history_without_login(
                 ), listed
 
     asyncio.run(scenario())
+
+
+def test_installed_cli_daemon_is_kept_away_from_switch_chats(monkeypatch):
+    """CLI 3000.14 can serve chats from one background daemon per data folder.
+
+    Switch's logins share that folder, so the daemon ran every chat on the login that started
+    it, refused the relay login, and kept a chat locked after its client had gone.
+    """
+    monkeypatch.setattr(Native, "require_login", lambda self, account, **options: None)
+    # A Unix socket path is at most 104 bytes: pytest's folders are too long for the daemon.
+    with tempfile.TemporaryDirectory(dir="/tmp", prefix="ds-") as folder:
+        project = Path(folder).resolve()
+        monkeypatch.chdir(project)
+        monkeypatch.setenv("HOME", str(project))
+        store = Store(project / "state")
+        with store.lock():
+            first, second = store.add("ansuman-1", None), store.add("ansuman-2", None)
+        store.select(second)
+        native = Native(store, Path(os.environ["DS_TEST_NATIVE"]))
+        assert native.command("acp")[1:] == ("--process-model=in-process", "acp")
+        assert native.sessions(first) == []
+        address = store.root / "shared/cli/daemon/daemon.sock"
+        assert not listening(address)
+        with sqlite3.connect(store.root / "shared/cli/sessions.db") as connection:
+            connection.execute(
+                "INSERT INTO sessions "
+                "(id, working_directory, backend_type, model, agent_mode, "
+                "created_at, last_activity_at, title) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                ("daemon-chat", str(project), "local", "test-model", "normal", 1, 1, "Daemon"),
+            )
+        chat = {"sessionId": "daemon-chat", "cwd": str(project), "mcpServers": []}
+
+        async def scenario():
+            async with native_acp(native, first, project, flags=("--process-model=daemon",)) as ask:
+                assert "result" in await ask("session/load", chat)
+            # The daemon outlives its client and keeps the chat, whatever login asks next.
+            assert listening(address)
+            async with native_acp(native, second, project) as ask:
+                refused = await ask("session/load", chat)
+                assert refused["error"]["code"] == -32015, refused
+            bridge = Bridge(native, lambda message: asyncio.sleep(0))
+            try:
+                await bridge.dispatch(
+                    "initialize", {"protocolVersion": 1, "clientCapabilities": {}}
+                )
+                assert not listening(address)
+            finally:
+                await bridge.close()
+            async with native_acp(native, second, project) as ask:
+                assert "result" in await ask("session/load", chat)
+            assert not listening(address)
+
+        try:
+            asyncio.run(scenario())
+        finally:
+            subprocess.run(
+                (str(native.binary), "daemon", "stop", "--force"),
+                env={**native.environment(first), "HOME": str(project)},
+                stdin=subprocess.DEVNULL,
+                capture_output=True,
+                timeout=30,
+                check=False,
+            )
 
 
 def test_installed_cli_shares_user_mcp_servers_across_logins(store, tmp_path, monkeypatch):

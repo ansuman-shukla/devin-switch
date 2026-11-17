@@ -20,7 +20,7 @@ from devin_switch import (
     subagents,
     tool_folders,
 )
-from devin_switch.native import Native
+from devin_switch.native import API_SERVER_VARIABLE, Native
 from devin_switch.store import Account, SwitchError, write_json
 
 MAX_MESSAGE = 8 * 1024 * 1024
@@ -362,6 +362,7 @@ class Backend:
         self.stopping = False
         self.stop_cause = None
         self.relay = None
+        self.pinned = False
         self.loop = None
         self.last_activity = time.monotonic()
         self.editor_ready = False
@@ -390,8 +391,20 @@ class Backend:
             environment = self.bridge.native.environment(self.account)
             environment.pop("DEVIN_MODEL", None)
             environment["DS_ACP_RUN_ID"] = self.lease.run.id
+            store = self.bridge.native.store
+            issued = relay.login(store, self.account) if self.chat else None
+            if issued:
+                self.loop = asyncio.get_running_loop()
+                self.relay = relay.Relay(
+                    issued,
+                    lambda current, tried: self.bridge.rotate(self, issued, current, tried),
+                    store.root / "logs" / "relay.log",
+                )
+                self.pinned = self.bridge.native.pins_server()
+                if self.pinned:
+                    environment[API_SERVER_VARIABLE] = self.relay.url
             self.process = subprocess.Popen(
-                (str(self.bridge.native.binary), *self.bridge.flags, "acp"),
+                self.bridge.native.command(*self.bridge.flags, "acp"),
                 env=environment,
                 # The native serves the session's cwd from any folder, even a deleted one.
                 cwd=self.project if self.project.is_dir() else Path.home(),
@@ -433,7 +446,7 @@ class Backend:
                 self.write({"method": method, "params": params})
             self.editor_ready = True
             await self.writer.drain()
-            if self.chat and (issued := relay.login(self.bridge.native.store, self.account)):
+            if issued:
                 await self.authenticate(issued)
             return result
         except BaseException:
@@ -442,12 +455,6 @@ class Backend:
 
     async def authenticate(self, issued):
         """Route the native's API traffic through a relay that can change logins in place."""
-        self.loop = asyncio.get_running_loop()
-        self.relay = relay.Relay(
-            issued,
-            lambda current, tried: self.bridge.rotate(self, issued, current, tried),
-            self.bridge.native.store.root / "logs" / "relay.log",
-        )
         try:
             await self.request(
                 "authenticate",
@@ -458,8 +465,10 @@ class Backend:
                 LIFECYCLE_TIMEOUT,
             )
         except RpcError:
-            # A failed host login (e.g. offline) leaves the native on its saved credentials.
-            await asyncio.to_thread(self.close_relay)
+            # A failed host login (e.g. offline) leaves the native on its saved credentials. A
+            # native started on the relay sends those through it too, so the relay stays.
+            if not self.pinned:
+                await asyncio.to_thread(self.close_relay)
 
     def close_relay(self):
         if self.relay:
@@ -874,7 +883,10 @@ class Bridge:
             client.setdefault("_meta", {}).setdefault("cognition.ai/diagnosticsSessionExport", True)
             # Side answers go to the Switch side panel; Desktop never sees them.
             client["_meta"][side.CAPABILITY] = True
-            probe = Backend(self, self.default_account(), Path.cwd(), chat=False)
+            account = self.default_account()
+            # Before any chat loads: a daemon left by an earlier launch keeps chats locked.
+            await asyncio.to_thread(self.native.retire_daemon, account)
+            probe = Backend(self, account, Path.cwd(), chat=False)
             result = await probe.start()
             self.lister = probe
             result["authMethods"] = []

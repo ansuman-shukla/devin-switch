@@ -4,11 +4,12 @@ import json
 import os
 import re
 import shutil
+import socket
 import subprocess
 import sys
 import time
 from collections.abc import Iterator
-from contextlib import ExitStack, contextmanager, nullcontext
+from contextlib import ExitStack, contextmanager, nullcontext, suppress
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -39,6 +40,19 @@ verified_logins: dict[tuple, float] = {}
 CAPTURE_TIMEOUT = 30
 TELEMETRY_VARIABLE = "OTEL_EXPORTER_OTLP_LOGS_ENDPOINT"
 RECEIVER_ENDPOINT = re.compile(r"http://127\.0\.0\.1:\d+/[0-9a-f]{32}/v1/logs")
+# Since 3000.14 a signed-in CLI serves `acp` and the terminal from one background daemon per
+# data folder, and Switch's logins share that folder: every chat then ran on the login that
+# started the daemon, whatever login Switch chose. The `=` form is needed: after a bare
+# `--process-model` the CLI reads `daemon` as its subcommand.
+PROCESS_MODEL = "--process-model"
+OWN_PROCESS = f"{PROCESS_MODEL}=in-process"
+# The same CLI refuses a host login for another API server than its process uses: a GUI chat's
+# native is started on its relay. A launch nested in that chat must not inherit the address,
+# because a relay serves only the login it was issued for.
+API_SERVER_VARIABLE = "WINDSURF_API_SERVER_URL"
+RELAY_SERVER = re.compile(r"http://127\.0\.0\.1:\d+")
+PROBE_TIMEOUT = 10
+process_flags: dict[tuple, tuple[str, ...]] = {}
 
 
 def find_binary() -> Path:
@@ -57,6 +71,36 @@ def find_binary() -> Path:
         if binary.is_file() and os.access(binary, os.X_OK):
             return binary.resolve()
     raise SwitchError("Devin CLI was not found. Install it or set DS_BINARY to its executable.")
+
+
+def own_process(binary: Path) -> tuple[str, ...]:
+    """The flag that keeps an agent inside the command Switch starts, for a CLI that has it."""
+    details = binary.stat()
+    key = (str(binary), details.st_ino, details.st_mtime_ns, details.st_size)
+    if key not in process_flags:
+        try:
+            listed = subprocess.run(
+                (str(binary), "--help"),
+                stdin=subprocess.DEVNULL,
+                capture_output=True,
+                text=True,
+                timeout=PROBE_TIMEOUT,
+                check=False,
+            ).stdout
+        except (OSError, subprocess.SubprocessError):
+            return ()
+        process_flags[key] = (OWN_PROCESS,) if PROCESS_MODEL in listed else ()
+    return process_flags[key]
+
+
+def listening(address: Path) -> bool:
+    with socket.socket(socket.AF_UNIX) as probe:
+        probe.settimeout(1)
+        try:
+            probe.connect(str(address))
+        except OSError:
+            return False
+    return True
 
 
 def user_config_home(store: Store) -> Path:
@@ -106,6 +150,8 @@ class Native:
         excluded = AUTH_ENVIRONMENT | {"DS_RUN_ID", "DS_ACP_RUN_ID", "DS_EXECUTABLE", "DS_FROZEN"}
         if RECEIVER_ENDPOINT.fullmatch(os.environ.get(TELEMETRY_VARIABLE, "")):
             excluded |= {TELEMETRY_VARIABLE}
+        if RELAY_SERVER.fullmatch(os.environ.get(API_SERVER_VARIABLE, "")):
+            excluded |= {API_SERVER_VARIABLE}
         environment = {
             **{key: value for key, value in os.environ.items() if key not in excluded},
             "XDG_DATA_HOME": str(base / "data"),
@@ -127,12 +173,42 @@ class Native:
             )
         return environment
 
+    def command(self, *arguments: str) -> tuple[str, ...]:
+        """An agent launch: in its own process, unless the arguments choose where it runs."""
+        chosen = any(item.split("=")[0] == PROCESS_MODEL for item in arguments)
+        return (str(self.binary), *(() if chosen else own_process(self.binary)), *arguments)
+
+    def pins_server(self) -> bool:
+        """Whether this CLI accepts a host login only for the API server of its process."""
+        return bool(own_process(self.binary))
+
+    def retire_daemon(self, account: Account) -> None:
+        """Stop a daemon that an earlier launch left serving Switch's shared history.
+
+        It keeps a chat loaded, and so locked, after its client is gone. Without `--force`
+        the CLI leaves a daemon alone while one of its chats is working.
+        """
+        if not own_process(self.binary) or not listening(
+            self.store.root / "shared/cli/daemon/daemon.sock"
+        ):
+            return
+        with suppress(OSError, subprocess.SubprocessError):
+            subprocess.run(
+                (str(self.binary), "daemon", "stop"),
+                env=self.environment(account),
+                stdin=subprocess.DEVNULL,
+                capture_output=True,
+                timeout=PROBE_TIMEOUT,
+                check=False,
+            )
+
     def capture(
         self, account: Account, arguments: tuple[str, ...], *, cwd: Path | None = None
     ) -> str:
         try:
             result = subprocess.run(
-                (str(self.binary), *arguments),
+                # `list` starts an agent of its own to read the history.
+                self.command(*arguments),
                 env=self.environment(account),
                 capture_output=True,
                 text=True,
@@ -184,6 +260,7 @@ class Native:
     def interactive(self, account: Account, arguments: tuple[str, ...]) -> int:
         previous_umask = os.umask(0o077)
         try:
+            self.retire_daemon(account)
             if self.run_id and sys.stdin.isatty() and sys.stdout.isatty():
                 from devin_switch import terminal
 
@@ -192,7 +269,7 @@ class Native:
                 with self.launch_selection(account):
                     process = stack.enter_context(
                         subprocess.Popen(
-                            (str(self.binary), *arguments),
+                            self.command(*arguments),
                             env=self.environment(account),
                             pass_fds=self.lock_fds,
                         )

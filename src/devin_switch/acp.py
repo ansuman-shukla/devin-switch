@@ -65,6 +65,9 @@ LOCAL_COMMANDS = [
 ]
 LOCAL_NAMES = {"/" + command["name"] for command in LOCAL_COMMANDS}
 AGENT_STOPPED = "_cognition.ai/agent_stopped"
+HISTORY_REWOUND = "_cognition.ai/revert/historyRewound"
+CONTINUING = f"Sending “{handoff.CONTINUE_PROMPT}”…"
+ASKING_AGAIN = "Sending your message again…"
 CANCEL_REQUEST = "$/cancel_request"
 QUESTIONS = "cognition.ai/questions"
 TOOL_CALL = "cognition.ai/toolCallId"
@@ -694,6 +697,9 @@ class Chat:
     controls: set[asyncio.Task] | None = None
     # A prompt holds the chat until it is answered, also while it changes logins between turns.
     prompting: bool = False
+    # What the native sent from the moment it took the open prompt back, kept from Desktop
+    # until the prompt's outcome is known (None: it did not).
+    rewound: list | None = None
     suspended: bool = False
     blank: bool = False
     canceled: bool = False
@@ -848,6 +854,15 @@ class Bridge:
             if backend.chat:
                 backend.record(message)
             if backend.suppress_replay:
+                return
+        chat = self.chats.get(backend.session_id)
+        if chat is not None and chat.backend is backend and chat.controls is not None:
+            if message.get("method") == HISTORY_REWOUND and chat.rewound is None:
+                # CLI 3000.14 takes back a prompt whose first model call failed. Desktop then
+                # drops the message and reloads the chat, but the prompt may be sent again.
+                chat.rewound = []
+            if chat.rewound is not None:
+                chat.rewound.append(message)
                 return
         if not backend.stopping:
             async with backend.emitting:
@@ -1060,6 +1075,7 @@ class Bridge:
                     return await self.prompt_turn(chat, params)
                 finally:
                     chat.prompting = False
+                    await self.show_rewind(chat)
             if method == "session/cancel" and chat.suspended:
                 return {}
             await self.reconnect(chat)
@@ -1072,11 +1088,13 @@ class Bridge:
             sent, closed = await self.closed_note_params(chat, params)
             backend = chat.backend
             backend.stop_cause = None
+            chat.rewound = None
             controls = chat.controls = set()
             if chat.canceled:
                 # Stopped before this turn opened, so the native has not seen that Stop.
                 self.spawn(self.keep_canceling(chat, {"sessionId": chat.session_id}))
             result = error = None
+            recorded = len(backend.transcript)
             backend.record_prompt(params)
             try:
                 result = await self.forward_request(backend, "session/prompt", sent)
@@ -1085,6 +1103,11 @@ class Bridge:
             finally:
                 chat.controls = None
                 await asyncio.gather(*controls, return_exceptions=True)
+            # The native took the prompt back: nothing is left to continue, and a reload must
+            # not show a message the conversation no longer has.
+            again = params if chat.rewound is not None else None
+            if again:
+                del backend.transcript[recorded:]
             if closed and not error and result.get("stopReason") != "cancelled":
                 # Told once: a prompt that failed or was stopped leaves them for the next one.
                 with suppress(SwitchError, OSError):
@@ -1122,18 +1145,23 @@ class Bridge:
                         chat.session_id,
                         f"Out of usage on {spent}. Continuing on {login.account.name} in the "
                         "same agent, so subagents keep running. "
-                        f"Sending “{handoff.CONTINUE_PROMPT}”…",
+                        f"{ASKING_AGAIN if again else CONTINUING}",
                     )
                     if chat.canceled:
                         return {"stopReason": "cancelled"}
-                    params = await self.follow_up_params(chat)
+                    params = await self.follow_up_params(chat, again=again)
                     continue
             await self.note(
                 chat.session_id,
                 f"Out of usage on {spent}. Auto-switch is on; restarting on another saved login…",
             )
             try:
-                await self.switch(chat, None, exclude=frozenset(tried), follow_up=True)
+                await self.switch(
+                    chat,
+                    None,
+                    exclude=frozenset(tried),
+                    follow_up=ASKING_AGAIN if again else CONTINUING,
+                )
             except (SwitchError, OSError) as exc:
                 await self.note(
                     chat.session_id,
@@ -1146,7 +1174,13 @@ class Bridge:
             if chat.canceled:
                 return {"stopReason": "cancelled"}
             tried.add(chat.backend.account.name)
-            params = await self.follow_up_params(chat)
+            params = await self.follow_up_params(chat, again=again)
+
+    async def show_rewind(self, chat):
+        """Tell Desktop about a rewind whose prompt was not sent again after all."""
+        held, chat.rewound = chat.rewound, None
+        for message in held or ():
+            await self.emit(message)
 
     async def keep_canceling(self, chat, params):
         """Repeat a Stop until its turn's prompt ends.
@@ -1440,10 +1474,13 @@ class Bridge:
                 "from where they stopped.",
             )
 
-    async def follow_up_params(self, chat, *, resume_only=False):
-        """`continue`, plus a request to resume any subagents that stopped before finishing."""
+    async def follow_up_params(self, chat, *, resume_only=False, again=None):
+        """`continue`, plus a request to resume any subagents that stopped before finishing.
+
+        `again` is the prompt the native took back: it is sent once more instead of `continue`.
+        """
         store = self.native.store
-        params = continue_params(chat.session_id)
+        params = again or continue_params(chat.session_id)
         try:
             pending = await asyncio.to_thread(subagents.interrupted, store, chat.session_id)
             if not pending:
@@ -1452,6 +1489,8 @@ class Bridge:
             await asyncio.to_thread(subagents.forget, store, chat.session_id, pending)
         except (SwitchError, OSError):
             return None if resume_only else params
+        if again:
+            return {**again, "prompt": [*again["prompt"], {"type": "text", "text": f"\n\n{text}"}]}
         block = params["prompt"][0]
         block["text"] = text if resume_only else f"{block['text']}\n\n{text}"
         return params
@@ -1674,7 +1713,11 @@ class Bridge:
         follow_up = command == "/switch-continue"
         try:
             await self.reconnect(chat)
-            await self.switch(chat, words[1] if len(words) == 2 else None, follow_up=follow_up)
+            await self.switch(
+                chat,
+                words[1] if len(words) == 2 else None,
+                follow_up=CONTINUING if follow_up else "",
+            )
         except (SwitchError, OSError) as exc:
             await self.note(
                 chat.session_id,
@@ -1851,7 +1894,7 @@ class Bridge:
                 raise SwitchError(f"{stage}: {failure_detail(exc)}") from exc
             raise
 
-    async def switch(self, chat, account_name, *, exclude=frozenset(), follow_up=False):
+    async def switch(self, chat, account_name, *, exclude=frozenset(), follow_up=""):
         old = chat.backend
         source = old.account
         store = self.native.store
@@ -1921,11 +1964,7 @@ class Bridge:
             chat.session_id,
             f"Switched {source.name} → {account.name}. Same conversation; "
             "desktop login and other chats are unchanged. "
-            + (
-                f"Sending “{handoff.CONTINUE_PROMPT}”…"
-                if follow_up
-                else "Send your next message when ready."
-            ),
+            + (follow_up or "Send your next message when ready."),
         )
 
     def rotate(self, backend, issued, current, tried):

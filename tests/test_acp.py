@@ -2907,6 +2907,138 @@ def test_gui_reload_while_a_prompt_changes_logins_is_answered_at_once(
     asyncio.run(scenario())
 
 
+REWIND = "_cognition.ai/revert/historyRewound"
+# What the native sends from the rewind on, until it answers the prompt with the error.
+TAKEN_BACK = [REWIND, "_cognition.ai/turn_stats", "_cognition.ai/agent_stopped"]
+
+
+def asked(session_id, text, identifier="prompt-1"):
+    """A prompt as Desktop sends it: the native names the message it takes back by this id."""
+    return {
+        **prompt_params(session_id, text),
+        "_meta": {"cognition.ai/clientMessageId": identifier},
+    }
+
+
+def methods(messages):
+    return [message.get("method") for message in messages]
+
+
+def test_gui_prompt_the_native_took_back_is_sent_again_after_the_switch(
+    acp_native, tmp_path, monkeypatch
+):
+    """CLI 3000.14 removes a prompt whose first model call failed: `continue` has no context.
+
+    Desktop 3.14 drops the message and reloads the chat when it hears of the rewind, so the
+    failed attempt stays between the bridge and the native.
+    """
+    monkeypatch.setattr(usage, "refresh_account", fresh_usage())
+    monkeypatch.setenv("FAKE_QUOTA_ACCOUNTS", "ansuman-1")
+    monkeypatch.setenv("FAKE_QUOTA_STYLE", "rewound")
+
+    async def scenario():
+        async with in_process(acp_native) as (bridge, messages):
+            created = await bridge.dispatch("session/new", {"cwd": str(tmp_path), "mcpServers": []})
+            session_id = created["sessionId"]
+            result = await bridge.dispatch("session/prompt", asked(session_id, "work"))
+            assert result == {"stopReason": "end_turn"}
+            assert prompts(acp_native) == [("ansuman-1", "work"), ("ansuman-2", "work")]
+            assert not set(TAKEN_BACK) & set(methods(messages))
+            notes = "".join(texts(messages))
+            assert "Sending your message again…" in notes and "continue" not in notes
+            chat = bridge.chats[session_id]
+            assert chat.backend.account.name == "ansuman-2"
+            assert recorded_prompts(chat.backend) == ["work"]
+            assert chat.rewound is None
+
+    asyncio.run(scenario())
+
+
+def test_gui_prompt_the_native_took_back_is_sent_again_in_the_same_process(
+    acp_native, relayed, tmp_path, monkeypatch
+):
+    monkeypatch.setattr(usage, "refresh_account", fresh_usage(exhausted={"ansuman-1"}))
+    # The relay cannot replay this request, so the agent sees the quota error itself.
+    monkeypatch.setattr(acp.relay, "ROTATION_LIMIT", 0)
+    monkeypatch.setenv("FAKE_QUOTA_STYLE", "rewound")
+    relayed.exhausted = {"ansuman-1"}
+
+    async def scenario():
+        async with in_process(acp_native) as (bridge, messages):
+            created = await bridge.dispatch("session/new", {"cwd": str(tmp_path), "mcpServers": []})
+            session_id = created["sessionId"]
+            backend = bridge.chats[session_id].backend
+            result = await bridge.dispatch("session/prompt", asked(session_id, "infer"))
+            assert result == {"stopReason": "end_turn"}
+            calls = [call for call in logged(acp_native) if call["text"] is not None]
+            assert [call["text"] for call in calls] == ["infer", "infer"]
+            assert len({call["pid"] for call in calls}) == 1
+            assert relayed.inference()[-1] == ("ansuman-2", "ansuman-2")
+            assert not set(TAKEN_BACK) & set(methods(messages))
+            assert "in the same agent, so subagents keep running. Sending your message again…" in (
+                "".join(texts(messages))
+            )
+            # A reload replays the message once: the first copy went with the rewind.
+            assert bridge.chats[session_id].backend is backend
+            assert recorded_prompts(backend) == ["infer"]
+
+    asyncio.run(scenario())
+
+
+def test_gui_rewind_reaches_desktop_when_the_prompt_is_not_sent_again(
+    acp_native, tmp_path, monkeypatch
+):
+    monkeypatch.setattr(usage, "refresh_account", fresh_usage())
+    monkeypatch.setenv("FAKE_QUOTA_ACCOUNTS", "ansuman-1")
+    monkeypatch.setenv("FAKE_QUOTA_STYLE", "rewound")
+    acp.handoff.set_auto_switch(acp_native.store, False)
+
+    async def scenario():
+        async with in_process(acp_native) as (bridge, messages):
+            created = await bridge.dispatch("session/new", {"cwd": str(tmp_path), "mcpServers": []})
+            session_id = created["sessionId"]
+            start = len(messages)
+            error = await wire_error(bridge, messages, "session/prompt", asked(session_id, "work"))
+            assert error["code"] == -32011
+            # Desktop hears what the native said, in its order, and then the error.
+            told = [method for method in methods(messages[start:]) if method in TAKEN_BACK]
+            assert told == TAKEN_BACK
+            assert "error" in messages[-1]
+            (rewind,) = [message for message in messages if message.get("method") == REWIND]
+            assert rewind["params"]["firstRemovedUserMessageId"] == "prompt-1"
+            assert prompts(acp_native) == [("ansuman-1", "work")]
+            chat = bridge.chats[session_id]
+            assert recorded_prompts(chat.backend) == [] and chat.rewound is None
+
+    asyncio.run(scenario())
+
+
+def test_gui_prompt_the_native_took_back_carries_the_subagents_to_resume(
+    acp_native, tmp_path, monkeypatch
+):
+    """The message is sent again as it was, with the resume request in a block of its own."""
+    store = acp_native.store
+    monkeypatch.setattr(usage, "refresh_account", fresh_usage())
+    monkeypatch.setenv("FAKE_QUOTA_ACCOUNTS", "ansuman-1")
+    monkeypatch.setenv("FAKE_QUOTA_STYLE", "rewound")
+
+    async def scenario():
+        async with in_process(acp_native) as (bridge, _):
+            created = await bridge.dispatch("session/new", {"cwd": str(tmp_path), "mcpServers": []})
+            session_id = created["sessionId"]
+            subagents.record(
+                store, session_id, subagents.STARTED, {"agentId": "a", "task": "Fix it"}
+            )
+            await bridge.dispatch("session/prompt", asked(session_id, "work"))
+            failed, again = prompt_texts(acp_native)
+            assert failed == ["work"]
+            assert again[0] == "work" and len(again) == 2
+            assert "stopped before finishing" in again[1] and "Fix it" in again[1]
+            assert subagents.interrupted(store, session_id) == {}
+
+    asyncio.run(scenario())
+
+
 def cold_catalog(native, monkeypatch, starts):
     counter = native.store.root.parent / "cold-starts"
     counter.write_text(str(starts))

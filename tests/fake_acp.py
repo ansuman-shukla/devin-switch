@@ -215,6 +215,22 @@ def emit(message):
     print(json.dumps({"jsonrpc": "2.0", **message}), flush=True)
 
 
+def take_back(params):
+    """What CLI 3000.14 sends, before the error, for a prompt whose first model call failed."""
+    session_id = params["sessionId"]
+    prompt_id = (params.get("_meta") or {}).get("cognition.ai/clientMessageId", "generated-id")
+    for method, details in (
+        ("revert/stepsUpdated", {"steps": []}),
+        (
+            "revert/historyRewound",
+            {"revertTargetNodeId": 1, "firstRemovedUserMessageId": prompt_id},
+        ),
+        ("turn_stats", {"turnClientMessageId": prompt_id}),
+        ("agent_stopped", {"cause": "quota_exhausted", "errorMessage": "Quota exhausted."}),
+    ):
+        emit({"method": f"_cognition.ai/{method}", "params": {"sessionId": session_id, **details}})
+
+
 def configs():
     return [
         {
@@ -450,6 +466,8 @@ async def handle(message):
             data = {"cognition.ai/errorKind": "resource_exhausted", "cognition.ai/retryable": True}
             if style == "rate":
                 data["cognition.ai/retryAfterSeconds"] = 30
+            if style == "rewound":
+                take_back(params)
             emit(
                 {
                     "id": message["id"],
@@ -484,6 +502,8 @@ async def handle(message):
                     "cognition.ai/errorKind": "resource_exhausted",
                     "cognition.ai/retryable": True,
                 }
+                if os.environ.get("FAKE_QUOTA_STYLE") == "rewound":
+                    take_back(params)
                 emit(
                     {
                         "id": message["id"],

@@ -46,8 +46,10 @@ if os.environ.get("FAKE_PROCESS_MODEL") and os.environ.get("WINDSURF_API_SERVER_
 canceled = asyncio.Event()
 side_canceled = asyncio.Event()
 chains = False
-# Running "busy" turns by request ID; like the native, a session/load ends them.
+# Running "busy" turns by request ID. A session/load ended them up to CLI 3000.11.216; from
+# 3000.14 on (FAKE_PROCESS_MODEL) the native replays under the turn and the turn goes on.
 turns = {}
+VERSION = "3000.14.0" if os.environ.get("FAKE_PROCESS_MODEL") else "1"
 # A turn waiting on a foreground subagent. Like native 3000.11.228, steering sent during it stays
 # open, and a Stop with steering pending only interrupts the subagent wait: the turn keeps working
 # on the steering and ends (answering every open prompt "cancelled") only on another cancel.
@@ -337,7 +339,7 @@ async def handle(message):
                 },
             },
             "authMethods": [{"id": "api-key", "name": "API key"}],
-            "agentInfo": {"name": "fake", "version": "1"},
+            "agentInfo": {"name": "fake", "version": VERSION},
         }
     elif method == "authenticate" and params.get("methodId") == "windsurf-api-key":
         # CLI 3000.14 takes a host login only for the API server its process was started on.
@@ -375,8 +377,12 @@ async def handle(message):
             assert connection.execute(
                 "SELECT id FROM sessions WHERE id = ?", (session_id,)
             ).fetchone()
-            for ended in turns.values():
-                ended.set()
+            if VERSION == "1":
+                for ended in turns.values():
+                    ended.set()
+            if os.environ.get("FAKE_FINISH_IN_LOAD"):
+                # A working subagent that finishes while this load is being answered.
+                update(session_id, finished(WORKER, True, "Slept."))
             update(
                 session_id,
                 {

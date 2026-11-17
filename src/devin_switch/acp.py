@@ -115,7 +115,15 @@ SIDE_REQUESTS = {
     "_cognition.ai/terminal/killBackgroundShell",
     "_cognition.ai/queuedMessages/update",
     "_cognition.ai/diagnostics/sessionExport",
+    # Desktop 3.14: older rows of a bounded load, fetched on open and on scroll.
+    "_cognition.ai/session/loadPage",
+    "_cognition.ai/session/feedback",
+    "_cognition.ai/session/reaction",
+    "_cognition.ai/session/stop",
 }
+# From this CLI on, a session/load of the open chat no longer ends its running turn: the native
+# replays under the turn (3000.11.216 answered -32603 agent_channel_closed and ended it).
+LOADS_UNDER_A_TURN = (3000, 14)
 # Editor state Desktop sends once (didOpen right after initialize): replay it to later natives.
 # The value says whether the state is kept per document/repository uri or only the latest.
 EDITOR_STATE = {
@@ -144,6 +152,15 @@ BLANK_RELEASED = (
     "This empty chat was closed after 15 idle minutes to free its agent. Nothing was sent "
     "to the model; start a new chat."
 )
+
+
+def loads_under_a_turn(initialized) -> bool:
+    """Whether the native that answered `initialize` serves a load while its turn runs."""
+    version = (initialized.get("agentInfo") or {}).get("version")
+    try:
+        return tuple(int(part) for part in str(version).split(".")[:2]) >= LOADS_UNDER_A_TURN
+    except ValueError:
+        return False
 
 
 class RpcError(SwitchError):
@@ -352,6 +369,9 @@ class Backend:
         self.suppress_replay = False
         # Subagent events count only once the conversation is loaded, not during its replay.
         self.live = False
+        # A load forwarded while the turn runs: its replay arrives among the turn's live updates.
+        self.reloading = False
+        self.loads_under_a_turn = False
         self.running = set()
         # What Desktop was sent since the latest session/new or session/load: replaying it answers
         # a reload during a turn, which a native session/load would end. JSON text keeps it small.
@@ -441,6 +461,7 @@ class Backend:
                 raise SwitchError(
                     "This native CLI lacks compatible ACP session loading. Update Devin CLI."
                 )
+            self.loads_under_a_turn = loads_under_a_turn(result)
             # Written without awaiting, so no newer editor context can be sent before the replay.
             for method, params in self.bridge.editor_state.values():
                 self.write({"method": method, "params": params})
@@ -551,6 +572,16 @@ class Backend:
             self.remember_selection("mode", result["modes"].get("currentModeId"))
         if isinstance(result.get("models"), dict):
             self.remember_selection("model", result["models"].get("currentModelId"))
+
+    def finishing(self, meta):
+        """Whether an update of a load under a running turn ends a subagent that is working.
+
+        Such a load's replay and the turn's live updates arrive mixed, and a replayed subagent
+        event has nothing that tells it from a live one. A completion of a subagent that is
+        running in this process cannot be in the saved history, so it is live.
+        """
+        event = meta.get(subagents.COMPLETED)
+        return self.reloading and isinstance(event, dict) and event.get("agentId") in self.running
 
     def record(self, message):
         update = message["params"]["update"]
@@ -800,7 +831,8 @@ class Bridge:
                 ] + LOCAL_COMMANDS
                 backend.commands = update["availableCommands"]
             meta = update.get("_meta")
-            if backend.live and backend.session_id and isinstance(meta, dict):
+            live = backend.live or (isinstance(meta, dict) and backend.finishing(meta))
+            if live and backend.session_id and isinstance(meta, dict):
                 self.roster.apply(backend.session_id, update)
                 for key in (subagents.STARTED, subagents.COMPLETED):
                     if isinstance(event := meta.get(key), dict):
@@ -1479,6 +1511,8 @@ class Bridge:
             if session_id in self.chats:
                 chat = self.chats[session_id]
                 if chat.controls is not None:
+                    if method == "session/load" and chat.backend.loads_under_a_turn:
+                        return await self.reload(chat, method, setup, running=True)
                     return await self.replay(chat, method)
                 async with chat.access():
                     if self.chats.get(session_id) is not chat:
@@ -1496,17 +1530,7 @@ class Bridge:
                             )
                         self.chats.pop(session_id)
                     else:
-                        chat.backend.suppress_replay = method == "session/resume"
-                        chat.backend.live = False
-                        try:
-                            result = await chat.backend.request(
-                                "session/load", setup, LIFECYCLE_TIMEOUT
-                            )
-                            chat.setup = setup
-                            return result
-                        finally:
-                            chat.backend.suppress_replay = False
-                            chat.backend.live = True
+                        return await self.reload(chat, method, setup)
         account = (
             self.default_account()
             if self.account
@@ -1541,10 +1565,29 @@ class Bridge:
                 await backend.close()
             raise
 
-    async def replay(self, chat, method):
-        """Reopen a chat whose turn is running (Desktop reloads it when switching surfaces).
+    async def reload(self, chat, method, setup, *, running=False):
+        """Load an open chat again in its own native.
 
-        A native session/load would end the turn, so replay what Desktop was already sent.
+        Desktop 3.14 shows "Syncing", hides every update and holds new messages until a load
+        is answered, and reads the answer's row ids and each replayed message's
+        `clientMessageId`. Only the native has those, so from CLI 3000.14 on it also serves
+        the load of a chat whose turn is running, never waiting for the prompt gate.
+        """
+        backend = chat.backend
+        backend.suppress_replay = method == "session/resume"
+        backend.live, backend.reloading = False, running
+        try:
+            result = await backend.request("session/load", setup, LIFECYCLE_TIMEOUT)
+            chat.setup = setup
+            return result
+        finally:
+            backend.suppress_replay = False
+            backend.live, backend.reloading = True, False
+
+    async def replay(self, chat, method):
+        """Reopen a chat whose turn is running, for a native that cannot load under a turn.
+
+        Its session/load would end the turn, so replay what Desktop was already sent.
         """
         backend = chat.backend
         async with backend.emitting:

@@ -636,7 +636,16 @@ def test_gui_sidebar_action_does_not_take_a_chat_back(acp_native, tmp_path):
 
 
 @pytest.mark.parametrize(
-    "method", ["_cognition.ai/session/rename", "_cognition.ai/queuedMessages/update"]
+    "method",
+    [
+        "_cognition.ai/session/rename",
+        "_cognition.ai/queuedMessages/update",
+        # Desktop 3.14 pages a bounded load's older rows while the agent works.
+        "_cognition.ai/session/loadPage",
+        "_cognition.ai/session/feedback",
+        "_cognition.ai/session/reaction",
+        "_cognition.ai/session/stop",
+    ],
 )
 def test_gui_sidebar_requests_answer_during_a_turn(acp_native, tmp_path, method):
     async def scenario():
@@ -1920,6 +1929,72 @@ def test_gui_reload_mid_turn_replays_without_interrupting_the_turn(acp_native, t
             await client.send({"method": "session/cancel", "params": {"sessionId": session_id}})
             assert (await turn)["result"]["stopReason"] == "cancelled"
             assert not any(call["method"] == "session/load" for call in logged(acp_native))
+
+    asyncio.run(scenario())
+
+
+def test_gui_reload_mid_turn_is_the_natives_own_when_it_loads_under_a_turn(
+    acp_native, tmp_path, monkeypatch
+):
+    """Desktop 3.14 reads row ids and message ids off a load: only the native has them."""
+    monkeypatch.setenv("FAKE_PROCESS_MODEL", "1")
+
+    async def scenario():
+        async with connect(acp_native) as client:
+            session_id = await client.new(tmp_path)
+            await client.prompt(session_id, "hello")
+            turn = asyncio.create_task(client.prompt(session_id, "busy"))
+            await wait_for_text(client, "live progress")
+            tail = {"cognition.ai/replayFrom": {"type": "_cognition.ai/tail"}}
+            params = {"sessionId": session_id, "cwd": str(tmp_path), "mcpServers": []}
+
+            start = len(client.messages)
+            loaded = await asyncio.wait_for(
+                client.request("session/load", {**params, "_meta": tail}), 5
+            )
+            assert "result" in loaded and not turn.done()
+            assert replayed_texts(client.messages[start:], "agent_message_chunk") == [
+                "historical replay"
+            ]
+            (load,) = [call for call in logged(acp_native) if call["method"] == "session/load"]
+            (busy,) = [call for call in logged(acp_native) if call["text"] == "busy"]
+            assert load["pid"] == busy["pid"]
+
+            # A resume shows nothing again, so it still never reaches the native.
+            resumed = await asyncio.wait_for(client.request("session/resume", params), 5)
+            assert "result" in resumed and not turn.done()
+            assert len([c for c in logged(acp_native) if c["method"] == "session/load"]) == 1
+            await client.send({"method": "session/cancel", "params": {"sessionId": session_id}})
+            assert (await turn)["result"]["stopReason"] == "cancelled"
+
+    asyncio.run(scenario())
+
+
+def test_gui_load_under_a_turn_tells_a_live_subagent_end_from_replayed_ones(
+    acp_native, tmp_path, monkeypatch
+):
+    for switch in ("PROCESS_MODEL", "FOREGROUND_SUBAGENT", "REPLAY_SUBAGENT", "FINISH_IN_LOAD"):
+        monkeypatch.setenv(f"FAKE_{switch}", "1")
+
+    async def scenario():
+        async with in_process(acp_native) as (bridge, messages):
+            created = await bridge.dispatch("session/new", {"cwd": str(tmp_path), "mcpServers": []})
+            session_id = created["sessionId"]
+            backend = bridge.chats[session_id].backend
+            turn = asyncio.create_task(
+                bridge.dispatch("session/prompt", prompt_params(session_id, "foreground"))
+            )
+            await until(lambda: backend.running)
+            (worker,) = backend.running
+            await bridge.dispatch(
+                "session/load", {"sessionId": session_id, "cwd": str(tmp_path), "mcpServers": []}
+            )
+            rows = bridge.roster.rows[session_id]
+            # The saved chat's old subagent is history; the working one really finished.
+            assert {agent: row["status"] for agent, row in rows.items()} == {worker: "done"}
+            assert not backend.running and not turn.done()
+            await bridge.dispatch("session/cancel", {"sessionId": session_id}, notification=True)
+            assert (await turn)["stopReason"] == "cancelled"
 
     asyncio.run(scenario())
 

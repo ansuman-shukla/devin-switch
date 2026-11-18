@@ -285,6 +285,16 @@ def named(event: object, field: str = "agentId") -> str | None:
     return agent if isinstance(agent, str) and agent else None
 
 
+class Runs:
+    """The runs in one transcript of a chat."""
+
+    def __init__(self) -> None:
+        # Per subagent: how many starts the transcript holds, and the ID given to the run the
+        # subagent is on (none: its first run, or a run the native named).
+        self.starts: dict[str, int] = {}
+        self.given: dict[str, str] = {}
+
+
 class RunIds:
     """Names the runs of a resumed subagent for Desktop, because the native does not.
 
@@ -296,37 +306,48 @@ class RunIds:
     therefore gets `runId` "<agentId>-<n>". A first run stays as sent, and so does every run
     whose start the native named itself: once the native fills `runId`, this changes nothing
     and can be removed.
+
+    A replay that Desktop is not shown (a handoff's, a resume's) still fills the bridge's
+    reload record, which Desktop is shown on a reload during a turn. Its runs are numbered
+    on their own, from the replay's first, and a run after it takes no number it holds.
     """
 
     def __init__(self) -> None:
-        # Per chat and subagent: how many starts Desktop was sent, and the ID given to the run
-        # it is on (none: its first run, or a run the native named).
-        self.starts: dict[str, dict[str, int]] = {}
-        self.given: dict[str, dict[str, str]] = {}
+        # Per chat: the runs Desktop was sent, and those of the latest replay kept from it.
+        self.shown: dict[str, Runs] = {}
+        self.kept: dict[str, Runs] = {}
 
-    def stamp(self, session_id: str, update: dict) -> None:
-        """Name the run in an update that Desktop is about to be sent.
+    def stamp(self, session_id: str, update: dict, *, shown: bool = True) -> None:
+        """Name the run in an update on its way to Desktop, or (not `shown`) to the record alone.
 
         Never raises on what a native might send: the caller is the chat's read loop.
         """
         meta = update.get("_meta")
         if not isinstance(meta, dict):
             return
+        chats = self.shown if shown else self.kept
         if agent := named(started := meta.get(STARTED)):
-            starts = self.starts.setdefault(session_id, {})
-            given = self.given.setdefault(session_id, {})
-            starts[agent] = starts.get(agent, 0) + 1
-            given.pop(agent, None)
-            if starts[agent] > 1 and started.get("runId") is None:
-                given[agent] = f"{agent}-{starts[agent]}"
-        if given := self.given.get(session_id):
+            runs = chats.setdefault(session_id, Runs())
+            count = runs.starts[agent] = runs.starts.get(agent, 0) + 1
+            runs.given.pop(agent, None)
+            if count > 1 and started.get("runId") is None:
+                runs.given[agent] = f"{agent}-{count}"
+            if not shown:
+                # Desktop's count never falls behind the record's: the next run it is sent
+                # takes one more than the larger of the two.
+                sent = self.shown.setdefault(session_id, Runs()).starts
+                sent[agent] = max(sent.get(agent, 0), count)
+        if (runs := chats.get(session_id)) and runs.given:
             for key, field in RUN_EVENTS.items():
                 event = meta.get(key)
-                run = given.get(named(event, field))
+                run = runs.given.get(named(event, field))
                 if run and event.get("runId") is None:
                     event["runId"] = run
 
-    def forget(self, session_id: str | None) -> None:
-        """Count a chat's runs from the first again: Desktop no longer has its rows."""
-        self.starts.pop(session_id, None)
-        self.given.pop(session_id, None)
+    def forget(self, session_id: str | None, *, shown: bool = True) -> None:
+        """Number a chat's runs from the first again: in the record, which every load's replay
+        starts anew, and in Desktop's rows when it is `shown` that replay (or closed the chat).
+        """
+        self.kept.pop(session_id, None)
+        if shown:
+            self.shown.pop(session_id, None)

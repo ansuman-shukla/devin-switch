@@ -32,7 +32,7 @@ PAST = "9d2e41aa"
 WORKER = "5e1f0c2a"
 # The foreground subagent the fake's "rerun" turns run, and then run again with `resume`.
 RESUMED = "d29b75b1"
-SECOND, THIRD = f"{RESUMED}-2", f"{RESUMED}-3"
+SECOND, THIRD, FOURTH = f"{RESUMED}-2", f"{RESUMED}-3", f"{RESUMED}-4"
 # What the fake's delegate subagent says, in two messages, before its first command.
 REPLY = "I'll run the command.\n\n## Plan\nSleep, then **report**."
 STARTED = "cognition.ai/subagent_started"
@@ -1117,20 +1117,38 @@ def test_a_load_under_a_running_turn_numbers_the_runs_like_any_replay_of_the_nat
     asyncio.run(scenario())
 
 
+def recorded(first, second, working):
+    """A record replay of two finished runs and one at work, each with the run ID it names.
+
+    A record keeps only the latest usage update, and sends it last.
+    """
+    finished = [
+        (part, run)
+        for run in (first, second)
+        for part in ("started", "agent_thought_chunk", "completed")
+    ]
+    return [*finished, *one_run(working)[:2], ("usage_update", working)]
+
+
 @pytest.mark.parametrize("unseen", ["handoff", "release"])
-def test_a_replay_desktop_never_sees_leaves_the_run_numbers_as_they_were(
+def test_a_replay_desktop_never_sees_is_numbered_for_the_record_alone(
     acp_native, tmp_path, monkeypatch, unseen
 ):
     """Desktop keeps its transcript over a handoff and over an idle release: the new native's
-    replay of the chat is not shown, so its starts are none Desktop has rows for."""
+    replay of the chat is not shown, so its starts are none Desktop has rows for. The bridge's
+    record holds that replay, though, and a reload during a turn shows Desktop the record."""
+    gate = tmp_path / "may-finish"
+    monkeypatch.setenv("FAKE_SUBAGENT_GATE", str(gate))
     monkeypatch.setenv("FAKE_REPLAY_RESUMED", "1")
 
     async def scenario():
         async with in_process(acp_native) as (bridge, messages):
             chat = await new_chat(bridge, tmp_path)
             old = chat.backend
+            gate.touch()
             await ask(bridge, chat, "rerun")
-            assert run_ids(messages) == one_run() + one_run(SECOND)
+            await ask(bridge, chat, "rerun-again")
+            assert run_ids(messages) == one_run() + one_run(SECOND) + one_run(THIRD)
 
             start = len(messages)
             if unseen == "handoff":
@@ -1138,11 +1156,55 @@ def test_a_replay_desktop_never_sees_leaves_the_run_numbers_as_they_were(
             else:
                 old.last_activity -= acp.IDLE_TIMEOUT + 1
                 assert await bridge.release_idle(chat)
-            await ask(bridge, chat, "rerun-again")
-            # The new native did replay both runs, to the bridge alone.
+            gate.unlink()
+            turn = asyncio.create_task(ask(bridge, chat, "rerun-again"))
+            await until(lambda: len(about(messages[start:])) == 3)
+            # The new native replayed the two runs it has saved, to the bridge alone. Desktop
+            # was sent three, so the run now at work is its fourth.
             assert chat.backend is not old
             assert native_loads(acp_native) == [chat.backend.process.pid]
-            assert run_ids(messages[start:]) == one_run(THIRD)
+            assert run_ids(messages[start:]) == one_run(FOURTH)[:-1]
+
+            # The record's replay is numbered from its own first run, like one of the
+            # native's that Desktop is shown; the run at work reads as it went out.
+            start = len(messages)
+            await bridge.dispatch("session/load", chat.setup)
+            assert run_ids(messages[start:]) == recorded(None, SECOND, FOURTH)
+            assert len(native_loads(acp_native)) == 1
+            start = len(messages)
+            gate.touch()
+            assert await turn == {"stopReason": "end_turn"}
+            assert run_ids(messages[start:]) == [("completed", FOURTH)]
+
+    asyncio.run(scenario())
+
+
+def test_a_run_never_takes_a_number_the_record_holds_from_a_replay_desktop_never_saw(
+    acp_native, tmp_path, monkeypatch
+):
+    """A resume asks for no replay, so Desktop is sent none of the chat's earlier runs, while
+    the record holds them. The next run must be told apart from those in both."""
+    gate = tmp_path / "may-finish"
+    monkeypatch.setenv("FAKE_SUBAGENT_GATE", str(gate))
+    monkeypatch.setenv("FAKE_REPLAY_RESUMED", "1")
+
+    async def scenario():
+        async with in_process(acp_native) as (bridge, messages):
+            chat = await new_chat(bridge, tmp_path)
+            # Each such replay is numbered from its own first run.
+            for loads in (1, 2):
+                await bridge.dispatch("session/resume", chat.setup)
+                assert len(native_loads(acp_native)) == loads
+            assert about(messages) == []
+
+            turn = asyncio.create_task(ask(bridge, chat, "rerun-again"))
+            await until(lambda: len(about(messages)) == 3)
+            assert run_ids(messages) == one_run(THIRD)[:-1]
+            start = len(messages)
+            await bridge.dispatch("session/load", chat.setup)
+            assert run_ids(messages[start:]) == recorded(None, SECOND, THIRD)
+            gate.touch()
+            assert await turn == {"stopReason": "end_turn"}
 
     asyncio.run(scenario())
 
@@ -1223,6 +1285,45 @@ def test_runs_are_numbered_per_chat_and_subagent_until_the_chat_is_forgotten():
     assert named_by(ids, started(), "other") == started(runId=f"{AGENT}-2")
 
 
+def test_a_replay_kept_from_desktop_is_numbered_on_its_own_from_its_first_run():
+    ids = subagents.RunIds()
+    run = [started(), by(AGENT, THOUGHT), paused(AGENT, True), completed()]
+    third = [in_run(update, f"{AGENT}-3") for update in run]
+    for _ in range(3):
+        shown = [named_by(ids, update) for update in run]
+    assert shown == third
+
+    def kept(update):
+        update = copy.deepcopy(update)
+        ids.stamp("chat", update, shown=False)
+        return update
+
+    # Each replay Desktop is not shown starts the record anew: so are its runs numbered.
+    for _ in range(2):
+        ids.forget("chat", shown=False)
+        assert [kept(update) for update in run] == run
+        assert [kept(update) for update in run] == [in_run(update, f"{AGENT}-2") for update in run]
+        assert kept(started("b2")) == started("b2")
+    # Desktop's rows are as they were: the run it was last sent is still the third...
+    assert named_by(ids, completed()) == in_run(completed(), f"{AGENT}-3")
+    assert named_by(ids, started(), "other") == started()
+    # ...and the next one is the fourth.
+    assert named_by(ids, started()) == started(runId=f"{AGENT}-4")
+    assert kept(completed()) == in_run(completed(), f"{AGENT}-2")
+
+    # Where the record holds more runs than Desktop was sent, the next run takes none of
+    # their numbers: a reload during a turn shows Desktop the record.
+    assert named_by(ids, started("b2")) == started("b2", runId="b2-2")
+    ids.forget("chat", shown=False)
+    for _ in range(6):
+        ids.stamp("chat", started(), shown=False)
+    assert named_by(ids, started()) == started(runId=f"{AGENT}-7")
+    # A replay that Desktop is shown starts both anew.
+    ids.forget("chat")
+    assert named_by(ids, started()) == started()
+    assert kept(started()) == started()
+
+
 def test_naming_runs_never_raises_on_odd_updates():
     ids = subagents.RunIds()
     for _ in range(2):
@@ -1238,6 +1339,8 @@ def test_naming_runs_never_raises_on_odd_updates():
     ):
         update = {"sessionUpdate": "tool_call_update", "_meta": meta}
         assert named_by(ids, update) == update
+        ids.stamp("chat", sent := copy.deepcopy(update), shown=False)
+        assert sent == update
     ids.stamp("chat", {"sessionUpdate": "usage_update"})
     # None of them was a start.
     assert named_by(ids, started()) == started(runId=f"{AGENT}-3")

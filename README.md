@@ -226,12 +226,22 @@ restart needed. If the setting file is unreadable, automatic switching stays off
   over) uses the native CLI's typed quota signals: a `-32011` / `resource_exhausted`
   prompt error, or an `agent_stopped` event with cause `quota_exhausted`. The switch and the
   `continue` happen inside the same Desktop turn, so output keeps streaming into the chat.
+  If the login ran out before the agent could start on your message, the CLI (3000.14 and
+  newer) takes that message out of the conversation; Switch then sends **your message again**
+  on the new login instead of `continue`.
   Rate limits that include a retry delay do not trigger a switch. Stopping the turn in Desktop
   cancels the pending `continue`. Each turn switches at most three times and never goes back
   to a login it already tried. If no login has confirmed remaining usage, the original quota
   error is shown.
-- **Terminal chats** watch the CLI's rendered "Quota exhausted" / "Usage limit reached" alert,
-  then check usage again for the current account. The chat switches only if that fresh reading
+- **Terminal chats keep running too** (Devin CLI 3000.14 or later). `ds run` routes the chat's
+  API traffic through the same kind of relay, so a request that runs out of usage is answered
+  on the next login with remaining usage, in the same CLI process: no exit, no resume, and no
+  `continue`. The terminal prints `ds: Out of usage on A. Continuing on B in this chat.` This
+  also covers piped and scripted chats (`ds run -- -p "..."`), which cannot restart. Use
+  `ds login` to sign in, not `/login` inside such a chat.
+- **Fallback for terminal chats** (an older CLI, no saved API login, or no login could take
+  over): Switch watches the CLI's rendered "Quota exhausted" / "Usage limit reached" alert,
+  then checks usage again for the current account. The chat switches only if that fresh reading
   confirms at least one quota window is at 0%, so the same words appearing in conversation
   text do not cause a switch. The exit, exact-conversation resume, and failure rules match
   `!ds switch`. A login whose sign-in check fails or times out is skipped. If the check

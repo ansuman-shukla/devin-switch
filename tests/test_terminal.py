@@ -478,3 +478,178 @@ def test_quota_alert_automatically_resumes_and_continues_on_real_pty(
         if process.poll() is None:
             process.terminate()
             process.wait(timeout=5)
+
+
+RELAYED_CLI = (
+    "#!/usr/bin/env python3\n"
+    "import json, os, pathlib, sys, termios, tty, urllib.error, urllib.request\n"
+    "if sys.argv[1:] == ['--help']:\n"
+    "    print('--process-model <PROCESS_MODEL>' if 'FAKE_OLD_CLI' not in os.environ else '')\n"
+    "    sys.exit(0)\n"
+    "if sys.argv[-2:] == ['auth', 'status']:\n"
+    "    print('Logged in as offline@example.invalid')\n"
+    "    sys.exit(0)\n"
+    "data = pathlib.Path(os.environ['XDG_DATA_HOME'])\n"
+    "saved = (data / 'devin/credentials.toml').read_text().split('\"')\n"
+    "# Like CLI 3000.14, the saved login goes to the API server the process was started on.\n"
+    "key, server = saved[1], os.environ.get('WINDSURF_API_SERVER_URL', saved[3])\n"
+    "def infer():\n"
+    "    request = urllib.request.Request(\n"
+    "        server + '/exa.api_server_pb.ApiServerService/GetChatMessage',\n"
+    "        data=b'\\x0a' + bytes([len(key)]) + key.encode(),\n"
+    "        headers={'Authorization': f'Basic {key}-sk',\n"
+    "                 'Content-Type': 'application/proto'})\n"
+    "    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))\n"
+    "    try:\n"
+    "        reply = opener.open(request, timeout=20).read()\n"
+    "    except urllib.error.HTTPError as error:\n"
+    "        return f'refused {error.code}'\n"
+    "    size = int.from_bytes(reply[1:5], 'big')\n"
+    "    return 'quota' if reply[0] & 2 else reply[5:5 + size].decode()\n"
+    "if '-p' in sys.argv:\n"
+    "    relayed = 'WINDSURF_API_SERVER_URL' in os.environ\n"
+    "    print(json.dumps({'reply': infer(), 'relayed': relayed}))\n"
+    "    sys.exit(0)\n"
+    "settings = termios.tcgetattr(0)\n"
+    "tty.setraw(0)\n"
+    "print('START ' + data.parent.name, flush=True)\n"
+    "while (key_pressed := os.read(0, 1)) != b'\\x04':\n"
+    "    if key_pressed == b'i':\n"
+    "        print('ANSWER ' + infer() + '.', end='\\r\\n', flush=True)\n"
+    "termios.tcsetattr(0, termios.TCSADRAIN, settings)\n"
+)
+USAGE_DRIVER = (
+    "import time\n"
+    "from devin_switch import cli, usage\n"
+    "def refresh(store, account, *, force):\n"
+    "    now = time.time()\n"
+    "    used = 100 if account.name == 'ansuman-1' else 20\n"
+    "    return usage.Usage(status='ok', fetched_at=now, checked_at=now, "
+    "daily=usage.Window(used, now+3600, 'available'), "
+    "weekly=usage.Window(10, now+86400, 'available'))\n"
+    "usage.refresh_account = refresh\n"
+    "raise SystemExit(cli.main())\n"
+)
+
+
+@pytest.fixture
+def relayed_cli(store: Store, tmp_path: Path):
+    """A CLI like 3000.14 with saved API logins, the first of them out of usage."""
+    from fake_upstream import Upstream
+
+    binary = tmp_path / "relayed cli"
+    binary.write_text(RELAYED_CLI)
+    binary.chmod(0o700)
+    upstream = Upstream([account.name for account in store.accounts()])
+    upstream.exhausted = {"ansuman-1"}
+    for account in store.accounts():
+        store.credentials(account).write_text(upstream.credentials(account.name))
+    (tmp_path / "project").mkdir()
+    yield binary, upstream
+    upstream.close()
+
+
+def piped(store, binary, project, *arguments):
+    """Run `ds run` with pipes, as a script would; returns its exit code and output."""
+    driver = project.parent / "pipe driver.py"
+    driver.write_text(USAGE_DRIVER)
+    result = subprocess.run(
+        (sys.executable, str(driver), "run", "--account", "ansuman-1", "--", *arguments),
+        env={**os.environ, "DS_HOME": str(store.root), "DS_BINARY": str(binary)},
+        cwd=project,
+        stdin=subprocess.DEVNULL,
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    return result.returncode, result.stdout, result.stderr
+
+
+def test_piped_chat_moves_to_the_next_login_without_restarting(store, relayed_cli, tmp_path):
+    binary, upstream = relayed_cli
+    code, output, notes = piped(store, binary, tmp_path / "project", "-p", "work")
+    assert code == 0, notes
+    assert json.loads(output) == {"reply": "reply from ansuman-2", "relayed": True}
+    assert "ds: Out of usage on ansuman-1. Continuing on ansuman-2 in this chat." in notes
+    assert upstream.inference() == [("ansuman-1", "ansuman-1"), ("ansuman-2", "ansuman-2")]
+    assert store.selected().name == "ansuman-2"
+    (run,) = sessions.runs(store)
+    assert (run["account"], run["active"]) == ("ansuman-2", False)
+    # The first login's lock was only shared, and both are free again.
+    for account in store.accounts():
+        with store.account_lock(account):
+            pass
+
+
+@pytest.mark.parametrize(
+    ("arguments", "environment", "relayed", "reply"),
+    [
+        # Auto-switch off: the relay hands the CLI its own quota error.
+        (("-p", "work"), {"FAKE_AUTO_SWITCH": "off"}, True, "quota"),
+        # The user's own config, and a CLI that does not take its server from the environment.
+        (("--config", "mine.json", "-p", "work"), {}, False, "quota"),
+        (("-p", "work"), {"FAKE_OLD_CLI": "1"}, False, "quota"),
+    ],
+)
+def test_piped_chat_keeps_its_login_when_it_cannot_move(
+    store, relayed_cli, tmp_path, monkeypatch, arguments, environment, relayed, reply
+):
+    binary, upstream = relayed_cli
+    for key, value in environment.items():
+        monkeypatch.setenv(key, value)
+    if "FAKE_AUTO_SWITCH" in environment:
+        handoff.set_auto_switch(store, False)
+    store.select(store.account("ansuman-1"))
+    code, output, notes = piped(store, binary, tmp_path / "project", *arguments)
+    assert code == 0, notes
+    assert json.loads(output) == {"reply": reply, "relayed": relayed}
+    assert "Continuing on" not in notes
+    assert {owner for owner, _ in upstream.inference()} == {"ansuman-1"}
+    assert store.selected().name == "ansuman-1"
+    assert sessions.runs(store)[0]["account"] == "ansuman-1"
+
+
+def test_terminal_chat_moves_to_the_next_login_in_place_on_real_pty(store, relayed_cli, tmp_path):
+    binary, upstream = relayed_cli
+    project = tmp_path / "project"
+    driver = tmp_path / "tty driver.py"
+    driver.write_text(USAGE_DRIVER)
+    master, slave = pty.openpty()
+    process = subprocess.Popen(
+        (sys.executable, str(driver), "run", "--account", "ansuman-1", "--", "--sandbox"),
+        env={**os.environ, "DS_HOME": str(store.root), "DS_BINARY": str(binary)},
+        cwd=project,
+        stdin=slave,
+        stdout=slave,
+        stderr=slave,
+        start_new_session=True,
+        preexec_fn=terminal.claim_terminal,
+    )
+    try:
+        read_until(master, b"START ansuman-1")
+        os.write(master, b"i")
+        output = read_until(master, b"ANSWER reply from ansuman-2.")
+        notice = b"ds: Out of usage on ansuman-1. Continuing on ansuman-2 in this chat."
+        if notice not in output:
+            output += read_until(master, notice)
+        os.write(master, b"i")
+        output += read_until(master, b"ANSWER reply from ansuman-2.")
+        # The same CLI process answered both: nothing was closed or resumed.
+        assert b"START" not in output
+        assert upstream.inference() == [
+            ("ansuman-1", "ansuman-1"),
+            ("ansuman-2", "ansuman-2"),
+            ("ansuman-2", "ansuman-2"),
+        ]
+        assert store.selected().name == "ansuman-2"
+        assert [(run["account"], run["active"]) for run in sessions.runs(store)] == [
+            ("ansuman-2", True)
+        ]
+        os.write(master, b"\x04")
+        assert process.wait(timeout=10) == 0
+    finally:
+        os.close(master)
+        os.close(slave)
+        if process.poll() is None:
+            process.terminate()
+            process.wait(timeout=5)

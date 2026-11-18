@@ -245,6 +245,33 @@ def test_gui_switch_a_b_a_keeps_exact_chat_settings_and_other_chat(acp_native, t
     asyncio.run(scenario())
 
 
+def test_gui_agents_stay_out_of_the_clis_shared_daemon(acp_native, tmp_path, monkeypatch):
+    """A daemon runs every chat on the login that started it, whatever login Switch chose."""
+    monkeypatch.setenv("FAKE_PROCESS_MODEL", "1")
+
+    async def scenario():
+        async with connect(acp_native, "--sandbox") as client:
+            chat = await client.new(tmp_path)
+            await client.prompt(chat, "/switch ansuman-2")
+            await client.prompt(chat, "continue")
+            calls = logged(acp_native)
+            assert {call["account"] for call in calls} == {"ansuman-1", "ansuman-2"}
+            assert all(
+                call["args"] == ["--process-model=in-process", "--sandbox", "acp"] for call in calls
+            )
+
+    asyncio.run(scenario())
+
+
+def test_gui_agents_get_no_process_flag_from_a_cli_without_one(acp_native, tmp_path):
+    async def scenario():
+        async with connect(acp_native) as client:
+            await client.prompt(await client.new(tmp_path), "continue")
+            assert all(call["args"] == ["acp"] for call in logged(acp_native))
+
+    asyncio.run(scenario())
+
+
 def test_gui_chats_and_handoffs_share_user_github_config(acp_native, tmp_path, monkeypatch):
     monkeypatch.setenv("HOME", str(tmp_path / "home"))
     monkeypatch.delenv("GH_CONFIG_DIR", raising=False)
@@ -609,7 +636,16 @@ def test_gui_sidebar_action_does_not_take_a_chat_back(acp_native, tmp_path):
 
 
 @pytest.mark.parametrize(
-    "method", ["_cognition.ai/session/rename", "_cognition.ai/queuedMessages/update"]
+    "method",
+    [
+        "_cognition.ai/session/rename",
+        "_cognition.ai/queuedMessages/update",
+        # Desktop 3.14 pages a bounded load's older rows while the agent works.
+        "_cognition.ai/session/loadPage",
+        "_cognition.ai/session/feedback",
+        "_cognition.ai/session/reaction",
+        "_cognition.ai/session/stop",
+    ],
 )
 def test_gui_sidebar_requests_answer_during_a_turn(acp_native, tmp_path, method):
     async def scenario():
@@ -1080,7 +1116,7 @@ def test_gui_native_crash_is_reported_without_leaking_diagnostics(acp_native, tm
 
 
 @asynccontextmanager
-async def in_process(native):
+async def in_process(native, capabilities=None):
     messages = []
 
     async def emit(message):
@@ -1088,7 +1124,9 @@ async def in_process(native):
 
     bridge = acp.Bridge(native, emit)
     try:
-        await bridge.dispatch("initialize", {"protocolVersion": 1, "clientCapabilities": {}})
+        await bridge.dispatch(
+            "initialize", {"protocolVersion": 1, "clientCapabilities": capabilities or {}}
+        )
         yield bridge, messages
     finally:
         await bridge.close()
@@ -1893,6 +1931,72 @@ def test_gui_reload_mid_turn_replays_without_interrupting_the_turn(acp_native, t
             await client.send({"method": "session/cancel", "params": {"sessionId": session_id}})
             assert (await turn)["result"]["stopReason"] == "cancelled"
             assert not any(call["method"] == "session/load" for call in logged(acp_native))
+
+    asyncio.run(scenario())
+
+
+def test_gui_reload_mid_turn_is_the_natives_own_when_it_loads_under_a_turn(
+    acp_native, tmp_path, monkeypatch
+):
+    """Desktop 3.14 reads row ids and message ids off a load: only the native has them."""
+    monkeypatch.setenv("FAKE_PROCESS_MODEL", "1")
+
+    async def scenario():
+        async with connect(acp_native) as client:
+            session_id = await client.new(tmp_path)
+            await client.prompt(session_id, "hello")
+            turn = asyncio.create_task(client.prompt(session_id, "busy"))
+            await wait_for_text(client, "live progress")
+            tail = {"cognition.ai/replayFrom": {"type": "_cognition.ai/tail"}}
+            params = {"sessionId": session_id, "cwd": str(tmp_path), "mcpServers": []}
+
+            start = len(client.messages)
+            loaded = await asyncio.wait_for(
+                client.request("session/load", {**params, "_meta": tail}), 5
+            )
+            assert "result" in loaded and not turn.done()
+            assert replayed_texts(client.messages[start:], "agent_message_chunk") == [
+                "historical replay"
+            ]
+            (load,) = [call for call in logged(acp_native) if call["method"] == "session/load"]
+            (busy,) = [call for call in logged(acp_native) if call["text"] == "busy"]
+            assert load["pid"] == busy["pid"]
+
+            # A resume shows nothing again, so it still never reaches the native.
+            resumed = await asyncio.wait_for(client.request("session/resume", params), 5)
+            assert "result" in resumed and not turn.done()
+            assert len([c for c in logged(acp_native) if c["method"] == "session/load"]) == 1
+            await client.send({"method": "session/cancel", "params": {"sessionId": session_id}})
+            assert (await turn)["result"]["stopReason"] == "cancelled"
+
+    asyncio.run(scenario())
+
+
+def test_gui_load_under_a_turn_tells_a_live_subagent_end_from_replayed_ones(
+    acp_native, tmp_path, monkeypatch
+):
+    for switch in ("PROCESS_MODEL", "FOREGROUND_SUBAGENT", "REPLAY_SUBAGENT", "FINISH_IN_LOAD"):
+        monkeypatch.setenv(f"FAKE_{switch}", "1")
+
+    async def scenario():
+        async with in_process(acp_native) as (bridge, messages):
+            created = await bridge.dispatch("session/new", {"cwd": str(tmp_path), "mcpServers": []})
+            session_id = created["sessionId"]
+            backend = bridge.chats[session_id].backend
+            turn = asyncio.create_task(
+                bridge.dispatch("session/prompt", prompt_params(session_id, "foreground"))
+            )
+            await until(lambda: backend.running)
+            (worker,) = backend.running
+            await bridge.dispatch(
+                "session/load", {"sessionId": session_id, "cwd": str(tmp_path), "mcpServers": []}
+            )
+            rows = bridge.roster.rows[session_id]
+            # The saved chat's old subagent is history; the working one really finished.
+            assert {agent: row["status"] for agent, row in rows.items()} == {worker: "done"}
+            assert not backend.running and not turn.done()
+            await bridge.dispatch("session/cancel", {"sessionId": session_id}, notification=True)
+            assert (await turn)["stopReason"] == "cancelled"
 
     asyncio.run(scenario())
 
@@ -2757,6 +2861,193 @@ def test_gui_quota_exhaustion_switches_and_continues_in_the_same_turn(
             text = json.dumps(messages)
             assert "Out of usage on ansuman-1" in text and "Sending" in text
             assert chat.controls is None and not chat.gate.locked()
+
+    asyncio.run(scenario())
+
+
+def test_gui_reload_while_a_prompt_changes_logins_is_answered_at_once(
+    acp_native, tmp_path, monkeypatch
+):
+    """No turn is open between the failed prompt and its follow-up, yet the prompt holds the chat.
+
+    Desktop 3.14 shows only a loader, and queues what is typed, until its reload is answered.
+    """
+    monkeypatch.setattr(usage, "refresh_account", fresh_usage())
+    monkeypatch.setenv("FAKE_QUOTA_ACCOUNTS", "ansuman-1")
+
+    async def scenario():
+        async with in_process(acp_native) as (bridge, messages):
+            created = await bridge.dispatch("session/new", {"cwd": str(tmp_path), "mcpServers": []})
+            session_id = created["sessionId"]
+            switch = bridge.switch
+            switching, proceed = asyncio.Event(), asyncio.Event()
+
+            async def slow_switch(chat, *arguments, **options):
+                switching.set()
+                await proceed.wait()
+                await switch(chat, *arguments, **options)
+
+            monkeypatch.setattr(bridge, "switch", slow_switch)
+            turn = bridge.spawn(
+                bridge.dispatch("session/prompt", prompt_params(session_id, "work"))
+            )
+            await asyncio.wait_for(switching.wait(), 5)
+            start = len(messages)
+            params = {"sessionId": session_id, "cwd": str(tmp_path), "mcpServers": []}
+            loaded = await asyncio.wait_for(bridge.dispatch("session/load", params), 5)
+            assert "configOptions" in loaded
+            assert replayed_texts(messages[start:], "user_message_chunk") == ["work"]
+            assert not turn.done()
+            proceed.set()
+            assert await turn == {"stopReason": "end_turn"}
+            assert prompts(acp_native) == [("ansuman-1", "work"), ("ansuman-2", "continue")]
+            loads = [
+                call["account"] for call in logged(acp_native) if call["method"] == "session/load"
+            ]
+            assert loads == ["ansuman-2"], "only the switch loaded the chat, in the new native"
+
+    asyncio.run(scenario())
+
+
+REWIND = "_cognition.ai/revert/historyRewound"
+# What the native sends from the rewind on, until it answers the prompt with the error.
+TAKEN_BACK = [REWIND, "_cognition.ai/turn_stats", "_cognition.ai/agent_stopped"]
+# Like Desktop, a client that shows revert steps: the native tells only those of a rewind.
+REVERTING = {"_meta": {"cognition.ai/revert": True}}
+
+
+def asked(session_id, text, identifier="prompt-1"):
+    """A prompt as Desktop sends it: the native names the message it takes back by this id."""
+    return {
+        **prompt_params(session_id, text),
+        "_meta": {"cognition.ai/clientMessageId": identifier},
+    }
+
+
+def methods(messages):
+    return [message.get("method") for message in messages]
+
+
+@pytest.mark.parametrize("client", [REVERTING, {}], ids=["desktop", "plain-client"])
+def test_gui_prompt_the_native_took_back_is_sent_again_after_the_switch(
+    acp_native, tmp_path, monkeypatch, client
+):
+    """CLI 3000.14 removes a prompt whose first model call failed: `continue` has no context.
+
+    Desktop 3.14 drops the message and reloads the chat when it hears of the rewind, so the
+    failed attempt stays between the bridge and the native. The native announces a rewind
+    only to a client that shows revert steps, so the bridge asks for that itself.
+    """
+    monkeypatch.setattr(usage, "refresh_account", fresh_usage())
+    monkeypatch.setenv("FAKE_QUOTA_ACCOUNTS", "ansuman-1")
+    monkeypatch.setenv("FAKE_QUOTA_STYLE", "rewound")
+
+    async def scenario():
+        async with in_process(acp_native, client) as (bridge, messages):
+            created = await bridge.dispatch("session/new", {"cwd": str(tmp_path), "mcpServers": []})
+            session_id = created["sessionId"]
+            result = await bridge.dispatch("session/prompt", asked(session_id, "work"))
+            assert result == {"stopReason": "end_turn"}
+            assert prompts(acp_native) == [("ansuman-1", "work"), ("ansuman-2", "work")]
+            assert not set(TAKEN_BACK) & set(methods(messages))
+            # Only a client that asked for them gets the revert steps of the turn.
+            steps = [m for m in methods(messages) if str(m).startswith("_cognition.ai/revert/")]
+            assert steps == (["_cognition.ai/revert/stepsUpdated"] if client else [])
+            notes = "".join(texts(messages))
+            assert "Sending your message again…" in notes and "continue" not in notes
+            chat = bridge.chats[session_id]
+            assert chat.backend.account.name == "ansuman-2"
+            assert recorded_prompts(chat.backend) == ["work"]
+            assert chat.rewound is None
+
+    asyncio.run(scenario())
+
+
+def test_gui_prompt_the_native_took_back_is_sent_again_in_the_same_process(
+    acp_native, relayed, tmp_path, monkeypatch
+):
+    monkeypatch.setattr(usage, "refresh_account", fresh_usage(exhausted={"ansuman-1"}))
+    # The relay cannot replay this request, so the agent sees the quota error itself.
+    monkeypatch.setattr(acp.relay, "ROTATION_LIMIT", 0)
+    monkeypatch.setenv("FAKE_QUOTA_STYLE", "rewound")
+    relayed.exhausted = {"ansuman-1"}
+
+    async def scenario():
+        async with in_process(acp_native, REVERTING) as (bridge, messages):
+            created = await bridge.dispatch("session/new", {"cwd": str(tmp_path), "mcpServers": []})
+            session_id = created["sessionId"]
+            backend = bridge.chats[session_id].backend
+            result = await bridge.dispatch("session/prompt", asked(session_id, "infer"))
+            assert result == {"stopReason": "end_turn"}
+            calls = [call for call in logged(acp_native) if call["text"] is not None]
+            assert [call["text"] for call in calls] == ["infer", "infer"]
+            assert len({call["pid"] for call in calls}) == 1
+            assert relayed.inference()[-1] == ("ansuman-2", "ansuman-2")
+            assert not set(TAKEN_BACK) & set(methods(messages))
+            assert "in the same agent, so subagents keep running. Sending your message again…" in (
+                "".join(texts(messages))
+            )
+            # A reload replays the message once: the first copy went with the rewind.
+            assert bridge.chats[session_id].backend is backend
+            assert recorded_prompts(backend) == ["infer"]
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("client", [REVERTING, {}], ids=["desktop", "plain-client"])
+def test_gui_rewind_reaches_desktop_when_the_prompt_is_not_sent_again(
+    acp_native, tmp_path, monkeypatch, client
+):
+    monkeypatch.setattr(usage, "refresh_account", fresh_usage())
+    monkeypatch.setenv("FAKE_QUOTA_ACCOUNTS", "ansuman-1")
+    monkeypatch.setenv("FAKE_QUOTA_STYLE", "rewound")
+    acp.handoff.set_auto_switch(acp_native.store, False)
+
+    async def scenario():
+        async with in_process(acp_native, client) as (bridge, messages):
+            created = await bridge.dispatch("session/new", {"cwd": str(tmp_path), "mcpServers": []})
+            session_id = created["sessionId"]
+            start = len(messages)
+            error = await wire_error(bridge, messages, "session/prompt", asked(session_id, "work"))
+            assert error["code"] == -32011
+            # Desktop hears what the native said, in its order, and then the error. A client
+            # that never asked for revert notices gets the rest without the rewind.
+            told = [method for method in methods(messages[start:]) if method in TAKEN_BACK]
+            assert told == (TAKEN_BACK if client else TAKEN_BACK[1:])
+            assert "error" in messages[-1]
+            rewinds = [message for message in messages if message.get("method") == REWIND]
+            assert [rewind["params"]["firstRemovedUserMessageId"] for rewind in rewinds] == (
+                ["prompt-1"] if client else []
+            )
+            assert prompts(acp_native) == [("ansuman-1", "work")]
+            chat = bridge.chats[session_id]
+            assert recorded_prompts(chat.backend) == [] and chat.rewound is None
+
+    asyncio.run(scenario())
+
+
+def test_gui_prompt_the_native_took_back_carries_the_subagents_to_resume(
+    acp_native, tmp_path, monkeypatch
+):
+    """The message is sent again as it was, with the resume request in a block of its own."""
+    store = acp_native.store
+    monkeypatch.setattr(usage, "refresh_account", fresh_usage())
+    monkeypatch.setenv("FAKE_QUOTA_ACCOUNTS", "ansuman-1")
+    monkeypatch.setenv("FAKE_QUOTA_STYLE", "rewound")
+
+    async def scenario():
+        async with in_process(acp_native) as (bridge, _):
+            created = await bridge.dispatch("session/new", {"cwd": str(tmp_path), "mcpServers": []})
+            session_id = created["sessionId"]
+            subagents.record(
+                store, session_id, subagents.STARTED, {"agentId": "a", "task": "Fix it"}
+            )
+            await bridge.dispatch("session/prompt", asked(session_id, "work"))
+            failed, again = prompt_texts(acp_native)
+            assert failed == ["work"]
+            assert again[0] == "work" and len(again) == 2
+            assert "stopped before finishing" in again[1] and "Fix it" in again[1]
+            assert subagents.interrupted(store, session_id) == {}
 
     asyncio.run(scenario())
 
@@ -3789,6 +4080,57 @@ def test_gui_failed_host_login_keeps_saved_credentials(acp_native, relayed, tmp_
             }
 
     asyncio.run(scenario())
+
+
+def test_gui_relay_login_reaches_a_cli_that_checks_its_api_server(
+    acp_native, relayed, tmp_path, monkeypatch
+):
+    """CLI 3000.14 refuses a host login for another server than the one it was started on."""
+    monkeypatch.setenv("FAKE_PROCESS_MODEL", "1")
+    monkeypatch.setattr(usage, "refresh_account", fresh_usage(exhausted={"ansuman-3"}))
+    relayed.exhausted = {"ansuman-1"}
+
+    async def scenario():
+        async with in_process(acp_native) as (bridge, _):
+            created = await bridge.dispatch("session/new", {"cwd": str(tmp_path), "mcpServers": []})
+            session_id = created["sessionId"]
+            backend = bridge.chats[session_id].backend
+            assert backend.relay is not None
+            assert await bridge.dispatch("session/prompt", prompt_params(session_id, "infer")) == {
+                "stopReason": "end_turn"
+            }
+            # Usage ran out, and the same native went on with the next login.
+            assert bridge.chats[session_id].backend is backend
+            assert relayed.inference()[-1] == ("ansuman-2", "ansuman-2")
+
+    asyncio.run(scenario())
+
+
+def test_gui_failed_host_login_goes_through_the_relay_the_cli_was_started_on(
+    acp_native, relayed, tmp_path, monkeypatch
+):
+    monkeypatch.setenv("FAKE_PROCESS_MODEL", "1")
+    monkeypatch.setattr(acp.Backend, "request", refuse_host_login(acp.Backend.request))
+
+    async def scenario():
+        async with in_process(acp_native) as (bridge, _):
+            created = await bridge.dispatch("session/new", {"cwd": str(tmp_path), "mcpServers": []})
+            session_id = created["sessionId"]
+            # Closing it would cut the native off: its saved login uses the relay's address too.
+            assert bridge.chats[session_id].backend.relay is not None
+            await bridge.dispatch("session/prompt", prompt_params(session_id, "infer"))
+            assert relayed.inference() == [("ansuman-1", "ansuman-1")]
+
+    asyncio.run(scenario())
+
+
+def refuse_host_login(request):
+    async def refusing(backend, method, params, *arguments):
+        if method == "authenticate":
+            raise acp.RpcError("Authentication failed", -32603)
+        return await request(backend, method, params, *arguments)
+
+    return refusing
 
 
 def test_gui_chats_without_a_saved_api_login_skip_the_relay(acp_native, tmp_path):

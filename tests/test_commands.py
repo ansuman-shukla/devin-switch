@@ -1,6 +1,8 @@
 import json
 import os
+import socket
 import subprocess
+import tempfile
 from pathlib import Path
 
 import pytest
@@ -223,3 +225,69 @@ def test_launched_handoff_stays_default_after_chat_exit(signed_in, monkeypatch, 
     runner = replace(signed_in, select_on_start=True)
     assert runner.interactive(second, ("--resume", "exact-chat")) == code
     assert store.selected() == second
+
+
+@pytest.fixture
+def daemon_cli(tmp_path: Path) -> Path:
+    """A CLI like 3000.14: it lists `--process-model` and has a daemon to stop."""
+    executable = tmp_path / "daemon-cli"
+    executable.write_text(
+        "#!/usr/bin/env python3\n"
+        "import json, os, sys\n"
+        "args = sys.argv[1:]\n"
+        "if args == ['--help']:\n"
+        "    print('      --process-model <PROCESS_MODEL>')\n"
+        "elif args == ['daemon', 'stop']:\n"
+        "    with open(os.environ['DS_HOME'] + '/daemon-stops', 'a') as stops:\n"
+        "        stops.write(os.environ['XDG_DATA_HOME'] + '\\n')\n"
+        "elif args[-2:] == ['auth', 'status']:\n"
+        "    print('Logged in as test@example.invalid')\n"
+        "else:\n"
+        "    print(json.dumps(args))\n"
+    )
+    executable.chmod(0o700)
+    return executable
+
+
+@pytest.mark.parametrize(
+    ("typed", "started"),
+    [
+        (["hello"], ["--process-model=in-process", "hello"]),
+        (["--process-model=daemon", "hello"], ["--process-model=daemon", "hello"]),
+    ],
+)
+def test_run_keeps_the_agent_out_of_the_clis_shared_daemon(
+    store: Store, daemon_cli: Path, monkeypatch, capfd, tmp_path: Path, typed, started
+) -> None:
+    """The daemon serves every login sharing Switch's history on the login that started it."""
+    first = store.accounts()[0]
+    store.select(first)
+    store.credentials(first).write_text("saved")
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(cli, "find_binary", lambda: daemon_cli)
+    assert cli.execute(cli.parser().parse_args(["run", "--", *typed]), store) == 0
+    assert json.loads(capfd.readouterr().out) == started
+    assert not (store.root / "daemon-stops").exists()
+
+
+def test_leftover_daemon_is_stopped_only_while_it_listens(daemon_cli: Path, native: Native) -> None:
+    # A Unix socket path is at most 104 bytes: pytest's folders are too long for one.
+    with tempfile.TemporaryDirectory(dir="/tmp", prefix="ds-") as folder:
+        store = Store(Path(folder) / "state")
+        with store.lock():
+            account = store.add("ansuman-1", None)
+        address = store.root / "shared/cli/daemon/daemon.sock"
+        address.parent.mkdir(parents=True)
+        stops = store.root / "daemon-stops"
+        with socket.socket(socket.AF_UNIX) as daemon:
+            daemon.bind(str(address))
+            daemon.listen()
+            # A CLI without the flag has no daemon of its own to stop.
+            Native(store, native.binary).retire_daemon(account)
+            assert not stops.exists()
+            Native(store, daemon_cli).retire_daemon(account)
+            assert stops.read_text() == f"{store.directory(account.name) / 'data'}\n"
+        # A stopped daemon leaves its socket file behind.
+        assert address.exists()
+        Native(store, daemon_cli).retire_daemon(account)
+        assert stops.read_text().count("\n") == 1

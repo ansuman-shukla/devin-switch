@@ -455,3 +455,16 @@ def test_verify_catches_missing_history_in_second_account(
     )
     with pytest.raises(SwitchError, match="visibility differs"):
         cli.verify(signed_in, first, second)
+
+
+@pytest.mark.parametrize(
+    ("inherited", "kept"),
+    [("http://127.0.0.1:50123", False), ("https://server.example.invalid", True)],
+)
+def test_nested_launch_drops_only_a_parent_chats_relay_address(
+    native: Native, monkeypatch, inherited: str, kept: bool
+):
+    # A relay serves the one login it was issued for, never a launch nested in its chat.
+    monkeypatch.setenv("WINDSURF_API_SERVER_URL", inherited)
+    environment = native.environment(native.store.accounts()[0])
+    assert ("WINDSURF_API_SERVER_URL" in environment) is kept

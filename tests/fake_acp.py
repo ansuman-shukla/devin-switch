@@ -10,8 +10,11 @@ import uuid
 from datetime import UTC, datetime
 from pathlib import Path
 
+if sys.argv[1:] == ["--help"]:
+    print("--process-model <PROCESS_MODEL>" if os.environ.get("FAKE_PROCESS_MODEL") else "Usage")
+    sys.exit(0)
 account = Path(os.environ["XDG_DATA_HOME"]).parent.name
-if sys.argv[1:] == ["auth", "status"]:
+if sys.argv[-2:] == ["auth", "status"]:
     print("Logged in as test@example.invalid")
     sys.exit(0)
 
@@ -36,11 +39,18 @@ replies = {}
 loaded = None
 project = None
 host = None
+if os.environ.get("FAKE_PROCESS_MODEL") and os.environ.get("WINDSURF_API_SERVER_URL"):
+    # Like CLI 3000.14, the saved login goes to the API server the process was started on.
+    saved = (Path(os.environ["XDG_DATA_HOME"]) / "devin/credentials.toml").read_text()
+    host = {"key": saved.split('"')[1], "url": os.environ["WINDSURF_API_SERVER_URL"]}
 canceled = asyncio.Event()
 side_canceled = asyncio.Event()
 chains = False
-# Running "busy" turns by request ID; like the native, a session/load ends them.
+reverts = False
+# Running "busy" turns by request ID. A session/load ended them up to CLI 3000.11.216; from
+# 3000.14 on (FAKE_PROCESS_MODEL) the native replays under the turn and the turn goes on.
 turns = {}
+VERSION = "3000.14.0" if os.environ.get("FAKE_PROCESS_MODEL") else "1"
 # A turn waiting on a foreground subagent. Like native 3000.11.228, steering sent during it stays
 # open, and a Stop with steering pending only interrupts the subagent wait: the turn keeps working
 # on the steering and ends (answering every open prompt "cancelled") only on another cancel.
@@ -206,6 +216,31 @@ def emit(message):
     print(json.dumps({"jsonrpc": "2.0", **message}), flush=True)
 
 
+def take_back(params):
+    """What CLI 3000.14 sends, before the error, for a prompt whose first model call failed.
+
+    It takes the prompt back either way, and says so only to a client that shows revert steps.
+    """
+    session_id = params["sessionId"]
+    prompt_id = (params.get("_meta") or {}).get("cognition.ai/clientMessageId", "generated-id")
+    for method, details in (
+        ("revert/stepsUpdated", {"steps": []}),
+        (
+            "revert/historyRewound",
+            {"revertTargetNodeId": 1, "firstRemovedUserMessageId": prompt_id},
+        ),
+        ("turn_stats", {"turnClientMessageId": prompt_id}),
+        ("agent_stopped", {"cause": "quota_exhausted", "errorMessage": "Quota exhausted."}),
+    ):
+        if reverts or not method.startswith("revert/"):
+            emit(
+                {
+                    "method": f"_cognition.ai/{method}",
+                    "params": {"sessionId": session_id, **details},
+                }
+            )
+
+
 def configs():
     return [
         {
@@ -279,7 +314,7 @@ def whiteboard_chat(params):
 
 
 async def handle(message):
-    global loaded, project, host, chains, foreground, parked
+    global loaded, project, host, chains, reverts, foreground, parked
     method, params = message["method"], message.get("params", {})
     if path := os.environ.get("FAKE_ACP_LOG"):
         with open(path, "a") as handle:
@@ -313,6 +348,7 @@ async def handle(message):
     if method == "initialize":
         meta = (params.get("clientCapabilities") or {}).get("_meta") or {}
         chains = meta.get("cognition.ai/chains") is True
+        reverts = meta.get("cognition.ai/revert") is True
         result = {
             "protocolVersion": 1,
             "agentCapabilities": {
@@ -330,9 +366,14 @@ async def handle(message):
                 },
             },
             "authMethods": [{"id": "api-key", "name": "API key"}],
-            "agentInfo": {"name": "fake", "version": "1"},
+            "agentInfo": {"name": "fake", "version": VERSION},
         }
     elif method == "authenticate" and params.get("methodId") == "windsurf-api-key":
+        # CLI 3000.14 takes a host login only for the API server its process was started on.
+        used = os.environ.get("WINDSURF_API_SERVER_URL")
+        if os.environ.get("FAKE_PROCESS_MODEL") and used != params["_meta"]["api_server_url"]:
+            emit({"id": message["id"], "error": {"code": -32603, "message": "Another server"}})
+            return
         previous, host = (
             host,
             {
@@ -363,8 +404,12 @@ async def handle(message):
             assert connection.execute(
                 "SELECT id FROM sessions WHERE id = ?", (session_id,)
             ).fetchone()
-            for ended in turns.values():
-                ended.set()
+            if VERSION == "1":
+                for ended in turns.values():
+                    ended.set()
+            if os.environ.get("FAKE_FINISH_IN_LOAD"):
+                # A working subagent that finishes while this load is being answered.
+                update(session_id, finished(WORKER, True, "Slept."))
             update(
                 session_id,
                 {
@@ -432,6 +477,8 @@ async def handle(message):
             data = {"cognition.ai/errorKind": "resource_exhausted", "cognition.ai/retryable": True}
             if style == "rate":
                 data["cognition.ai/retryAfterSeconds"] = 30
+            if style == "rewound":
+                take_back(params)
             emit(
                 {
                     "id": message["id"],
@@ -466,6 +513,8 @@ async def handle(message):
                     "cognition.ai/errorKind": "resource_exhausted",
                     "cognition.ai/retryable": True,
                 }
+                if os.environ.get("FAKE_QUOTA_STYLE") == "rewound":
+                    take_back(params)
                 emit(
                     {
                         "id": message["id"],

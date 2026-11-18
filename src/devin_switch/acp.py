@@ -20,7 +20,7 @@ from devin_switch import (
     subagents,
     tool_folders,
 )
-from devin_switch.native import Native
+from devin_switch.native import API_SERVER_VARIABLE, Native
 from devin_switch.store import Account, SwitchError, write_json
 
 MAX_MESSAGE = 8 * 1024 * 1024
@@ -65,6 +65,12 @@ LOCAL_COMMANDS = [
 ]
 LOCAL_NAMES = {"/" + command["name"] for command in LOCAL_COMMANDS}
 AGENT_STOPPED = "_cognition.ai/agent_stopped"
+# The native says that it took a prompt back only to a client able to show revert steps.
+REVERT = "cognition.ai/revert"
+REVERT_NOTICES = "_cognition.ai/revert/"
+HISTORY_REWOUND = REVERT_NOTICES + "historyRewound"
+CONTINUING = f"Sending “{handoff.CONTINUE_PROMPT}”…"
+ASKING_AGAIN = "Sending your message again…"
 CANCEL_REQUEST = "$/cancel_request"
 QUESTIONS = "cognition.ai/questions"
 TOOL_CALL = "cognition.ai/toolCallId"
@@ -115,7 +121,15 @@ SIDE_REQUESTS = {
     "_cognition.ai/terminal/killBackgroundShell",
     "_cognition.ai/queuedMessages/update",
     "_cognition.ai/diagnostics/sessionExport",
+    # Desktop 3.14: older rows of a bounded load, fetched on open and on scroll.
+    "_cognition.ai/session/loadPage",
+    "_cognition.ai/session/feedback",
+    "_cognition.ai/session/reaction",
+    "_cognition.ai/session/stop",
 }
+# From this CLI on, a session/load of the open chat no longer ends its running turn: the native
+# replays under the turn (3000.11.216 answered -32603 agent_channel_closed and ended it).
+LOADS_UNDER_A_TURN = (3000, 14)
 # Editor state Desktop sends once (didOpen right after initialize): replay it to later natives.
 # The value says whether the state is kept per document/repository uri or only the latest.
 EDITOR_STATE = {
@@ -144,6 +158,15 @@ BLANK_RELEASED = (
     "This empty chat was closed after 15 idle minutes to free its agent. Nothing was sent "
     "to the model; start a new chat."
 )
+
+
+def loads_under_a_turn(initialized) -> bool:
+    """Whether the native that answered `initialize` serves a load while its turn runs."""
+    version = (initialized.get("agentInfo") or {}).get("version")
+    try:
+        return tuple(int(part) for part in str(version).split(".")[:2]) >= LOADS_UNDER_A_TURN
+    except ValueError:
+        return False
 
 
 class RpcError(SwitchError):
@@ -352,6 +375,9 @@ class Backend:
         self.suppress_replay = False
         # Subagent events count only once the conversation is loaded, not during its replay.
         self.live = False
+        # A load forwarded while the turn runs: its replay arrives among the turn's live updates.
+        self.reloading = False
+        self.loads_under_a_turn = False
         self.running = set()
         # What Desktop was sent since the latest session/new or session/load: replaying it answers
         # a reload during a turn, which a native session/load would end. JSON text keeps it small.
@@ -362,6 +388,7 @@ class Backend:
         self.stopping = False
         self.stop_cause = None
         self.relay = None
+        self.pinned = False
         self.loop = None
         self.last_activity = time.monotonic()
         self.editor_ready = False
@@ -390,8 +417,20 @@ class Backend:
             environment = self.bridge.native.environment(self.account)
             environment.pop("DEVIN_MODEL", None)
             environment["DS_ACP_RUN_ID"] = self.lease.run.id
+            store = self.bridge.native.store
+            issued = relay.login(store, self.account) if self.chat else None
+            if issued:
+                self.loop = asyncio.get_running_loop()
+                self.relay = relay.Relay(
+                    issued,
+                    lambda current, tried: self.bridge.rotate(self, issued, current, tried),
+                    store.root / "logs" / "relay.log",
+                )
+                self.pinned = self.bridge.native.pins_server()
+                if self.pinned:
+                    environment[API_SERVER_VARIABLE] = self.relay.url
             self.process = subprocess.Popen(
-                (str(self.bridge.native.binary), *self.bridge.flags, "acp"),
+                self.bridge.native.command(*self.bridge.flags, "acp"),
                 env=environment,
                 # The native serves the session's cwd from any folder, even a deleted one.
                 cwd=self.project if self.project.is_dir() else Path.home(),
@@ -428,12 +467,13 @@ class Backend:
                 raise SwitchError(
                     "This native CLI lacks compatible ACP session loading. Update Devin CLI."
                 )
+            self.loads_under_a_turn = loads_under_a_turn(result)
             # Written without awaiting, so no newer editor context can be sent before the replay.
             for method, params in self.bridge.editor_state.values():
                 self.write({"method": method, "params": params})
             self.editor_ready = True
             await self.writer.drain()
-            if self.chat and (issued := relay.login(self.bridge.native.store, self.account)):
+            if issued:
                 await self.authenticate(issued)
             return result
         except BaseException:
@@ -442,12 +482,6 @@ class Backend:
 
     async def authenticate(self, issued):
         """Route the native's API traffic through a relay that can change logins in place."""
-        self.loop = asyncio.get_running_loop()
-        self.relay = relay.Relay(
-            issued,
-            lambda current, tried: self.bridge.rotate(self, issued, current, tried),
-            self.bridge.native.store.root / "logs" / "relay.log",
-        )
         try:
             await self.request(
                 "authenticate",
@@ -458,8 +492,10 @@ class Backend:
                 LIFECYCLE_TIMEOUT,
             )
         except RpcError:
-            # A failed host login (e.g. offline) leaves the native on its saved credentials.
-            await asyncio.to_thread(self.close_relay)
+            # A failed host login (e.g. offline) leaves the native on its saved credentials. A
+            # native started on the relay sends those through it too, so the relay stays.
+            if not self.pinned:
+                await asyncio.to_thread(self.close_relay)
 
     def close_relay(self):
         if self.relay:
@@ -542,6 +578,16 @@ class Backend:
             self.remember_selection("mode", result["modes"].get("currentModeId"))
         if isinstance(result.get("models"), dict):
             self.remember_selection("model", result["models"].get("currentModelId"))
+
+    def finishing(self, meta):
+        """Whether an update of a load under a running turn ends a subagent that is working.
+
+        Such a load's replay and the turn's live updates arrive mixed, and a replayed subagent
+        event has nothing that tells it from a live one. A completion of a subagent that is
+        running in this process cannot be in the saved history, so it is live.
+        """
+        event = meta.get(subagents.COMPLETED)
+        return self.reloading and isinstance(event, dict) and event.get("agentId") in self.running
 
     def record(self, message):
         update = message["params"]["update"]
@@ -652,6 +698,11 @@ class Chat:
     backend: Backend
     gate: asyncio.Lock = field(default_factory=asyncio.Lock)
     controls: set[asyncio.Task] | None = None
+    # A prompt holds the chat until it is answered, also while it changes logins between turns.
+    prompting: bool = False
+    # What the native sent from the moment it took the open prompt back, kept from Desktop
+    # until the prompt's outcome is known (None: it did not).
+    rewound: list | None = None
     suspended: bool = False
     blank: bool = False
     canceled: bool = False
@@ -704,6 +755,8 @@ class Bridge:
         self.side_server = None
         self.side_sinks = {}
         self.roster = subagent_tab.Roster()
+        # Whether Desktop itself asked for the native's revert notices.
+        self.reverts = False
 
     def spawn(self, coroutine):
         task = asyncio.create_task(coroutine)
@@ -791,7 +844,8 @@ class Bridge:
                 ] + LOCAL_COMMANDS
                 backend.commands = update["availableCommands"]
             meta = update.get("_meta")
-            if backend.live and backend.session_id and isinstance(meta, dict):
+            live = backend.live or (isinstance(meta, dict) and backend.finishing(meta))
+            if live and backend.session_id and isinstance(meta, dict):
                 self.roster.apply(backend.session_id, update)
                 for key in (subagents.STARTED, subagents.COMPLETED):
                     if isinstance(event := meta.get(key), dict):
@@ -806,6 +860,19 @@ class Bridge:
                 backend.record(message)
             if backend.suppress_replay:
                 return
+        chat = self.chats.get(backend.session_id)
+        unasked = str(message.get("method")).startswith(REVERT_NOTICES) and not self.reverts
+        if chat is not None and chat.backend is backend and chat.controls is not None:
+            if message.get("method") == HISTORY_REWOUND and chat.rewound is None:
+                # CLI 3000.14 takes back a prompt whose first model call failed. Desktop then
+                # drops the message and reloads the chat, but the prompt may be sent again.
+                chat.rewound = []
+            if chat.rewound is not None:
+                if not unasked:
+                    chat.rewound.append(message)
+                return
+        if unasked:
+            return
         if not backend.stopping:
             async with backend.emitting:
                 await self.emit(message)
@@ -874,7 +941,14 @@ class Bridge:
             client.setdefault("_meta", {}).setdefault("cognition.ai/diagnosticsSessionExport", True)
             # Side answers go to the Switch side panel; Desktop never sees them.
             client["_meta"][side.CAPABILITY] = True
-            probe = Backend(self, self.default_account(), Path.cwd(), chat=False)
+            # The bridge needs the revert notices whatever the client is: without them a
+            # prompt the native took back looks like one that is still in the conversation.
+            self.reverts = client["_meta"].get(REVERT) is True
+            client["_meta"][REVERT] = True
+            account = self.default_account()
+            # Before any chat loads: a daemon left by an earlier launch keeps chats locked.
+            await asyncio.to_thread(self.native.retire_daemon, account)
+            probe = Backend(self, account, Path.cwd(), chat=False)
             result = await probe.start()
             self.lister = probe
             result["authMethods"] = []
@@ -1005,11 +1079,16 @@ class Bridge:
             if method == "session/prompt":
                 # A Stop from before this prompt arrived was for an earlier turn.
                 chat.canceled = chat.early_stops != stops
-                if (result := await self.local_prompt(chat, params)) is not None:
-                    return result
-                await self.reconnect(chat)
-                chat.blank = False
-                return await self.prompt_turn(chat, params)
+                chat.prompting = True
+                try:
+                    if (result := await self.local_prompt(chat, params)) is not None:
+                        return result
+                    await self.reconnect(chat)
+                    chat.blank = False
+                    return await self.prompt_turn(chat, params)
+                finally:
+                    chat.prompting = False
+                    await self.show_rewind(chat)
             if method == "session/cancel" and chat.suspended:
                 return {}
             await self.reconnect(chat)
@@ -1022,11 +1101,13 @@ class Bridge:
             sent, closed = await self.closed_note_params(chat, params)
             backend = chat.backend
             backend.stop_cause = None
+            chat.rewound = None
             controls = chat.controls = set()
             if chat.canceled:
                 # Stopped before this turn opened, so the native has not seen that Stop.
                 self.spawn(self.keep_canceling(chat, {"sessionId": chat.session_id}))
             result = error = None
+            recorded = len(backend.transcript)
             backend.record_prompt(params)
             try:
                 result = await self.forward_request(backend, "session/prompt", sent)
@@ -1035,6 +1116,11 @@ class Bridge:
             finally:
                 chat.controls = None
                 await asyncio.gather(*controls, return_exceptions=True)
+            # The native took the prompt back: nothing is left to continue, and a reload must
+            # not show a message the conversation no longer has.
+            again = params if chat.rewound is not None else None
+            if again:
+                del backend.transcript[recorded:]
             if closed and not error and result.get("stopReason") != "cancelled":
                 # Told once: a prompt that failed or was stopped leaves them for the next one.
                 with suppress(SwitchError, OSError):
@@ -1072,18 +1158,23 @@ class Bridge:
                         chat.session_id,
                         f"Out of usage on {spent}. Continuing on {login.account.name} in the "
                         "same agent, so subagents keep running. "
-                        f"Sending “{handoff.CONTINUE_PROMPT}”…",
+                        f"{ASKING_AGAIN if again else CONTINUING}",
                     )
                     if chat.canceled:
                         return {"stopReason": "cancelled"}
-                    params = await self.follow_up_params(chat)
+                    params = await self.follow_up_params(chat, again=again)
                     continue
             await self.note(
                 chat.session_id,
                 f"Out of usage on {spent}. Auto-switch is on; restarting on another saved login…",
             )
             try:
-                await self.switch(chat, None, exclude=frozenset(tried), follow_up=True)
+                await self.switch(
+                    chat,
+                    None,
+                    exclude=frozenset(tried),
+                    follow_up=ASKING_AGAIN if again else CONTINUING,
+                )
             except (SwitchError, OSError) as exc:
                 await self.note(
                     chat.session_id,
@@ -1096,7 +1187,13 @@ class Bridge:
             if chat.canceled:
                 return {"stopReason": "cancelled"}
             tried.add(chat.backend.account.name)
-            params = await self.follow_up_params(chat)
+            params = await self.follow_up_params(chat, again=again)
+
+    async def show_rewind(self, chat):
+        """Tell Desktop about a rewind whose prompt was not sent again after all."""
+        held, chat.rewound = chat.rewound, None
+        for message in held or ():
+            await self.emit(message)
 
     async def keep_canceling(self, chat, params):
         """Repeat a Stop until its turn's prompt ends.
@@ -1390,10 +1487,13 @@ class Bridge:
                 "from where they stopped.",
             )
 
-    async def follow_up_params(self, chat, *, resume_only=False):
-        """`continue`, plus a request to resume any subagents that stopped before finishing."""
+    async def follow_up_params(self, chat, *, resume_only=False, again=None):
+        """`continue`, plus a request to resume any subagents that stopped before finishing.
+
+        `again` is the prompt the native took back: it is sent once more instead of `continue`.
+        """
         store = self.native.store
-        params = continue_params(chat.session_id)
+        params = again or continue_params(chat.session_id)
         try:
             pending = await asyncio.to_thread(subagents.interrupted, store, chat.session_id)
             if not pending:
@@ -1402,6 +1502,8 @@ class Bridge:
             await asyncio.to_thread(subagents.forget, store, chat.session_id, pending)
         except (SwitchError, OSError):
             return None if resume_only else params
+        if again:
+            return {**again, "prompt": [*again["prompt"], {"type": "text", "text": f"\n\n{text}"}]}
         block = params["prompt"][0]
         block["text"] = text if resume_only else f"{block['text']}\n\n{text}"
         return params
@@ -1466,7 +1568,13 @@ class Bridge:
             acp_state.session_key(session_id)
             if session_id in self.chats:
                 chat = self.chats[session_id]
-                if chat.controls is not None:
+                if chat.prompting:
+                    if (
+                        chat.controls is not None
+                        and method == "session/load"
+                        and chat.backend.loads_under_a_turn
+                    ):
+                        return await self.reload(chat, method, setup, running=True)
                     return await self.replay(chat, method)
                 async with chat.access():
                     if self.chats.get(session_id) is not chat:
@@ -1484,17 +1592,7 @@ class Bridge:
                             )
                         self.chats.pop(session_id)
                     else:
-                        chat.backend.suppress_replay = method == "session/resume"
-                        chat.backend.live = False
-                        try:
-                            result = await chat.backend.request(
-                                "session/load", setup, LIFECYCLE_TIMEOUT
-                            )
-                            chat.setup = setup
-                            return result
-                        finally:
-                            chat.backend.suppress_replay = False
-                            chat.backend.live = True
+                        return await self.reload(chat, method, setup)
         account = (
             self.default_account()
             if self.account
@@ -1529,10 +1627,31 @@ class Bridge:
                 await backend.close()
             raise
 
-    async def replay(self, chat, method):
-        """Reopen a chat whose turn is running (Desktop reloads it when switching surfaces).
+    async def reload(self, chat, method, setup, *, running=False):
+        """Load an open chat again in its own native.
 
-        A native session/load would end the turn, so replay what Desktop was already sent.
+        Desktop 3.14 shows "Syncing", hides every update and holds new messages until a load
+        is answered, and reads the answer's row ids and each replayed message's
+        `clientMessageId`. Only the native has those, so from CLI 3000.14 on it also serves
+        the load of a chat whose turn is running, never waiting for the prompt gate.
+        """
+        backend = chat.backend
+        backend.suppress_replay = method == "session/resume"
+        backend.live, backend.reloading = False, running
+        try:
+            result = await backend.request("session/load", setup, LIFECYCLE_TIMEOUT)
+            chat.setup = setup
+            return result
+        finally:
+            backend.suppress_replay = False
+            backend.live, backend.reloading = True, False
+
+    async def replay(self, chat, method):
+        """Reopen a chat whose prompt is running, from what Desktop was already sent.
+
+        For a native whose session/load would end the turn, and for any native between a
+        prompt's turns: the prompt keeps the chat while it changes logins, and waiting for the
+        chat would last until the prompt is answered.
         """
         backend = chat.backend
         async with backend.emitting:
@@ -1607,7 +1726,11 @@ class Bridge:
         follow_up = command == "/switch-continue"
         try:
             await self.reconnect(chat)
-            await self.switch(chat, words[1] if len(words) == 2 else None, follow_up=follow_up)
+            await self.switch(
+                chat,
+                words[1] if len(words) == 2 else None,
+                follow_up=CONTINUING if follow_up else "",
+            )
         except (SwitchError, OSError) as exc:
             await self.note(
                 chat.session_id,
@@ -1784,7 +1907,7 @@ class Bridge:
                 raise SwitchError(f"{stage}: {failure_detail(exc)}") from exc
             raise
 
-    async def switch(self, chat, account_name, *, exclude=frozenset(), follow_up=False):
+    async def switch(self, chat, account_name, *, exclude=frozenset(), follow_up=""):
         old = chat.backend
         source = old.account
         store = self.native.store
@@ -1854,11 +1977,7 @@ class Bridge:
             chat.session_id,
             f"Switched {source.name} → {account.name}. Same conversation; "
             "desktop login and other chats are unchanged. "
-            + (
-                f"Sending “{handoff.CONTINUE_PROMPT}”…"
-                if follow_up
-                else "Send your next message when ready."
-            ),
+            + (follow_up or "Send your next message when ready."),
         )
 
     def rotate(self, backend, issued, current, tried):

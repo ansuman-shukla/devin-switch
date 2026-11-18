@@ -132,9 +132,12 @@
   /** The reader's merge method while the repository still allows it, else the repository's default: its first. */
   const methodOf = (pull, local) => (pull.methods.includes(local.method) ? local.method : (pull.methods[0] ?? null));
 
-  /** The step between Merge and the merge itself; null unless the reader opened it on a pull request that can be merged. */
+  /** Whether a merge can be confirmed now: an open pull request the server lets merge, with nothing running on it. */
+  const mergeable = (pull, local) => kindOf(pull) === 'open' && pull.can.merge && !runningOf(pull, local);
+
+  /** The step between Merge and the merge itself; null unless the reader opened it on a pull request that can be merged now. */
   function confirmOf(pull, local) {
-    if (!local.confirming || kindOf(pull) !== 'open' || !pull.can.merge) return null;
+    if (!local.confirming || !mergeable(pull, local)) return null;
     const method = methodOf(pull, local);
     const waiting = notGreen(pull.checks);
     return {
@@ -142,7 +145,6 @@
       methods: pull.methods.map((value) => ({ value, label: METHODS[value] ?? value, chosen: value === method })),
       chooser: pull.methods.length > 1,
       warning: waiting ? `${waiting === 1 ? '1 check is' : `${waiting} checks are`} not green` : '',
-      enabled: !runningOf(pull, local),
     };
   }
 
@@ -186,12 +188,11 @@
   function reconcile(local, pull) {
     // A pull request that is loading says nothing yet, so nothing is moot.
     if (pull.loading) return local;
-    const open = kindOf(pull) === 'open';
     return {
       ...local,
       // Closed for good: it must not open again by itself once the pull request can be merged again.
-      confirming: local.confirming && open && pull.can.merge && !pull.busy,
-      method: open && !pull.methods.includes(local.method) ? null : local.method,
+      confirming: local.confirming && mergeable(pull, local),
+      method: kindOf(pull) === 'open' && !pull.methods.includes(local.method) ? null : local.method,
     };
   }
 

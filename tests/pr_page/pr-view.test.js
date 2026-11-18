@@ -253,7 +253,6 @@ test('the confirm step offers the repository\'s merge methods with the first one
     ],
     chooser: true,
     warning: '',
-    enabled: true,
   });
   const other = view.confirmOf(pull({ methods: ['merge', 'rebase'] }), confirming);
   assert.equal(other.method, 'merge');
@@ -313,10 +312,10 @@ test('the confirm step shows only when the reader opened it on a pull request th
   assert.equal(closed.confirm, null);
   assert.deepEqual(labels(closed.actions), ['Merge', 'Update branch', 'Convert to draft', 'Re-run failed checks']);
 
-  // Confirm merge is off while the card is locked by a request of the page.
-  assert.equal(view.confirmOf(pull({}), confirming).enabled, true);
-  assert.equal(view.confirmOf(pull({}), { ...confirming, pending: 'dismiss' }).enabled, false);
-  assert.equal(view.confirmOf(pull({ busy: 'rerun' }), confirming).enabled, false);
+  // Nothing can be confirmed while an action runs on the pull request, the server's or the page's own.
+  assert.equal(view.confirmOf(pull({ busy: 'rerun' }), confirming), null);
+  assert.equal(view.confirmOf(pull({}), { ...confirming, pending: 'dismiss' }), null);
+  assert.deepEqual(labels(view.cardOf(pull({ can: all, busy: 'rerun' }), confirming).actions), ['Merge', 'Update branch', 'Convert to draft', 'Re-running…']);
 });
 
 test('a loading card shows only its heading and never reads the missing fields', () => {
@@ -472,6 +471,7 @@ test('the confirm step closes when the pull request can no longer be merged, and
   assert.equal(view.reconcile(confirming, pull({ state: 'merged' })).confirming, false, 'merged, whatever `can` says');
   assert.equal(view.reconcile(confirming, pull({ busy: 'update' })).confirming, false, 'something else runs on it');
   assert.equal(view.reconcile(confirming, bare({ error: 'gh failed' })).confirming, false, 'it could not be loaded');
+  assert.equal(view.reconcile({ ...confirming, pending: 'dismiss' }, pull({})).confirming, false, 'the page itself has a request out');
 });
 
 test('a pull request that is loading keeps its whole page state, without reading the missing fields', () => {

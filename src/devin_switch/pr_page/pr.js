@@ -115,7 +115,7 @@
       : lines('sub', confirm.methods.map(({ label }) => label));
     const warning = confirm.warning ? [el('p', { className: 'warning' }, [icon('warn'), confirm.warning])] : [];
     const buttons = [
-      button(card, 'confirm-merge', 'Confirm merge', () => act(url, 'merge', { method: confirm.method }), { className: 'button primary', disabled: !confirm.enabled }),
+      button(card, 'confirm-merge', 'Confirm merge', () => act(url, 'merge', { method: confirm.method }), { className: 'button primary' }),
       button(card, 'cancel', 'Cancel', () => change(url, view.cancelMerge, 'merge')),
     ];
     const step = el('div', { className: 'confirm', role: 'group', ariaLabel: 'Confirm merge', tabIndex: -1 }, [...methods, ...warning, el('div', { className: 'buttons' }, buttons)]);

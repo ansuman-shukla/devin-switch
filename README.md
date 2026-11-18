@@ -443,6 +443,31 @@ still appears in the chat as usual. Replies are kept only while the window's Swi
 earlier replies are no longer shown anywhere in Desktop; they stay in the chat's saved history
 and in what the chat's agent already read.
 
+### See and manage a chat's pull requests
+
+Devin Desktop's own PR tab loads pull requests through Devin's cloud, so for a private
+repository that Devin has no GitHub access to it only says "Unable to load PR." Type `/pr` in a
+Desktop chat run through Devin Switch instead. A **Pull requests** tab opens next to the chat
+and lists the GitHub pull requests whose links showed up in that chat: in what you and the
+agent wrote, and in what a `gh pr` command was given and printed. `/pr <link>` or
+`/pr <number>` adds one yourself (a number is looked up in the chat's folder), and `/pr` in a
+chat with none yet tries the pull request of the branch checked out in the chat's folder.
+
+Each card shows the state, whether the branch is up to date with its base, conflicts, checks
+and reviews. They are read with the GitHub CLI under your own login (`gh auth login` once in a
+normal terminal; every saved account shares it) and refreshed every 30 seconds while the tab is
+open. The buttons run `gh` the same way: **Merge** asks for a second click, is offered only
+when GitHub says the pull request can merge and its branch holds all of its base, and names
+the merge commit after the pull request; **Update branch**, **Mark ready** /
+**Convert to draft** and **Re-run failed checks** do what they say. **Open on GitHub** opens
+your default browser, and **×** takes a pull request off the tab. Nothing is added to the chat
+and nothing goes through Devin's cloud.
+
+The list is kept only while the window's Switch agent runs. After a window reload it is
+rebuilt from the part of the chat Desktop loads again, so add an older link back with
+`/pr <link>`. Closed the tab? Type `/pr` again. The page is served the same way as the Side
+chat tab.
+
 ### Keep a whiteboard per chat
 
 Switch gives chats `WHITEBOARD_CHAT_COMMAND="ds chat id"` (unless you set it), so a chat keeps

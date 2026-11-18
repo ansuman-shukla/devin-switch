@@ -357,6 +357,11 @@ class Pull:
     # One look at a time, so an older answer never replaces a newer one.
     asking: asyncio.Lock = field(default_factory=asyncio.Lock)
 
+    def unsettled(self) -> bool:
+        """Whether GitHub may have news of it that nobody asked for: it is open, or was never
+        looked up, or the last look failed. A merged or closed one stays as it is."""
+        return self.loading or self.error is not None or self.details.get("state") == "open"
+
     def shown(self) -> dict:
         return {
             "url": self.url,
@@ -697,16 +702,20 @@ class Pulls:
     async def watch(self, tab: Tab) -> None:
         """Keep a chat's pull requests fresh while a page shows them.
 
-        All of them every `REFRESH` seconds, and one that was just added at once.
+        All of them once, when the page connects. Then, every `REFRESH` seconds, those that
+        are not settled, and one that was just added at once. GitHub is not asked again and
+        again about a merged or closed one: the Refresh button does that.
         """
+        due = list(tab.pulls.values())
         while True:
             again = time.monotonic() + REFRESH
-            await self.refresh(tab, list(tab.pulls.values()))
+            await self.refresh(tab, due)
             while (left := again - time.monotonic()) > 0:
                 with suppress(TimeoutError):
                     await asyncio.wait_for(tab.added.wait(), left)
                 tab.added.clear()
                 await self.refresh(tab, [pull for pull in tab.pulls.values() if pull.loading])
+            due = [pull for pull in tab.pulls.values() if pull.unsettled()]
 
     def start(self, tab: Tab) -> bool:
         """Start looking a tab's pull requests up, if a page shows them and nothing does yet."""

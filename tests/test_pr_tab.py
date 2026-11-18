@@ -1116,6 +1116,50 @@ def test_an_open_page_sees_github_change(gh, pulls, monkeypatch):
     asyncio.run(scenario())
 
 
+def test_only_pull_requests_that_are_not_settled_are_looked_up_again(gh, pulls, monkeypatch):
+    monkeypatch.setattr(pr_tab, "REFRESH", 0.2)
+    opened, merged, closed = gh.pull(1), gh.pull(2, state="MERGED"), gh.pull(3, state="CLOSED")
+    # GitHub does not know this one yet: every look at it fails.
+    failing = link(4)
+
+    def looks(url):
+        return len([run for run in gh.runs("pr", "view") if run[2] == url])
+
+    async def scenario():
+        pulls.said("chat", f"{opened} {merged} {closed} {failing}")
+        with pulls.listen("chat"):
+            # The first pass looks at every one; the next ones leave the finished ones alone.
+            await until(lambda: looks(opened) >= 4 and looks(failing) >= 4)
+            assert (looks(merged), looks(closed)) == (1, 1)
+            assert row(pulls, failing)["error"] and not row(pulls, failing)["loading"]
+            # What GitHub says of a finished one later comes with Refresh only.
+            gh.change(merged, title="Renamed after the merge")
+            seen = looks(opened)
+            await until(lambda: looks(opened) >= seen + 2)
+            assert (row(pulls, merged)["title"], looks(merged)) == ("Add the thing", 1)
+            assert await ask(pulls, "refresh") == {"ok": True}
+            assert row(pulls, merged)["title"] == "Renamed after the merge"
+            assert (looks(merged), looks(closed)) == (2, 2)
+
+            # One that gh failed on is tried again until it answers.
+            gh.pull(4)
+            await until(lambda: row(pulls, failing)["error"] is None)
+            assert row(pulls, failing)["state"] == "open"
+            # One that gets merged is seen merged, and from then on left alone too.
+            gh.change(opened, state="MERGED")
+            await until(lambda: row(pulls, opened)["state"] == "merged")
+            settled_at, seen = looks(opened), looks(failing)
+            await until(lambda: looks(failing) >= seen + 3)
+            assert looks(opened) == settled_at
+            assert (looks(merged), looks(closed)) == (2, 2)
+        # A page that connects looks at every one once more.
+        with pulls.listen("chat"):
+            every = (merged, closed, opened)
+            await until(lambda: [looks(url) for url in every] == [3, 3, settled_at + 1])
+
+    asyncio.run(scenario())
+
+
 def test_an_open_page_keeps_looking_after_its_second_page_leaves(gh, pulls, monkeypatch):
     monkeypatch.setattr(pr_tab, "REFRESH", 0.2)
     url = gh.pull(596)

@@ -719,14 +719,25 @@ class Pulls:
             if queue.empty():
                 queue.put_nowait(True)
 
+    def release(self, tab: Tab) -> None:
+        """End a tab's connected pages' streams, and stop looking its pull requests up."""
+        if tab.watcher:
+            tab.watcher.cancel()
+            tab.watcher = None
+        for queue in tab.listeners:
+            queue.put_nowait(None)
+
+    def forget(self, session_id: str) -> None:
+        """Drop a chat's tab: the chat was closed, so nothing of it is kept or looked up."""
+        if tab := self.tabs.pop(session_id, None):
+            self.release(tab)
+
     async def close(self) -> None:
         """End every connected page's stream, and stop looking pull requests up."""
         running = [*self.tasks, *(tab.watcher for tab in self.tabs.values() if tab.watcher)]
         for tab in self.tabs.values():
-            tab.watcher = None
-            for queue in tab.listeners:
-                queue.put_nowait(None)
-        for task in running:
+            self.release(tab)
+        for task in self.tasks:
             task.cancel()
         await asyncio.gather(*running, return_exceptions=True)
 

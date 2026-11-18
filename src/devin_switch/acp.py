@@ -1090,6 +1090,7 @@ class Bridge:
                     )
                 self.chats.pop(session_id)
                 self.roster.forget(session_id)
+                self.pulls.forget(session_id)
                 return {}
             if method == "session/prompt":
                 # A Stop from before this prompt arrived was for an earlier turn.

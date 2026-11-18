@@ -1758,6 +1758,70 @@ def test_pr_counts_the_link_a_message_was_ending_with(gh, pulls, tmp_path):
     asyncio.run(scenario())
 
 
+def test_forgetting_a_chat_drops_its_tab_and_ends_its_pages(gh, pulls, tmp_path):
+    url, kept = gh.pull(596), gh.pull(7)
+    gh.put(gates={"pr view": str(tmp_path / "never")})
+
+    async def scenario():
+        pulls.said("chat", f"{url} {kept}")
+        pulls.said("other-chat", kept)
+        pulls.tabs["chat"].notice = "No pull request #77 in my-project"
+        assert await ask(pulls, "dismiss", kept) == {"ok": True}
+        pulls.feed("chat", said(f"It ends with {link(41)}"))
+        with pulls.listen("chat") as page, pulls.listen("chat") as second:
+            with pulls.listen("other-chat") as other:
+                await until(lambda: len(gh.calls()) == 2)
+                watcher, theirs = pulls.tabs["chat"].watcher, pulls.tabs["other-chat"].watcher
+                for queue in (page, second, other):
+                    assert queue.get_nowait() is True and queue.empty()
+                pulls.forget("never-seen")
+                pulls.forget("chat")
+                # Nothing of the chat is kept, and its pages' streams end.
+                assert list(pulls.tabs) == ["other-chat"]
+                assert pulls.snapshot("chat") == {"pulls": [], "notice": None}
+                assert not pulls.showing("chat")
+                assert page.get_nowait() is None and second.get_nowait() is None
+                # Nothing looks its pull requests up any more: the gh that was running is gone.
+                with pytest.raises(asyncio.CancelledError):
+                    await watcher
+                mine = [call for call in gh.calls() if call["args"][2] == url]
+                assert [gone(call["pid"]) for call in mine] == [True]
+                # Another chat's tab, its page and its watcher go on.
+                assert other.empty() and pulls.showing("other-chat") and not theirs.done()
+                assert urls(pulls, "other-chat") == [kept]
+        # What the chat says later starts a new tab: what it dismissed was not kept either.
+        pulls.feed("chat", said(f"Again {kept} and more"))
+        assert urls(pulls) == [kept]
+        await pulls.close()
+
+    asyncio.run(scenario())
+
+
+def test_closing_a_chat_forgets_its_pull_requests(gh, acp_native, tmp_path):
+    url = gh.pull(596)
+
+    async def scenario():
+        async with in_process(acp_native) as (bridge, _):
+            chat, other = await new_chat(bridge, tmp_path), await new_chat(bridge, tmp_path)
+            pulls, server = bridge.pulls, bridge.side_server
+            pulls.said(chat.session_id, url)
+            pulls.said(other.session_id, url)
+            address = events_url(server, chat.session_id)
+            status, reader, writer = await request(server.port, "GET", address)
+            assert status == 200
+            await streamed(reader, lambda shown: not shown["pulls"][0]["loading"])
+            await bridge.dispatch("session/close", {"sessionId": chat.session_id})
+            assert chat.session_id not in pulls.tabs
+            assert urls(pulls, chat.session_id) == []
+            # The page that was open is told nothing more: its stream ends.
+            assert b"data:" not in await asyncio.wait_for(reader.read(), 5)
+            assert not pulls.showing(chat.session_id)
+            assert urls(pulls, other.session_id) == [url]
+            writer.close()
+
+    asyncio.run(scenario())
+
+
 def test_closing_stops_what_a_pr_command_left_running(gh, pulls, tmp_path):
     gh.put(gates={"pr view": str(tmp_path / "never")})
 

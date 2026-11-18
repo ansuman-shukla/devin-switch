@@ -98,22 +98,30 @@ def links(text: str, ended: bool = False) -> tuple[list[str], str]:
     for match in LINK.finditer(text):
         if match.end() == len(text) and not ended:
             break
-        found.append(f"https://github.com/{match[1]}/{match[2]}/pull/{int(match[3])}")
+        found.append(f"https://github.com/{match[1]}/{match[2]}/pull/{match[3]}")
         start = match.end()
     return found, "" if ended else text[max(start, len(text) - TAIL) :]
 
 
 def texts(value: object) -> Iterator[str]:
-    """Every text inside a tool call's input or output, however it is nested."""
+    """Every text inside a tool call's input or output, in order, however it is nested."""
     waiting = [value]
     while waiting:
         item = waiting.pop()
         if isinstance(item, str):
             yield item
-        elif isinstance(item, dict):
-            waiting.extend(item.values())
-        elif isinstance(item, list):
-            waiting.extend(item)
+        elif isinstance(item, dict | list):
+            waiting.extend(reversed(list(item.values()) if isinstance(item, dict) else item))
+
+
+def command(update: dict) -> str:
+    """What a tool call says it runs: its title, and the command line of a shell call.
+
+    Not the rest of its input: a file written about `gh pr` is not a `gh pr` command.
+    """
+    given = update.get("rawInput")
+    line = given.get("command") if isinstance(given, dict) else given
+    return f"{word(update.get('title'))}\n{word(line)}"
 
 
 def written(update: dict) -> str:
@@ -474,8 +482,7 @@ class Pulls:
         time whole so far. A link that ends such a text waits until the text is known whole.
         """
         if call not in tab.calls:
-            named = texts([update.get("title"), update.get("rawInput")])
-            if not any(COMMAND in text for text in named):
+            if COMMAND not in command(update):
                 return
             tab.calls[call] = {"input": [], "output": []}
             for oldest in list(tab.calls)[:-MAX_CALLS]:

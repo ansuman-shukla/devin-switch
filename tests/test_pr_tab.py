@@ -376,6 +376,16 @@ def test_a_chat_keeps_its_newest_pull_requests(pulls):
     assert urls(pulls) == [*(link(number) for number in range(5, 24)), link(1)]
 
 
+def test_a_link_is_read_once_however_its_message_goes_on(pulls):
+    pulls.feed("chat", said(f"First {link(1)} "))
+    assert urls(pulls) == [link(1)]
+    # Twenty newer ones push it out; the rest of its message does not bring it back.
+    pulls.said("chat", " ".join(link(number) for number in range(2, 22)))
+    pulls.feed("chat", said("and that is all"))
+    pulls.flush("chat")
+    assert urls(pulls) == [link(number) for number in range(2, 22)]
+
+
 def test_only_a_gh_pr_commands_input_and_output_are_read(pulls):
     # As CLI 3000.12.43 streams a command: its input grows, then it runs, then it ends.
     pulls.feed("chat", step("c1", "tool_call", title="Running command", rawInput=""))
@@ -418,6 +428,11 @@ def test_a_command_that_ends_with_a_link_counts_once_it_runs(pulls):
     # A call that never says it ended is counted when its turn ends.
     pulls.flush("chat")
     assert urls(pulls) == [link(9), link(61), link(62)]
+    # Input given as text, and links in the order the output holds them.
+    both = [*printed(f"{link(71)}\n"), {"deep": {"a": [f"{link(72)} ", [f"{link(73)} "]]}}]
+    pulls.feed("chat", step("c6", "tool_call", rawInput='{"command": "gh pr list"}'))
+    pulls.feed("chat", step("c6", status="completed", content=both, rawOutput=f"{link(74)} "))
+    assert urls(pulls)[3:] == [link(number) for number in (71, 72, 73, 74)]
 
 
 def test_other_tool_calls_say_nothing_about_pull_requests(pulls):
@@ -429,9 +444,14 @@ def test_other_tool_calls_say_nothing_about_pull_requests(pulls):
     ):
         pulls.feed("chat", step(call, "tool_call", title=title, rawInput={"command": command}))
         pulls.feed("chat", step(call, status="completed", content=printed(seen)))
-    # What a file says about `gh pr` does not make reading it a `gh pr` command.
+    # What a file says about `gh pr` does not make reading or writing it a `gh pr` command.
     read = step("c4", "tool_call", title="Read notes.md", status="completed")
     pulls.feed("chat", {**read, "content": printed(f"gh pr view {link(98)} \n")})
+    about = {"file_path": "notes.md", "content": f"Run gh pr view {link(97)} to see it.\n"}
+    pulls.feed("chat", step("c6", "tool_call", title="Wrote notes.md", rawInput=about))
+    pulls.feed("chat", step("c6", status="completed", content=printed(seen)))
+    pulls.feed("chat", step("c7", "tool_call", title="Ran x", rawInput={"command": ["gh pr"]}))
+    pulls.feed("chat", step("c7", status="completed", content=printed(seen)))
     pulls.feed("chat", step(5, "tool_call", title="gh pr view", content=printed(seen)))
     pulls.flush("chat")
     assert urls(pulls) == []
@@ -815,6 +835,8 @@ def test_reviews_name_who_reviewed_and_who_was_asked():
         (True, False, True, "SQUASH", ["merge", "rebase"]),
         (False, False, False, "MERGE", []),
         (True, True, False, None, ["merge", "squash"]),
+        # What GitHub did not say is not allowed.
+        (None, "yes", 1, "MERGE", []),
     ],
 )
 def test_merge_methods_are_those_the_repository_allows_its_default_first(
@@ -863,11 +885,8 @@ def test_whatever_gh_prints_about_a_pull_request_is_described_without_raising():
     }
     for value in (None, 5, True, "text", {"a": {"b": []}}):
         assert pr_tab.describe({key: value for key in FIELDS.split(",")}, None, []) is not None
-    assert pr_tab.describe(view(additions=True, deletions="7", changedFiles=2.5), 0, []) | {
-        "additions": 0,
-        "deletions": 0,
-        "files": 0,
-    } == pr_tab.describe(view(additions=0, deletions=0, changedFiles=0), 0, [])
+    odd = pr_tab.describe(view(additions=True, deletions="7", changedFiles=2.5), 0, [])
+    assert (odd["additions"], odd["deletions"], odd["files"]) == (0, 0, 0)
 
 
 def test_a_repositorys_merge_methods_are_asked_once(gh, pulls):
@@ -1044,10 +1063,12 @@ def test_pull_requests_are_looked_up_only_while_a_page_shows_them(gh, pulls):
 
 def test_an_open_page_sees_github_change(gh, pulls, monkeypatch):
     monkeypatch.setattr(pr_tab, "REFRESH", 0.2)
-    url = gh.pull(596)
+    # More than are looked up at a time: every one of them is looked up again.
+    opened = [gh.pull(number) for number in range(1, 7)]
+    url = opened[-1]
 
     async def scenario():
-        pulls.said("chat", url)
+        pulls.said("chat", " ".join(opened))
         with pulls.listen("chat") as page:
             assert (await loaded(pulls, url))["title"] == "Add the thing"
             gh.change(url, title="Renamed on GitHub", state="MERGED")
@@ -1173,8 +1194,8 @@ def test_an_open_pull_request_that_cannot_be_merged_says_the_first_reason(behind
 @pytest.mark.parametrize("state", ["MERGED", "CLOSED"])
 def test_nothing_can_be_done_to_a_pull_request_that_is_not_open(state):
     failing = [check_run("unit", "FAILURE")]
-    for draft in (False, True):
-        details = described(None, state=state, isDraft=draft, statusCheckRollup=failing)
+    for draft, behind in ((False, None), (True, None), (False, 2), (True, 0)):
+        details = described(behind, state=state, isDraft=draft, statusCheckRollup=failing)
         assert details["can"] == NOTHING and details["why"] == {}
 
 
@@ -1485,6 +1506,30 @@ def test_a_running_action_is_shown_and_holds_the_others_off(gh, pulls, tmp_path,
     asyncio.run(scenario())
 
 
+def test_an_action_that_is_given_up_leaves_the_pull_request_free(gh, pulls, tmp_path, unwatched):
+    url = gh.pull(596, isDraft=True)
+    gh.put(gates={"pr ready": str(tmp_path / "never")})
+
+    async def scenario():
+        await looked(pulls, url)
+        with pulls.listen("chat") as page:
+            running = asyncio.create_task(ask(pulls, "ready", url))
+            await until(lambda: len(acted(gh)) == 1)
+            assert row(pulls, url)["busy"] == "ready"
+            while not page.empty():
+                page.get_nowait()
+            # The bridge closing, say: the row must not stay busy for good.
+            running.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await running
+            assert row(pulls, url)["busy"] is None
+            assert page.get_nowait() is True
+            (ready,) = [call for call in gh.calls() if call["args"][:2] == ["pr", "ready"]]
+            assert gone(ready["pid"])
+
+    asyncio.run(scenario())
+
+
 def test_open_shows_a_pull_request_or_one_of_its_checks_in_the_browser(gh, pulls):
     odd = commit_status("local", "FAILURE") | {"targetUrl": "file:///etc/passwd"}
     rollup = [check_run("unit", run=8001), commit_status("ci/x", "PENDING"), odd]
@@ -1551,10 +1596,14 @@ def test_a_dismissed_pull_request_stays_away_until_the_user_asks_for_it(
         pulls.show("chat", [url], tmp_path)
         assert urls(pulls) == [kept, url]
         assert row(pulls, url) == waiting(596)
-        # And it is then an ordinary one again.
-        assert await ask(pulls, "dismiss", url) == {"ok": True}
+        # And it is then an ordinary one again: pushed out by newer ones, a link brings it back.
+        pulls.said("chat", " ".join(link(number) for number in range(100, 120)))
+        assert url not in urls(pulls)
         pulls.feed("chat", said(f"once more {url} ", stream="m7"))
-        assert urls(pulls) == [kept]
+        assert urls(pulls)[-1] == url
+        assert await ask(pulls, "dismiss", url) == {"ok": True}
+        pulls.feed("chat", said(f"and again {url} ", stream="m8"))
+        assert url not in urls(pulls)
         assert acted(gh) == []
 
     asyncio.run(scenario())
@@ -1612,7 +1661,7 @@ def test_pr_adds_the_links_and_numbers_it_is_given(gh, pulls, tmp_path):
     asyncio.run(scenario())
 
 
-def test_pr_says_which_number_or_word_it_could_not_use(gh, pulls, tmp_path):
+def test_pr_says_which_number_or_word_it_could_not_use(gh, pulls, tmp_path, unwatched):
     folder = tmp_path / "my-project"
     folder.mkdir()
     found = gh.pull(12)
@@ -1620,11 +1669,19 @@ def test_pr_says_which_number_or_word_it_could_not_use(gh, pulls, tmp_path):
 
     async def scenario():
         with pulls.listen("chat") as page:
+            pulls.show("chat", ["77"], folder)
+            assert page.get_nowait() is True and page.empty()
+            await settled(pulls)
+            # The open page is told what gh could not find.
+            assert page.get_nowait() is True and page.empty()
+            assert pulls.snapshot("chat") == {
+                "pulls": [],
+                "notice": "No pull request #77 in my-project",
+            }
             pulls.show("chat", ["77", "12"], folder)
             await settled(pulls)
             assert pulls.snapshot("chat")["notice"] == "No pull request #77 in my-project"
             assert urls(pulls) == [found]
-            assert page.get_nowait() is True
             # The next /pr starts clean, and so does a refresh.
             pulls.show("chat", [], folder)
             assert pulls.snapshot("chat")["notice"] is None
@@ -1637,7 +1694,8 @@ def test_pr_says_which_number_or_word_it_could_not_use(gh, pulls, tmp_path):
             assert pulls.snapshot("chat")["notice"] == (
                 "Not a pull request link or number: https://github.com/acme/app/issues/5"
             )
-        assert [run[2] for run in gh.runs("pr", "view") if run[2].isdigit()] == ["77", "12", "12"]
+        numbers = [run[2] for run in gh.runs("pr", "view") if run[2].isdigit()]
+        assert numbers == ["77", "77", "12", "12"]
 
     asyncio.run(scenario())
 

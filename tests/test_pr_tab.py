@@ -5,15 +5,25 @@ import re
 import sys
 import time
 from pathlib import Path
-from urllib.parse import quote
+from urllib.parse import quote, urlsplit
 
 import pytest
 from test_acp import acp_native as acp_native  # noqa: F401 (a fixture)
-from test_acp import in_process, until
-from test_side import fetch, lines, request
-from test_subagent_tab import get
+from test_acp import (
+    connect,
+    in_process,
+    logged,
+    prompt_params,
+    prompts,
+    replayed,
+    replayed_texts,
+    until,
+    wait_for_text,
+)
+from test_side import fetch, lines, opened, request
+from test_subagent_tab import get, new_chat
 
-from devin_switch import pr_tab, side
+from devin_switch import acp, pr_tab, side
 
 STREAM = "cognition.ai/streamingMessageId"
 CONTEXT = "cognition.ai/subagent_context"
@@ -1787,7 +1797,7 @@ def test_the_pull_requests_page_streams_a_chats_pull_requests_as_they_change(gh,
             assert not pulls.showing("chat")
             status, reader, writer = await request(server.port, "GET", events_url(server, "chat"))
             assert status == 200
-            _, idle, _ = await request(server.port, "GET", events_url(server, "another-chat"))
+            _, idle, other = await request(server.port, "GET", events_url(server, "another-chat"))
             # The pull requests as they are right after connecting, then as gh describes them.
             (connected,) = await lines(reader, 1)
             assert connected == {"pulls": [waiting(596)], "notice": None}
@@ -1816,6 +1826,7 @@ def test_the_pull_requests_page_streams_a_chats_pull_requests_as_they_change(gh,
             await server.close()
             await asyncio.wait_for(idle.read(), 5)
             assert not pulls.showing("another-chat")
+            other.close()
 
     asyncio.run(scenario())
 
@@ -1860,5 +1871,250 @@ def test_the_pull_requests_page_runs_the_actions_its_buttons_ask_for(gh, acp_nat
             status, _ = await fetch(server.port, "GET", f"/pr/act?t={server.token}")
             assert status == 200 and len(acted(gh)) == 2
             writer.close()
+
+    asyncio.run(scenario())
+
+
+async def streamed(reader, done):
+    """Every snapshot a page is sent, up to the first one that `done` accepts."""
+    seen = []
+    async with asyncio.timeout(10):
+        while not seen or not done(seen[-1]):
+            seen += await lines(reader, 1)
+    return seen
+
+
+def listed(snapshot):
+    return [pull["url"] for pull in snapshot["pulls"]]
+
+
+def test_pr_command_opens_the_tab_without_waiting_for_the_turn(gh, acp_native, tmp_path):
+    url = gh.pull(596)
+
+    async def scenario():
+        async with connect(acp_native) as client:
+            session_id = await client.new(tmp_path)
+            turn = asyncio.create_task(client.prompt(session_id, "busy"))
+            await wait_for_text(client, "live progress")
+
+            start = len(client.messages)
+            asked = await asyncio.wait_for(client.prompt(session_id, f" /pr {url}"), 5)
+            assert asked["result"] == {"stopReason": "end_turn"} and not turn.done()
+            (preview,) = opened(client.messages[start:])
+            assert set(preview) == {"sessionId", "previewUrl"}
+            assert preview["sessionId"] == session_id
+            address = urlsplit(preview["previewUrl"])
+            assert (address.scheme, address.hostname) == ("http", "127.0.0.1")
+            assert address.path == f"/pr/{quote(session_id, safe='')}"
+            assert address.query.startswith("t=") and len(address.query) > 20
+            # The chat itself shows nothing of it.
+            assert replayed(client.messages[start:], "agent_message_chunk") == []
+
+            # The tab loads the page, whose event stream shows the pull request asked for.
+            status, _, body = await get(address.port, f"{address.path}?{address.query}")
+            assert status == 200 and f'data-session="{session_id}"' in body
+            events = f"/pr/events?session={quote(session_id, safe='')}&{address.query}"
+            status, reader, stream = await request(address.port, "GET", events)
+            assert status == 200
+            *_, latest = await streamed(reader, lambda shown: not shown["pulls"][0]["loading"])
+            assert [(pull["url"], pull["title"]) for pull in latest["pulls"]] == [
+                (url, "Add the thing")
+            ]
+
+            # Desktop opens a new tab per notice: a chat whose page is connected gets none.
+            start = len(client.messages)
+            again = await asyncio.wait_for(client.prompt(session_id, "/pr"), 5)
+            assert again["result"] == {"stopReason": "end_turn"}
+            assert opened(client.messages[start:]) == []
+            # Closing the tab is noticed at once, so the next /pr opens it again.
+            stream.close()
+            async with asyncio.timeout(side.KEEPALIVE / 3):
+                while not opened(client.messages[start:]):
+                    await asyncio.sleep(0.05)
+                    await asyncio.wait_for(client.prompt(session_id, "/pr"), 5)
+            assert len(opened(client.messages[start:])) == 1
+
+            # A reload mid-turn replays the chat: neither the command nor a tab to reopen.
+            start = len(client.messages)
+            params = {"sessionId": session_id, "cwd": str(tmp_path), "mcpServers": []}
+            await asyncio.wait_for(client.request("session/load", params), 5)
+            replay = client.messages[start:]
+            assert replayed_texts(replay, "user_message_chunk") == ["busy"]
+            assert opened(replay) == []
+            assert not turn.done()
+            await client.send({"method": "session/cancel", "params": {"sessionId": session_id}})
+            assert (await turn)["result"]["stopReason"] == "cancelled"
+
+        # The agent never saw the command, and the chat never showed the pull request.
+        assert [call["text"] for call in logged(acp_native) if call["text"] is not None] == ["busy"]
+        assert not any("pull" in text for text in client.texts())
+        (*_, latest) = replayed(client.messages, "available_commands_update")
+        offered = {item["name"]: item for item in latest["availableCommands"]}
+        assert len(offered) == len(latest["availableCommands"])
+        assert {"help", "btw", "subagents"} <= set(offered)
+        assert offered["pr"] == {
+            "name": "pr",
+            "description": "Show this chat's pull requests in a tab; this chat keeps working",
+            "input": {"hint": "optional link or number"},
+        }
+        # The folder's own branch was not asked for: the tab was given a pull request.
+        assert all(run[2] == url for run in gh.runs("pr", "view"))
+
+    asyncio.run(scenario())
+
+
+def test_pr_command_does_not_wake_a_chat_released_for_idleness(gh, acp_native, tmp_path):
+    found = gh.pull(12)
+    gh.put(numbers={"12": found})
+
+    async def scenario():
+        async with in_process(acp_native) as (bridge, messages):
+            chat = await new_chat(bridge, tmp_path)
+            chat.backend.last_activity -= acp.IDLE_TIMEOUT + 1
+            assert await bridge.release_idle(chat)
+            calls = [call for call in logged(acp_native) if call["sessionId"] == chat.session_id]
+            reply = await bridge.dispatch(
+                "session/prompt", prompt_params(chat.session_id, "/pr 12")
+            )
+            assert reply == {"stopReason": "end_turn"} and chat.suspended
+            (preview,) = opened(messages)
+            assert f"/pr/{chat.session_id}?t=" in preview["previewUrl"]
+            # The number is looked for in the chat's folder, beside the answer.
+            await settled(bridge.pulls)
+            assert urls(bridge.pulls, chat.session_id) == [found]
+            (call,) = gh.calls()
+            assert call["args"] == ["pr", "view", "12", "--json", "url"]
+            assert Path(call["cwd"]) == tmp_path.resolve()
+            assert chat.suspended and calls == [
+                call for call in logged(acp_native) if call["sessionId"] == chat.session_id
+            ]
+
+    asyncio.run(scenario())
+
+
+def test_pr_command_takes_links_and_numbers_and_is_a_whole_word(gh, acp_native, tmp_path):
+    by_link, by_number, mine = gh.pull(596), gh.pull(12), gh.pull(3)
+    gh.put(numbers={"12": by_number}, branches={tmp_path.name: mine})
+
+    async def scenario():
+        async with in_process(acp_native) as (bridge, messages):
+            chat = await new_chat(bridge, tmp_path)
+            session_id, pulls = chat.session_id, bridge.pulls
+            start = len(messages)
+            reply = await bridge.dispatch("session/prompt", prompt_params(session_id, "/pr"))
+            assert reply == {"stopReason": "end_turn"}
+            (preview,) = opened(messages[start:])
+            assert f"/pr/{session_id}?t=" in preview["previewUrl"]
+            # Alone, with nothing listed yet: the pull request of the folder's branch.
+            await settled(pulls)
+            assert urls(pulls, session_id) == [mine]
+
+            # With links and numbers, whatever else the prompt holds.
+            image = {"type": "image", "data": "aGk=", "mimeType": "image/png"}
+            blocks = [{"type": "text", "text": f"/pr {by_link} #12 99"}, image]
+            reply = await bridge.dispatch(
+                "session/prompt", {"sessionId": session_id, "prompt": blocks}
+            )
+            assert reply == {"stopReason": "end_turn"}
+            # No page is connected, so each /pr asks for the tab.
+            assert len(opened(messages[start:])) == 2
+            assert urls(pulls, session_id) == [mine, by_link]
+            await settled(pulls)
+            assert urls(pulls, session_id) == [mine, by_link, by_number]
+            assert pulls.snapshot(session_id)["notice"] == f"No pull request #99 in {tmp_path.name}"
+            assert gh.runs() == [
+                ["pr", "view", "--json", "url"],
+                ["pr", "view", "12", "--json", "url"],
+                ["pr", "view", "99", "--json", "url"],
+            ]
+            assert {Path(call["cwd"]) for call in gh.calls()} == {tmp_path.resolve()}
+            assert prompts(acp_native) == []
+
+            # A longer first word is not this command: the agent gets it as typed.
+            start = len(messages)
+            for text in ("/pr-foo", "/prs"):
+                reply = await bridge.dispatch("session/prompt", prompt_params(session_id, text))
+                assert reply == {"stopReason": "end_turn"}
+            assert opened(messages[start:]) == []
+            assert prompts(acp_native) == [("ansuman-1", "/pr-foo"), ("ansuman-1", "/prs")]
+
+    asyncio.run(scenario())
+
+
+def test_links_a_chat_shows_reach_its_open_tab(gh, acp_native, tmp_path, monkeypatch):
+    gate = tmp_path / "end-the-turn"
+    created = "gh pr create --fill"
+    turn = [
+        said("Opened https://github.com/acme/app/pull/1"),
+        said("23 and one by a command."),
+        step("call_1", "tool_call", title="Running command", rawInput={"command": created}),
+        step("call_1", status="completed", content=printed(f"{link(77)}\n")),
+        step("call_2", "tool_call", title="Ran cat", rawInput={"command": "cat notes.md"}),
+        step("call_2", status="completed", content=printed(f"{link(78)}\n")),
+        # A subagent's own message never shows in the chat, but its link counts.
+        said(f"Mine is {link(55)} too.", stream="s1", agent="sub1"),
+        said(f"The last one is {link(45)}", stream="m2"),
+    ]
+    monkeypatch.setenv("FAKE_SAY", json.dumps(turn))
+    monkeypatch.setenv("FAKE_SAY_GATE", str(gate))
+
+    async def scenario():
+        async with connect(acp_native) as client:
+            session_id = await client.new(tmp_path)
+            start = len(client.messages)
+            await asyncio.wait_for(client.prompt(session_id, f"/pr {link(9)}"), 5)
+            (preview,) = opened(client.messages[start:])
+            address = urlsplit(preview["previewUrl"])
+            events = f"/pr/events?session={quote(session_id, safe='')}&{address.query}"
+            _, reader, stream = await request(address.port, "GET", events)
+
+            running = asyncio.create_task(client.prompt(session_id, "say"))
+            seen = await streamed(reader, lambda shown: len(shown["pulls"]) == 4)
+            assert listed(seen[-1]) == [link(9), link(123), link(77), link(55)]
+            # The turn is still open, so the link its last message ends with is not counted yet.
+            await asyncio.sleep(0.3)
+            assert not running.done()
+            gate.touch()
+            assert (await running)["result"] == {"stopReason": "end_turn"}
+            seen += await streamed(reader, lambda shown: len(shown["pulls"]) == 5)
+            assert listed(seen[-1]) == [link(9), link(123), link(77), link(55), link(45)]
+
+            # What the user writes counts as well.
+            await asyncio.wait_for(client.prompt(session_id, f"and what about {link(31)}"), 5)
+            seen += await streamed(reader, lambda shown: len(shown["pulls"]) == 6)
+            assert listed(seen[-1])[-1] == link(31)
+            # No page was ever shown part of a link, or what another command printed.
+            every = {url for shown in seen for url in listed(shown)}
+            assert every == {link(number) for number in (9, 123, 77, 55, 45, 31)}
+            stream.close()
+
+        assert "Mine is" not in "".join(client.texts())
+        assert "The last one is" in "".join(client.texts())
+
+    asyncio.run(scenario())
+
+
+def test_links_a_reopened_chat_replays_are_listed_again(gh, acp_native, tmp_path, monkeypatch):
+    history = [
+        said(f"please look at {link(5)}", stream=None, kind=USER),
+        said(f"Looked at {link(5)}; see {link(6)}/files as well.", stream=None),
+        said(f"It ends with {link(7)}", stream=None),
+    ]
+    monkeypatch.setenv("FAKE_REPLAY_SAY", json.dumps(history))
+
+    async def scenario():
+        async with in_process(acp_native) as (bridge, messages):
+            chat = await new_chat(bridge, tmp_path)
+            session_id, pulls = chat.session_id, bridge.pulls
+            assert urls(pulls, session_id) == []
+            await bridge.dispatch("session/load", chat.setup)
+            # The updates that follow the replay end its last message.
+            assert urls(pulls, session_id) == [link(5), link(6), link(7)]
+            assert opened(messages) == []
+            # One the user dismissed stays away through the next replay.
+            assert await ask(pulls, "dismiss", link(6), session_id) == {"ok": True}
+            await bridge.dispatch("session/load", chat.setup)
+            assert urls(pulls, session_id) == [link(5), link(7)]
+            assert gh.calls() == []
 
     asyncio.run(scenario())

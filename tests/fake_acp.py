@@ -417,6 +417,9 @@ async def handle(message):
                     "content": {"type": "text", "text": "historical replay"},
                 },
             )
+            for said in json.loads(os.environ.get("FAKE_REPLAY_SAY", "[]")):
+                # What a test has the saved chat's replay hold, as given.
+                update(session_id, said)
             if os.environ.get("FAKE_REPLAY_SUBAGENT"):
                 # The native replays a saved chat's foreground subagents in the live shapes,
                 # but each message whole, named by its saved event.
@@ -536,6 +539,15 @@ async def handle(message):
             return
         if text == "delegate":
             await delegate(message["id"])
+            return
+        if text == "say":
+            # A turn that sends just the updates a test gives it, and ends once its gate opens.
+            for said in json.loads(os.environ["FAKE_SAY"]):
+                update(loaded, said)
+            gate = os.environ.get("FAKE_SAY_GATE")
+            while gate and not Path(gate).exists():
+                await asyncio.sleep(0.02)
+            emit({"id": message["id"], "result": {"stopReason": "end_turn"}})
             return
         if foreground is not None and text.startswith("steer"):
             foreground["steering"].append(message["id"])

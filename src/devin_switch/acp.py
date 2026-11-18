@@ -532,6 +532,9 @@ class Backend:
         if method in OPENING:
             self.transcript.clear()
             self.latest.clear()
+            if not self.suppress_replay:
+                # Desktop builds the chat's rows anew from the replay it is about to be shown.
+                self.bridge.run_ids.forget(self.session_id)
         try:
             await self.send({"id": identifier, "method": method, "params": params})
             response = await asyncio.wait_for(future, timeout)
@@ -755,6 +758,7 @@ class Bridge:
         self.side_server = None
         self.side_sinks = {}
         self.roster = subagent_tab.Roster()
+        self.run_ids = subagents.RunIds()
         # Whether Desktop itself asked for the native's revert notices.
         self.reverts = False
 
@@ -856,6 +860,12 @@ class Bridge:
             # Remove once Desktop nests a subagent's replies itself.
             if subagent_tab.own_message(update):
                 return
+            # Desktop 3.14 counts a resumed subagent as running for good: the native names no
+            # run, so the second start gets a row that its end never finds. Runs are named in
+            # what Desktop is shown, never in a replay kept from it (it has no rows of that).
+            # A no-op once the native sends `runId` itself: remove it then.
+            if backend.session_id and not backend.suppress_replay:
+                self.run_ids.stamp(backend.session_id, update)
             if backend.chat:
                 backend.record(message)
             if backend.suppress_replay:
@@ -1075,6 +1085,7 @@ class Bridge:
                     )
                 self.chats.pop(session_id)
                 self.roster.forget(session_id)
+                self.run_ids.forget(session_id)
                 return {}
             if method == "session/prompt":
                 # A Stop from before this prompt arrived was for an earlier turn.

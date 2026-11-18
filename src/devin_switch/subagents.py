@@ -27,6 +27,9 @@ STARTED = "cognition.ai/subagent_started"
 COMPLETED = "cognition.ai/subagent_completed"
 PAUSED = "cognition.ai/subagent_paused"
 CONTEXT = "cognition.ai/subagent_context"
+# The payloads that can say which run of a subagent they belong to, and each one's field for
+# the subagent.
+RUN_EVENTS = {STARTED: "agentId", COMPLETED: "agentId", PAUSED: "agentId", CONTEXT: "parentAgentId"}
 QUOTA_FAILURE = re.compile(r"usage quota has been exhausted|quota exhausted", re.IGNORECASE)
 TASK_LIMIT = 4000
 PROGRESS_LIMIT = 2000
@@ -276,7 +279,54 @@ def resume_text(store: Store, session_id: str, agents: dict) -> str:
     return "\n".join(lines)
 
 
-def named(event: object) -> str | None:
+def named(event: object, field: str = "agentId") -> str | None:
     """The subagent an event is about, when it names one."""
-    agent = event.get("agentId") if isinstance(event, dict) else None
+    agent = event.get(field) if isinstance(event, dict) else None
     return agent if isinstance(agent, str) and agent else None
+
+
+class RunIds:
+    """Names the runs of a resumed subagent for Desktop, because the native does not.
+
+    The native reports a subagent that is run again (`run_subagent` with `resume`) like its
+    first run: the same `agentId` and no `runId`, a field both sides define. Desktop 3.14 keys
+    a subagent's row by `runId ?? agentId` and files a second start under a row nothing finds
+    again, so that run's end, pauses and own updates land on the first row and the new one
+    counts as running for good. From a subagent's second start on, every payload of the run
+    therefore gets `runId` "<agentId>-<n>". A first run stays as sent, and so does every run
+    whose start the native named itself: once the native fills `runId`, this changes nothing
+    and can be removed.
+    """
+
+    def __init__(self) -> None:
+        # Per chat and subagent: how many starts Desktop was sent, and the ID given to the run
+        # it is on (none: its first run, or a run the native named).
+        self.starts: dict[str, dict[str, int]] = {}
+        self.given: dict[str, dict[str, str]] = {}
+
+    def stamp(self, session_id: str, update: dict) -> None:
+        """Name the run in an update that Desktop is about to be sent.
+
+        Never raises on what a native might send: the caller is the chat's read loop.
+        """
+        meta = update.get("_meta")
+        if not isinstance(meta, dict):
+            return
+        if agent := named(started := meta.get(STARTED)):
+            starts = self.starts.setdefault(session_id, {})
+            given = self.given.setdefault(session_id, {})
+            starts[agent] = starts.get(agent, 0) + 1
+            given.pop(agent, None)
+            if starts[agent] > 1 and started.get("runId") is None:
+                given[agent] = f"{agent}-{starts[agent]}"
+        if given := self.given.get(session_id):
+            for key, field in RUN_EVENTS.items():
+                event = meta.get(key)
+                run = given.get(named(event, field))
+                if run and event.get("runId") is None:
+                    event["runId"] = run
+
+    def forget(self, session_id: str | None) -> None:
+        """Count a chat's runs from the first again: Desktop no longer has its rows."""
+        self.starts.pop(session_id, None)
+        self.given.pop(session_id, None)

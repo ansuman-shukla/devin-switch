@@ -1135,6 +1135,106 @@ def test_an_open_page_keeps_looking_after_its_second_page_leaves(gh, pulls, monk
     asyncio.run(scenario())
 
 
+STOPPED = (
+    "Stopped checking GitHub: RuntimeError: GitHub answered nonsense. Press Refresh to try again."
+)
+
+
+class Faulty:
+    """Looks pull requests up as the tab does, or fails the way a bug would, and counts."""
+
+    def __init__(self, pulls):
+        self.broken, self.tries, self.look = True, 0, pulls.look
+        pulls.look = self
+
+    async def __call__(self, tab, pull):
+        self.tries += 1
+        if self.broken:
+            raise RuntimeError("GitHub answered nonsense.\nmore detail")
+        await self.look(tab, pull)
+
+
+def test_a_watcher_that_fails_says_so_and_refresh_starts_it_again(gh, pulls):
+    url = gh.pull(596)
+    faulty = Faulty(pulls)
+
+    async def scenario():
+        pulls.said("chat", url)
+        with pulls.listen("chat") as page:
+            tab = pulls.tabs["chat"]
+            assert page.get_nowait() is True
+            await until(lambda: tab.watcher is None)
+            # The page is told why nothing is looked up any more: it must not look live.
+            assert pulls.snapshot("chat") == {"pulls": [waiting(596)], "notice": STOPPED}
+            assert page.get_nowait() is True and page.empty()
+            assert faulty.tries == 1
+            assert pulls.snapshot("other-chat")["notice"] is None
+
+            # Refresh starts a watcher again. While the fault lasts, it says so again.
+            assert await ask(pulls, "refresh") == {"ok": True}
+            await until(lambda: faulty.tries == 2 and tab.watcher is None)
+            assert pulls.snapshot("chat")["notice"] == STOPPED
+            while not page.empty():
+                page.get_nowait()
+            faulty.broken = False
+            assert await ask(pulls, "refresh") == {"ok": True}
+            assert pulls.snapshot("chat")["notice"] is None
+            assert page.get_nowait() is True
+            assert (await loaded(pulls, url))["title"] == "Add the thing"
+            assert tab.watcher is not None and not tab.watcher.done()
+            assert pulls.snapshot("chat")["notice"] is None
+            # With a watcher running, Refresh looks them up itself and starts no second one.
+            running, asked = tab.watcher, len(gh.runs("pr", "view"))
+            assert await ask(pulls, "refresh") == {"ok": True}
+            assert tab.watcher is running and len(gh.runs("pr", "view")) == asked + 1
+        # A page that leaves ends the watcher without a word.
+        await asyncio.sleep(0.05)
+        assert running.cancelled() and pulls.snapshot("chat")["notice"] is None
+
+    asyncio.run(scenario())
+
+
+def test_a_watcher_that_fails_later_keeps_what_was_shown(gh, pulls, monkeypatch):
+    monkeypatch.setattr(pr_tab, "REFRESH", 0.2)
+    url = gh.pull(596)
+    faulty = Faulty(pulls)
+    faulty.broken = False
+
+    async def scenario():
+        pulls.said("chat", url)
+        with pulls.listen("chat") as page:
+            tab = pulls.tabs["chat"]
+            assert (await loaded(pulls, url))["title"] == "Add the thing"
+            tab.notice = "No pull request #77 in my-project"
+            faulty.broken = True
+            await until(lambda: tab.watcher is None)
+            # What stopped comes first, and the pull request stays as it was last seen.
+            assert pulls.snapshot("chat")["notice"] == STOPPED
+            assert row(pulls, url)["title"] == "Add the thing"
+            tries = faulty.tries
+            await asyncio.sleep(0.5)
+            assert faulty.tries == tries
+            while not page.empty():
+                page.get_nowait()
+
+            # A page that connects starts a watcher again, and so does /pr.
+            faulty.broken = False
+            with pulls.listen("chat"):
+                await until(lambda: faulty.tries > tries)
+                assert tab.watcher is not None and not tab.watcher.done()
+                # The earlier notice is back: only what stopped is over.
+                assert pulls.snapshot("chat")["notice"] == "No pull request #77 in my-project"
+            faulty.broken = True
+            await until(lambda: tab.watcher is None)
+            faulty.broken, tries = False, faulty.tries
+            pulls.show("chat", [], Path.home())
+            assert tab.watcher is not None
+            await until(lambda: faulty.tries > tries)
+            assert pulls.snapshot("chat")["notice"] is None
+
+    asyncio.run(scenario())
+
+
 def test_pull_requests_are_looked_up_a_few_at_a_time(gh, pulls, tmp_path):
     assert pr_tab.BATCH == 4
     opened = [gh.pull(number) for number in range(1, 7)]

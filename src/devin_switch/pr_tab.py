@@ -192,6 +192,13 @@ def trouble(ran: Ran) -> str:
     return (lines[0] if lines else f"gh ended with code {ran.code}")[:ERROR_LIMIT]
 
 
+def short(error: BaseException) -> str:
+    """An exception in one short line."""
+    lines = str(error).strip().splitlines()
+    name = type(error).__name__
+    return (f"{name}: {lines[0].strip()}" if lines else name)[:ERROR_LIMIT]
+
+
 def answer(ran: Ran) -> dict | None:
     """The JSON object a `gh` command printed (None: it failed, or printed something else)."""
     if ran.code:
@@ -422,6 +429,8 @@ class Tab:
     calls: dict[str, dict[str, list[str]]] = field(default_factory=dict)
     listeners: set[asyncio.Queue] = field(default_factory=set)
     watcher: asyncio.Task | None = None
+    # What the pages are told when the watcher gave up by itself, until one is started again.
+    stopped: str | None = None
     added: asyncio.Event = field(default_factory=asyncio.Event)
 
 
@@ -548,6 +557,7 @@ class Pulls:
         tab = self.tabs.setdefault(session_id, Tab())
         tab.notice = None
         self.flush(session_id)
+        self.start(tab)
         numbers = []
         for item in words:
             if found := links(item, ended=True)[0]:
@@ -583,7 +593,9 @@ class Pulls:
             return None
         if action == "refresh":
             tab.notice = None
-            await self.refresh(tab, list(tab.pulls.values()))
+            # A watcher that had stopped starts again, and its first pass looks at them all.
+            if not self.start(tab):
+                await self.refresh(tab, list(tab.pulls.values()))
             self.tell(tab)
             return OK
         key = url.lower() if isinstance(url, str) else None
@@ -684,12 +696,32 @@ class Pulls:
                 tab.added.clear()
                 await self.refresh(tab, [pull for pull in tab.pulls.values() if pull.loading])
 
+    def start(self, tab: Tab) -> bool:
+        """Start looking a tab's pull requests up, if a page shows them and nothing does yet."""
+        if not tab.listeners or tab.watcher:
+            return False
+        tab.stopped = None
+        tab.watcher = watcher = asyncio.create_task(self.watch(tab))
+        watcher.add_done_callback(lambda ended: self.gave_up(tab, ended))
+        return True
+
+    def gave_up(self, tab: Tab, watcher: asyncio.Task) -> None:
+        """A watcher that ended on an error says so on its tab: a page must not look live
+        while nothing looks its pull requests up. One that was cancelled just stops."""
+        if watcher.cancelled():
+            return
+        why = short(watcher.exception()).rstrip(".")
+        if tab.watcher is watcher:
+            tab.watcher = None
+            tab.stopped = f"Stopped checking GitHub: {why}. Press Refresh to try again."
+            self.tell(tab)
+
     def snapshot(self, session_id: str) -> dict:
         """What the page shows."""
         tab = self.tabs.get(session_id)
         return {
             "pulls": [pull.shown() for pull in tab.pulls.values()] if tab else [],
-            "notice": MISSING if self.missing else tab.notice if tab else None,
+            "notice": MISSING if self.missing else (tab.stopped or tab.notice) if tab else None,
         }
 
     def showing(self, session_id: str) -> bool:
@@ -706,8 +738,7 @@ class Pulls:
         # The page shows the pull requests as they are right after connecting.
         queue.put_nowait(True)
         tab.listeners.add(queue)
-        if tab.watcher is None:
-            tab.watcher = asyncio.create_task(self.watch(tab))
+        self.start(tab)
         try:
             yield queue
         finally:

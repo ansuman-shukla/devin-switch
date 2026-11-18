@@ -318,10 +318,9 @@ def test_a_link_counts_wherever_the_chunks_divide_it(store):
     [
         said("Next message", stream="m2"),
         said("a question", kind=USER),
-        said("hm", kind=THOUGHT),
         step("call_1", "tool_call", title="Running command"),
-        {"sessionUpdate": "usage_update", "_meta": {CONTEXT: {"parentAgentId": "root"}}},
-        {"sessionUpdate": "available_commands_update", "availableCommands": []},
+        step("call_1", status="completed"),
+        {"sessionUpdate": "tool_call"},
     ],
 )
 def test_a_link_that_ends_a_message_counts_once_the_message_has_ended(pulls, ending):
@@ -329,6 +328,37 @@ def test_a_link_that_ends_a_message_counts_once_the_message_has_ended(pulls, end
     assert urls(pulls) == []
     pulls.feed("chat", ending)
     assert urls(pulls) == [link(41)]
+
+
+@pytest.mark.parametrize(
+    "between",
+    [
+        {"sessionUpdate": "usage_update", "used": 1, "size": 10},
+        {"sessionUpdate": "usage_update", "_meta": {CONTEXT: {"parentAgentId": "root"}}},
+        {"sessionUpdate": "plan", "entries": []},
+        {"sessionUpdate": "current_mode_update", "currentModeId": "ask"},
+        {"sessionUpdate": "available_commands_update", "availableCommands": []},
+        {"sessionUpdate": "session_info_update", "title": "A chat"},
+        {"sessionUpdate": "config_option_update", "configOptions": []},
+        said("hm", kind=THOUGHT),
+        said("hm", stream="t1", kind=THOUGHT),
+        {"sessionUpdate": "something_new"},
+        {},
+    ],
+)
+def test_what_arrives_in_the_middle_of_a_message_does_not_end_it(pulls, between):
+    # As a native streams: usage, plans, thoughts and settings come between two chunks.
+    pulls.feed("chat", said("See https://github.com/acme/app/pull/1"))
+    pulls.feed("chat", between)
+    assert urls(pulls) == []
+    pulls.feed("chat", said("23 for details"))
+    assert urls(pulls) == [link(123)]
+    # Nor does it say that a message which ends with a link is over: the turn's end does.
+    pulls.feed("chat", said(f" and {link(41)}"))
+    pulls.feed("chat", between)
+    assert urls(pulls) == [link(123)]
+    pulls.flush("chat")
+    assert urls(pulls) == [link(123), link(41)]
 
 
 def test_the_end_of_a_turn_counts_the_link_its_last_message_ended_with(pulls):
@@ -355,8 +385,10 @@ def test_another_writers_updates_leave_a_message_still_being_written_alone(pulls
     assert urls(pulls) == []
     pulls.feed("chat", said("23 is up"))
     assert urls(pulls) == [link(123)]
-    # The subagent's own next step ends its message.
+    # The subagent's own next tool call ends its message; its usage says nothing.
     pulls.feed("chat", {"sessionUpdate": "usage_update", "_meta": theirs})
+    assert urls(pulls) == [link(123)]
+    pulls.feed("chat", step("call_9", status="completed", _meta=theirs))
     assert urls(pulls) == [link(123), link(77)]
     assert urls(pulls, "other-chat") == []
 
@@ -2183,6 +2215,8 @@ def test_links_a_chat_shows_reach_its_open_tab(gh, acp_native, tmp_path, monkeyp
     created = "gh pr create --fill"
     turn = [
         said("Opened https://github.com/acme/app/pull/1"),
+        # Usage arrives in the middle of the message, as it does from a real native.
+        {"sessionUpdate": "usage_update", "used": 1, "size": 10},
         said("23 and one by a command."),
         step("call_1", "tool_call", title="Running command", rawInput={"command": created}),
         step("call_1", status="completed", content=printed(f"{link(77)}\n")),
@@ -2245,9 +2279,13 @@ def test_links_a_reopened_chat_replays_are_listed_again(gh, acp_native, tmp_path
             session_id, pulls = chat.session_id, bridge.pulls
             assert urls(pulls, session_id) == []
             await bridge.dispatch("session/load", chat.setup)
-            # The updates that follow the replay end its last message.
-            assert urls(pulls, session_id) == [link(5), link(6), link(7)]
+            # A replay is read like the chat itself: the settings that follow it do not say
+            # that its last message is over, so the link that message ends with waits.
+            assert urls(pulls, session_id) == [link(5), link(6)]
             assert opened(messages) == []
+            # /pr counts it.
+            await bridge.dispatch("session/prompt", prompt_params(session_id, "/pr"))
+            assert urls(pulls, session_id) == [link(5), link(6), link(7)]
             # One the user dismissed stays away through the next replay.
             assert await ask(pulls, "dismiss", link(6), session_id) == {"ok": True}
             await bridge.dispatch("session/load", chat.setup)

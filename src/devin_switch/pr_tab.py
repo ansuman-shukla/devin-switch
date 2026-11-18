@@ -453,11 +453,14 @@ class Pulls:
 
     def read(self, tab: Tab, update: dict) -> None:
         kind, writer = update.get("sessionUpdate"), subagent_tab.author(update)
-        if kind not in CHUNKS:
-            # Anything else from the same writer: its message has ended.
+        if kind in STEPS:
+            # A writer that calls a tool has finished what it was saying.
             self.end(tab, writer)
-            if kind in STEPS and isinstance(call := update.get("toolCallId"), str):
+            if isinstance(call := update.get("toolCallId"), str):
                 self.step(tab, call, update)
+        if kind not in CHUNKS:
+            # Usage, plans, thoughts and settings arrive in the middle of a message that is
+            # being streamed too, so they say nothing about where it ends.
             return
         meta = update.get("_meta")
         message = (kind, meta.get(subagent_tab.STREAM) if isinstance(meta, dict) else None)

@@ -1,6 +1,6 @@
 'use strict';
 // The Pull requests page of one chat, shown in a Browser tab of the chat. The Switch bridge that served it sends
-// the chat's pull requests again on every change.
+// the chat's pull requests again on every change and runs each action through the gh CLI on this Mac.
 (() => {
   const view = window.PrView;
   const { session, token } = document.body.dataset;
@@ -24,27 +24,45 @@
   const cards = new Map();
   // Cards are numbered: a url is not safe as the element id that aria-describedby needs.
   let numbered = 0;
+  let refreshing = false;
 
+  const refresh = el('button', { type: 'button', className: 'button small', textContent: 'Refresh', onclick: refreshAll });
   const updated = el('span', { className: 'updated' });
   const banner = el('div', { className: 'banner', role: 'status', hidden: true });
   const notice = el('div', { className: 'banner notice', ariaLive: 'polite', hidden: true });
+  const trouble = newProblem(() => trouble.show(null));
   const list = el('ul', { className: 'cards' });
   const empty = el('div', { className: 'empty', hidden: true }, [
     el('h2', { textContent: 'No pull requests in this chat yet.' }),
     el('p', { textContent: 'Paste a PR link in the chat, or type /pr <link or number>.' }),
   ]);
   document.body.append(
-    el('header', { className: 'toolbar' }, [el('h1', { textContent: 'Pull requests' }), updated]),
+    el('header', { className: 'toolbar' }, [el('h1', { textContent: 'Pull requests' }), refresh, updated]),
     banner,
     notice,
-    el('main', { className: 'content' }, [el('div', { className: 'column' }, [empty, list])]),
+    el('main', { className: 'content' }, [el('div', { className: 'column' }, [trouble.node, empty, list])]),
   );
+
+  /** An error line that stays in the page across redraws, so a screen reader hears its text change. */
+  function newProblem(hide) {
+    const text = el('span', { className: 'problem-text', ariaLive: 'polite' });
+    const close = el('button', { type: 'button', className: 'close', textContent: '×', ariaLabel: 'Hide this error', onclick: hide });
+    const node = el('div', { className: 'problem', hidden: true }, [icon('bad'), text, close]);
+    return {
+      node,
+      show(message) {
+        node.hidden = !message;
+        setText(text, message ?? '');
+      },
+    };
+  }
 
   function newCard(url) {
     const card = { url, number: ++numbered, json: '', controls: new Map(), focus: null };
     card.body = el('div', { className: 'card-body' });
+    card.problem = newProblem(() => change(url, view.hideError));
     // The card takes the keyboard focus when the control that had it is gone or switched off.
-    card.node = el('li', { className: 'card', tabIndex: -1 }, [card.body]);
+    card.node = el('li', { className: 'card', tabIndex: -1 }, [card.body, card.problem.node]);
     cards.set(url, card);
     return card;
   }
@@ -62,9 +80,12 @@
     return el('li', { className: 'status' }, [icon(tone), el('div', { className: 'status-body' }, [line, ...below])]);
   }
 
-  function checkLine(check) {
+  /** A check with a link opens it; the others are plain lines. */
+  function checkLine(card, check, index) {
     const workflow = check.workflow ? [' ', el('span', { className: 'workflow', textContent: check.workflow })] : [];
-    return el('div', { className: 'check' }, [icon(check.tone), el('span', { className: 'check-name' }, [check.name, ...workflow]), el('span', { className: 'check-word', textContent: check.word })]);
+    const children = [icon(check.tone), el('span', { className: 'check-name' }, [check.name, ...workflow]), el('span', { className: 'check-word', textContent: check.word })];
+    if (!check.url) return el('div', { className: 'check' }, children);
+    return control(card, `check-${index}`, el('button', { type: 'button', className: 'check', title: 'Open this check in the browser', onclick: () => openLink(card.url, check.url) }, children));
   }
 
   function checksRow(card, checks) {
@@ -73,7 +94,7 @@
       className: 'toggle',
       ariaExpanded: String(checks.open),
     });
-    const items = checks.list.map((check) => el('li', {}, [checkLine(check)]));
+    const items = checks.list.map((check, index) => el('li', {}, [checkLine(card, check, index)]));
     return statusRow(checks, [toggle], checks.open ? [el('ul', { className: 'checks' }, items)] : []);
   }
 
@@ -82,17 +103,55 @@
     return el('ul', { className: 'statuses' }, [statusRow(behind), statusRow(conflicts), checksRow(card, checks), statusRow(review, [], reviewed)]);
   }
 
+  /** The step between Merge and the merge: only Confirm merge sends it. */
+  function confirmStep(card, confirm) {
+    const { url } = card;
+    const radio = ({ value, label, chosen }) => {
+      const input = el('input', { type: 'radio', name: `method-${card.number}`, value, checked: chosen, onchange: () => change(url, (state) => view.chooseMethod(state, value)) });
+      return el('label', {}, [control(card, `method-${value}`, input), label]);
+    };
+    const methods = confirm.chooser
+      ? [el('fieldset', { className: 'methods', ariaLabel: 'Merge method' }, confirm.methods.map(radio))]
+      : lines('quiet', confirm.methods.map(({ label }) => label));
+    const warning = confirm.warning ? [el('p', { className: 'warning' }, [icon('warn'), confirm.warning])] : [];
+    const buttons = [
+      button(card, 'confirm-merge', 'Confirm merge', () => act(url, 'merge', { method: confirm.method }), { className: 'button primary', disabled: !confirm.enabled }),
+      button(card, 'cancel', 'Cancel', () => change(url, view.cancelMerge, 'merge')),
+    ];
+    const step = el('div', { className: 'confirm', role: 'group', ariaLabel: 'Confirm merge', tabIndex: -1 }, [...methods, ...warning, el('div', { className: 'buttons' }, buttons)]);
+    return control(card, 'confirm', step);
+  }
+
+  /** The buttons the server allows, why Merge is off, and the link out, which every card has. */
+  function actionRow(card, model) {
+    const { url } = card;
+    const reason = `reason-${card.number}`;
+    const buttons = model.actions.flatMap(({ action, label, enabled }) => {
+      if (action !== 'merge') return [button(card, action, label, () => act(url, action), { disabled: !enabled })];
+      // The first click only opens the confirm step, which takes the keyboard focus.
+      const merge = button(card, action, label, () => change(url, view.startMerge, 'confirm'), { className: 'button primary', disabled: !enabled });
+      if (!model.reason) return [merge];
+      merge.setAttribute('aria-describedby', reason);
+      return [merge, el('span', { className: 'reason', id: reason, textContent: model.reason })];
+    });
+    return el('div', { className: 'actions' }, [...buttons, button(card, 'open', 'Open on GitHub', () => openLink(url), { className: 'link' })]);
+  }
+
   /** A card's elements from its view model. */
   function parts(card, model) {
+    const { url } = card;
+    const dismiss = button(card, 'dismiss', '×', () => act(url, 'dismiss'), { className: 'close', ariaLabel: 'Remove from this tab', disabled: model.locked });
     const pill = model.pill ? [el('span', { className: `pill ${model.pill.kind}`, textContent: model.pill.text })] : [];
     const meta = model.meta.map(({ kind, text }) => el('span', { className: kind, textContent: text }));
     return [
-      el('div', { className: 'head' }, [el('span', { className: 'repo', textContent: model.heading }), ...pill]),
+      el('div', { className: 'head' }, [el('span', { className: 'repo', textContent: model.heading }), ...pill, dismiss]),
       // A long title is clamped; the tooltip keeps the full text.
       model.title && el('h2', { className: 'title', textContent: model.title, title: model.title }),
       model.note && el('p', { className: `note ${model.kind}` }, model.kind === 'error' ? [icon('bad'), model.note] : [model.note]),
       meta.length > 0 && el('div', { className: 'meta' }, meta),
       model.status && statusList(card, model.status),
+      model.confirm && confirmStep(card, model.confirm),
+      actionRow(card, model),
     ].filter(Boolean);
   }
 
@@ -105,6 +164,7 @@
       card.controls.clear();
       card.node.className = `card ${model.kind}`;
       card.body.replaceChildren(...parts(card, model));
+      card.problem.show(model.error);
       card.json = json;
       const target = card.controls.get(card.focus ?? focused);
       if (target && !target.disabled) target.focus({ preventScroll: true });
@@ -143,6 +203,40 @@
     states.set(url, update(states.get(url)));
     cards.get(url).focus = focus;
     render();
+  }
+
+  /** Asks the bridge for one action. Resolves to null when it went through, else to the line to show. */
+  function post(body) {
+    return fetch(`/pr/act?t=${encodeURIComponent(token)}`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) })
+      .then((response) => (response.ok ? response.json() : null))
+      .catch(() => null)
+      .then(view.replyError);
+  }
+
+  /** Runs an action on a pull request; its card is locked until the answer is back. */
+  function act(url, action, extras = {}) {
+    change(url, (state) => view.began(state, action));
+    post(view.actBody(session, action, { url, ...extras })).then((error) => change(url, (state) => view.ended(state, error)));
+  }
+
+  /** Outside links open in the Mac's default browser, through the bridge: this tab never leaves the page. */
+  function openLink(url, target) {
+    post(view.actBody(session, 'open', { url, target })).then((error) => change(url, (state) => view.opened(state, error)));
+  }
+
+  function refreshAll() {
+    // The button stays focusable while the request is out, so it is switched off by hand.
+    if (refreshing) return;
+    const set = (on) => {
+      refreshing = on;
+      refresh.ariaDisabled = String(on);
+      setText(refresh, on ? 'Refreshing…' : 'Refresh');
+    };
+    set(true);
+    post(view.actBody(session, 'refresh')).then((error) => {
+      set(false);
+      trouble.show(error);
+    });
   }
 
   const source = new EventSource(`/pr/events?session=${encodeURIComponent(session)}&t=${encodeURIComponent(token)}`);

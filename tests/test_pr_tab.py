@@ -1852,10 +1852,13 @@ def test_pr_alone_finds_the_pull_request_of_the_folders_branch_for_an_empty_tab(
     gh.put(branches={"my-project": mine})
 
     async def scenario():
-        # A folder whose branch has none: silently nothing.
+        # A folder whose branch has none says so, in gh's words.
         pulls.show("quiet-chat", [], bare)
         await settled(pulls)
-        assert pulls.snapshot("quiet-chat") == {"pulls": [], "notice": None}
+        assert pulls.snapshot("quiet-chat") == {
+            "pulls": [],
+            "notice": "No pull request found for no-pull-request: no pull requests found",
+        }
         assert gh.runs() == [["pr", "view", "--json", "url"]]
         assert Path(gh.calls()[0]["cwd"]) == bare.resolve()
 
@@ -1872,6 +1875,94 @@ def test_pr_alone_finds_the_pull_request_of_the_folders_branch_for_an_empty_tab(
         pulls.show("chat", [], folder)
         await settled(pulls)
         assert urls(pulls) == [mine] and len(gh.calls()) == 3
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize(
+    ("written_by_gh", "why"),
+    [
+        (
+            "failed to run git: fatal: not a git repository (or any of the parent directories)\n",
+            "failed to run git: fatal: not a git repository (or any of the parent directories)",
+        ),
+        (
+            "To get started with GitHub CLI, please run:  gh auth login\nOr set GH_TOKEN",
+            "To get started with GitHub CLI, please run:  gh auth login",
+        ),
+        ('no pull requests found for branch "main"', 'no pull requests found for branch "main"'),
+        ("  \n" + "e" * 300, "e" * 200),
+        ("", "gh ended with code 1"),
+    ],
+)
+def test_pr_alone_says_why_gh_found_no_pull_request_for_the_folder(
+    gh, pulls, tmp_path, unwatched, written_by_gh, why
+):
+    folder = tmp_path / "my-project"
+    folder.mkdir()
+    gh.put(fails={"pr view": written_by_gh})
+
+    async def scenario():
+        with pulls.listen("chat") as page:
+            pulls.show("chat", [], folder)
+            assert page.get_nowait() is True and page.empty()
+            await settled(pulls)
+            assert pulls.snapshot("chat") == {
+                "pulls": [],
+                "notice": f"No pull request found for my-project: {why}",
+            }
+            # The open page is told.
+            assert page.get_nowait() is True and page.empty()
+            assert gh.runs() == [["pr", "view", "--json", "url"]]
+            # A number that gh does not find keeps its own words.
+            pulls.show("chat", ["12"], folder)
+            await settled(pulls)
+            assert pulls.snapshot("chat")["notice"] == "No pull request #12 in my-project"
+
+    asyncio.run(scenario())
+
+
+def test_pr_alone_says_when_gh_answers_with_no_pull_request(gh, pulls, tmp_path):
+    folder = tmp_path / "my-project"
+    folder.mkdir()
+    odd = gh.pull(596, url="https://github.com/acme/app/issues/596")
+    gh.put(branches={"my-project": odd})
+
+    async def scenario():
+        pulls.show("chat", [], folder)
+        await settled(pulls)
+        assert pulls.snapshot("chat") == {
+            "pulls": [],
+            "notice": "No pull request found for my-project: "
+            "gh printed something that is not a pull request",
+        }
+
+    asyncio.run(scenario())
+
+
+def test_pr_leaves_a_missing_gh_its_own_notice(gh, pulls, tmp_path, monkeypatch, unwatched):
+    folder = tmp_path / "my-project"
+    folder.mkdir()
+    url = gh.pull(596)
+    found = os.environ["PATH"]
+    monkeypatch.setenv("PATH", str(tmp_path))
+
+    async def scenario():
+        with pulls.listen("chat") as page:
+            for words in ([], ["12"]):
+                while not page.empty():
+                    page.get_nowait()
+                pulls.show("chat", words, folder)
+                assert page.get_nowait() is True and page.empty()
+                await settled(pulls)
+                assert pulls.snapshot("chat")["notice"] == "GitHub CLI (gh) was not found"
+                # The open page is told that gh is missing.
+                assert page.get_nowait() is True and page.empty()
+            # Once gh is found, nothing is left that blames the folder or the number.
+            monkeypatch.setenv("PATH", found)
+            pulls.said("other-chat", url)
+            assert (await looked(pulls, url, "other-chat"))["title"] == "Add the thing"
+            assert pulls.snapshot("chat") == {"pulls": [], "notice": None}
 
     asyncio.run(scenario())
 

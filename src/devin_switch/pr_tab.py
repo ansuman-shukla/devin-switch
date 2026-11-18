@@ -573,15 +573,27 @@ class Pulls:
         self.tell(tab)
 
     async def find(self, tab: Tab, numbers: list[str], folder: Path) -> None:
-        """Add a folder's pull requests by number, or without one its current branch's."""
+        """Add a folder's pull requests by number, or without one its current branch's.
+
+        What was not found is said on the tab: for the branch in gh's own words, which tell
+        a branch without a pull request from a folder that is no repository or a lost login.
+        """
         for number in numbers or [None]:
             target = [number] if number else []
-            seen = answer(await self.gh("pr", "view", *target, "--json", "url", folder=folder))
+            ran = await self.gh("pr", "view", *target, "--json", "url", folder=folder)
+            seen = answer(ran)
             if found := links(word(seen.get("url")) if seen else "", ended=True)[0]:
                 self.keep(tab, found, asked=True)
-            elif number:
-                tab.notice = f"No pull request #{number} in {folder.name}"
-                self.tell(tab)
+                continue
+            if number:
+                missed = f"No pull request #{number} in {folder.name}"
+            else:
+                why = trouble(ran) if ran.code else UNREADABLE
+                missed = f"No pull request found for {folder.name}: {why}"
+            # A gh that is missing has its own notice, which goes once gh is found.
+            if not self.missing:
+                tab.notice = missed
+            self.tell(tab)
 
     async def act(self, request: dict) -> dict | None:
         """Do what a page's button asks for: ok, or why not (None: the chat has no tab)."""

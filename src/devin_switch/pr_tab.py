@@ -428,9 +428,10 @@ class Tab:
 class Pulls:
     """Each chat's pull requests, and the pages watching them."""
 
-    def __init__(self, store: Store, browse: Callable[[str], bool] = webbrowser.open) -> None:
+    def __init__(self, store: Store, browse: Callable[[str], bool] | None = None) -> None:
         self.store = store
-        self.browse = browse
+        # What opens a link in the user's own browser.
+        self.browse = browse or webbrowser.open
         self.tabs: dict[str, Tab] = {}
         self.tasks: set[asyncio.Task] = set()
         # Whether gh was missing the last time it was needed.
@@ -580,6 +581,7 @@ class Pulls:
         if action == "refresh":
             tab.notice = None
             await self.refresh(tab, list(tab.pulls.values()))
+            self.tell(tab)
             return OK
         key = url.lower() if isinstance(url, str) else None
         if key not in tab.pulls:

@@ -208,6 +208,8 @@ def gh(tmp_path, monkeypatch):
     monkeypatch.setenv("PATH", f"{script.parent}{os.pathsep}{os.environ['PATH']}")
     monkeypatch.setenv("FAKE_GH_HOME", str(home))
     monkeypatch.setattr(pr_tab, "FALLBACKS", ())
+    # And never a real browser window: a test that opens a link brings its own opener.
+    monkeypatch.setattr(pr_tab.webbrowser, "open", lambda target: pytest.fail(f"opened {target}"))
     return Gh(home)
 
 
@@ -1530,7 +1532,7 @@ def test_an_action_that_is_given_up_leaves_the_pull_request_free(gh, pulls, tmp_
     asyncio.run(scenario())
 
 
-def test_open_shows_a_pull_request_or_one_of_its_checks_in_the_browser(gh, pulls):
+def test_open_shows_a_pull_request_or_one_of_its_checks_in_the_browser(gh, store, monkeypatch):
     odd = commit_status("local", "FAILURE") | {"targetUrl": "file:///etc/passwd"}
     rollup = [check_run("unit", run=8001), commit_status("ci/x", "PENDING"), odd]
     url, other = gh.pull(596, statusCheckRollup=rollup), gh.pull(7)
@@ -1540,7 +1542,11 @@ def test_open_shows_a_pull_request_or_one_of_its_checks_in_the_browser(gh, pulls
         opened.append(target)
         return works
 
-    pulls.browse = browse
+    # The system's own opener, unless another is given.
+    monkeypatch.setattr(pr_tab.webbrowser, "open", browse)
+    pulls = pr_tab.Pulls(store)
+    given = pr_tab.Pulls(store, opened.append)
+    assert given.browse == opened.append and pulls.browse is browse
 
     async def scenario():
         nonlocal works
@@ -1678,6 +1684,10 @@ def test_pr_says_which_number_or_word_it_could_not_use(gh, pulls, tmp_path, unwa
                 "pulls": [],
                 "notice": "No pull request #77 in my-project",
             }
+            # A refresh clears it, and says so even with nothing to look up.
+            assert await ask(pulls, "refresh") == {"ok": True}
+            assert page.get_nowait() is True and page.empty()
+            assert pulls.snapshot("chat") == {"pulls": [], "notice": None}
             pulls.show("chat", ["77", "12"], folder)
             await settled(pulls)
             assert pulls.snapshot("chat")["notice"] == "No pull request #77 in my-project"

@@ -10,6 +10,7 @@ pull request is decided here, never in the page. Everything is kept in memory on
 """
 
 import asyncio
+import html
 import json
 import os
 import re
@@ -26,6 +27,8 @@ from urllib.parse import quote
 from devin_switch import native, subagent_tab
 from devin_switch.store import Store
 
+PAGE = Path(__file__).parent / "pr_page"
+ASSETS = {"pr.css": "text/css", "pr-view.js": "text/javascript", "pr.js": "text/javascript"}
 # Only a pull request itself: not an issue, the list of pulls or a file. A number followed by
 # a letter or by more digits than GitHub numbers have is not one.
 LINK = re.compile(
@@ -717,3 +720,17 @@ class Pulls:
         for task in running:
             task.cancel()
         await asyncio.gather(*running, return_exceptions=True)
+
+
+def page(session_id: str, token: str) -> str:
+    """The page shell: its scripts read the chat and token from <body>."""
+    token = html.escape(token)
+    files = {name: f"/pr/assets/{name}?t={token}" for name in ASSETS}
+    return (
+        '<!doctype html><html><head><meta charset="utf-8"><title>Pull requests</title>'
+        '<meta name="viewport" content="width=device-width, initial-scale=1">'
+        f'<link rel="stylesheet" href="{files["pr.css"]}"></head>'
+        f'<body data-session="{html.escape(session_id)}" data-token="{token}">'
+        f'<script src="{files["pr-view.js"]}"></script><script src="{files["pr.js"]}"></script>'
+        "</body></html>"
+    )

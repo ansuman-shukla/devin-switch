@@ -1,14 +1,19 @@
 import asyncio
 import json
 import os
+import re
 import sys
 import time
 from pathlib import Path
+from urllib.parse import quote
 
 import pytest
-from test_acp import until
+from test_acp import acp_native as acp_native  # noqa: F401 (a fixture)
+from test_acp import in_process, until
+from test_side import fetch, lines, request
+from test_subagent_tab import get
 
-from devin_switch import pr_tab
+from devin_switch import pr_tab, side
 
 STREAM = "cognition.ai/streamingMessageId"
 CONTEXT = "cognition.ai/subagent_context"
@@ -1415,9 +1420,9 @@ def test_an_action_needs_a_pull_request_of_its_own_chat(gh, pulls):
         # A chat without a tab has nothing to act on, and a request must say what it wants.
         assert await ask(pulls, "ready", theirs, "no-such-chat") is None
         assert await ask(pulls, "refresh", session_id="no-such-chat") is None
-        for request in ({"session": 5, "action": "refresh"}, {"session": "chat"}, {}):
+        for unclear in ({"session": 5, "action": "refresh"}, {"session": "chat"}, {}):
             with pytest.raises(ValueError):
-                await pulls.act(request)
+                await pulls.act(unclear)
         with pytest.raises(ValueError):
             await pulls.act({"session": "chat", "action": ["refresh"]})
 
@@ -1684,5 +1689,176 @@ def test_closing_stops_what_a_pr_command_left_running(gh, pulls, tmp_path):
         (finding,) = pulls.tasks
         await pulls.close()
         assert finding.cancelled() and gone(gh.calls()[0]["pid"])
+
+    asyncio.run(scenario())
+
+
+def test_the_page_shell_names_its_chat_token_and_files():
+    shell = pr_tab.page('chat-1<"&>', 'tok<en>&"x')
+    token = "tok&lt;en&gt;&amp;&quot;x"
+    assert "<title>Pull requests</title>" in shell
+    assert f'<body data-session="chat-1&lt;&quot;&amp;&gt;" data-token="{token}">' in shell
+    assert re.findall(r'<link rel="stylesheet" href="([^"]*)">', shell) == [
+        f"/pr/assets/pr.css?t={token}"
+    ]
+    # The view comes first: the page's own script draws with it.
+    assert re.findall(r'<script src="([^"]*)"></script>', shell) == [
+        f"/pr/assets/pr-view.js?t={token}",
+        f"/pr/assets/pr.js?t={token}",
+    ]
+    assert shell.count("<script") == 2 and shell.endswith("</script></body></html>")
+    assert shell.startswith("<!doctype html>")
+    assert 'tok<en>&"x' not in shell and 'chat-1<"&>' not in shell
+
+
+def events_url(server, session_id):
+    return f"/pr/events?session={quote(session_id, safe='')}&t={server.token}"
+
+
+async def post(server, body, token=None, host=None):
+    """Status and answer of an action a page asks for."""
+    target = f"/pr/act?t={server.token if token is None else token}"
+    status, answer = await fetch(server.port, "POST", target, body, host)
+    return status, json.loads(answer) if answer.startswith("{") else answer
+
+
+def test_the_pull_requests_page_needs_its_token_and_a_loopback_host(
+    gh, acp_native, tmp_path, monkeypatch
+):
+    # The real page files are not this test's business: serve stand-ins.
+    folder = tmp_path / "page"
+    folder.mkdir()
+    kinds = {"pr.css": "text/css", "pr-view.js": "text/javascript", "pr.js": "text/javascript"}
+    for name in (*kinds, "notes.js"):
+        (folder / name).write_text(f"/* stand-in {name} */")
+    (tmp_path / "outside.js").write_text("/* outside */")
+    monkeypatch.setattr(pr_tab, "PAGE", folder)
+    url = gh.pull(596, isDraft=True)
+
+    async def scenario():
+        async with in_process(acp_native) as (bridge, _):
+            server = bridge.side_server
+            port, token = server.port, server.token
+            page = server.path('chat-1<"&>', "pr")
+            assert page == f"/pr/chat-1%3C%22%26%3E?t={token}"
+            bridge.pulls.said("c", url)
+            ready = {"session": "c", "url": url, "action": "ready"}
+            for route in (page, f"/pr/assets/pr.js?t={token}", events_url(server, "c")):
+                assert (await get(port, route.replace(token, "wrong")))[0] == 403
+                assert (await get(port, route.replace(f"t={token}", "")))[0] == 403
+                assert (await get(port, route, host="evil.example"))[0] == 403
+            assert (await post(server, ready, token="wrong"))[0] == 403
+            assert (await post(server, ready, token=""))[0] == 403
+            assert (await post(server, ready, host="evil.example"))[0] == 403
+            assert (await fetch(port, "POST", "/pr/act", ready))[0] == 403
+            # Nothing was connected, looked up or done for any of those.
+            assert not bridge.pulls.showing("c") and gh.calls() == []
+
+            for host in (None, f"localhost:{port}"):
+                status, headers, shell = await get(port, page, host)
+                assert status == 200 and headers["Content-Type"].startswith("text/html")
+                assert shell == pr_tab.page('chat-1<"&>', token)
+                # Every file the shell names is one this server serves.
+                files = re.findall(r'(?:src|href)="([^"]*)"', shell)
+                assert len(files) == 3
+                for source in files:
+                    assert (await get(port, source, host))[0] == 200
+            for name, kind in kinds.items():
+                status, headers, body = await get(port, f"/pr/assets/{name}?t={token}")
+                assert (status, body) == (200, f"/* stand-in {name} */")
+                assert headers["Content-Type"] == f"{kind}; charset=utf-8"
+            # Only the page's three files, whatever else its folder (or another page) holds.
+            for name in ("notes.js", "../outside.js", "side.js", "subagents.js", "", "pr.js/x"):
+                assert (await get(port, f"/pr/assets/{name}?t={token}"))[0] == 404
+            assert (await get(port, f"/side/assets/pr.js?t={token}"))[0] == 404
+            assert (await get(port, f"/subagents/assets/pr.js?t={token}"))[0] == 404
+            assert (await fetch(port, "POST", page, ready))[0] == 404
+
+    asyncio.run(scenario())
+
+
+def test_the_pull_requests_page_streams_a_chats_pull_requests_as_they_change(gh, acp_native):
+    first, second = gh.pull(596), gh.pull(7, behind=1)
+
+    async def scenario():
+        async with in_process(acp_native) as (bridge, _):
+            pulls, server = bridge.pulls, bridge.side_server
+            pulls.said("chat", first)
+            assert not pulls.showing("chat")
+            status, reader, writer = await request(server.port, "GET", events_url(server, "chat"))
+            assert status == 200
+            _, idle, _ = await request(server.port, "GET", events_url(server, "another-chat"))
+            # The pull requests as they are right after connecting, then as gh describes them.
+            (connected,) = await lines(reader, 1)
+            assert connected == {"pulls": [waiting(596)], "notice": None}
+            assert await lines(idle, 1) == [{"pulls": [], "notice": None}]
+            assert pulls.showing("chat")
+            (looked_up,) = await lines(reader, 1)
+            assert looked_up == pulls.snapshot("chat")
+            (shown_row,) = looked_up["pulls"]
+            assert (shown_row["loading"], shown_row["title"]) == (False, "Add the thing")
+            assert shown_row["can"]["merge"] is True
+
+            # A link the chat says next shows up at once, and is then looked up.
+            pulls.feed("chat", said(f"and {second} too"))
+            (added,) = await lines(reader, 1)
+            assert added["pulls"] == [shown_row, waiting(7)]
+            async with asyncio.timeout(10):
+                while (latest := (await lines(reader, 1))[0])["pulls"][1]["loading"]:
+                    pass
+            assert latest["pulls"][1]["why"] == {"merge": "1 commit behind main"}
+
+            # Closing the tab is noticed at once, well before the keepalive.
+            writer.close()
+            await until(lambda: not pulls.showing("chat"), side.KEEPALIVE / 3)
+            assert pulls.showing("another-chat")
+            # A closing bridge ends the streams still open.
+            await server.close()
+            await asyncio.wait_for(idle.read(), 5)
+            assert not pulls.showing("another-chat")
+
+    asyncio.run(scenario())
+
+
+def test_the_pull_requests_page_runs_the_actions_its_buttons_ask_for(gh, acp_native):
+    url = gh.pull(596, isDraft=True)
+
+    async def scenario():
+        async with in_process(acp_native) as (bridge, _):
+            pulls, server = bridge.pulls, bridge.side_server
+            pulls.said("chat", url)
+            status, reader, writer = await request(server.port, "GET", events_url(server, "chat"))
+            async with asyncio.timeout(10):
+                while (await lines(reader, 1))[0]["pulls"][0]["loading"]:
+                    pass
+
+            ready = {"session": "chat", "url": url, "action": "ready"}
+            assert await post(server, ready) == (200, {"ok": True})
+            assert acted(gh) == [["pr", "ready", url]]
+            # The open page is shown the action running, then what GitHub made of it.
+            async with asyncio.timeout(10):
+                while (latest := (await lines(reader, 1))[0]["pulls"][0])["draft"]:
+                    assert latest["busy"] in ("ready", None)
+            # What may not be done is refused in the answer, not as a failed request.
+            assert await post(server, ready) == (200, {"error": "Already ready for review"})
+            merge = {**ready, "action": "merge", "method": "rebase"}
+            assert await post(server, merge) == (
+                200,
+                {"error": "This repository does not allow that merge method"},
+            )
+            assert await post(server, {**merge, "method": "squash"}) == (200, {"ok": True})
+            assert acted(gh)[1:] == [
+                ["pr", "merge", url, "--squash", "--subject", "Add the thing"]
+                + ["--match-head-commit", OID]
+            ]
+            assert row(pulls, url)["state"] == "merged"
+
+            # A chat without a tab, and a request that does not say what it wants.
+            assert (await post(server, {**ready, "session": "no-such-chat"}))[0] == 404
+            for body in ([], "ready", {"session": "chat"}, {"action": "ready"}, None):
+                assert (await post(server, body))[0] == 400
+            status, _ = await fetch(server.port, "GET", f"/pr/act?t={server.token}")
+            assert status == 200 and len(acted(gh)) == 2
+            writer.close()
 
     asyncio.run(scenario())

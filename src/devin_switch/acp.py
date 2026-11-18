@@ -13,6 +13,7 @@ from devin_switch import (
     acp_state,
     agent_browser,
     handoff,
+    pr_tab,
     relay,
     sessions,
     side,
@@ -755,6 +756,7 @@ class Bridge:
         self.side_server = None
         self.side_sinks = {}
         self.roster = subagent_tab.Roster()
+        self.pulls = pr_tab.Pulls(native.store)
         # Whether Desktop itself asked for the native's revert notices.
         self.reverts = False
 

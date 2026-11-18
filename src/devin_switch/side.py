@@ -13,7 +13,8 @@ cloud access link, which a local chat never gets. Nor would an editor panel: Des
 the agents view to IDE mode for any editor tab.
 
 The same server, port and token serve the chat's Subagents page (`subagent_tab.py`) under
-`/subagents/`, opened by `/subagents` the same way.
+`/subagents/` and its pull requests page (`pr_tab.py`) under `/pr/`, opened by `/subagents`
+and `/pr` the same way.
 """
 
 import asyncio
@@ -25,7 +26,7 @@ from contextlib import suppress
 from pathlib import Path
 from urllib.parse import parse_qs, quote, unquote, urlsplit
 
-from devin_switch import subagent_tab
+from devin_switch import pr_tab, subagent_tab
 from devin_switch.store import SwitchError
 
 CHAIN = "cognition.ai/chain"
@@ -93,7 +94,10 @@ def btw_question(text: str) -> str | None:
 
 
 class Server:
-    """Each chat's side and Subagents pages, for Desktop's preview: loopback HTTP behind a token."""
+    """Each chat's side, Subagents and pull requests pages, for Desktop's preview.
+
+    Loopback HTTP behind a token.
+    """
 
     def __init__(self, bridge):
         self.bridge = bridge
@@ -118,6 +122,7 @@ class Server:
             for queue in queues:
                 queue.put_nowait(None)
         self.bridge.roster.close()
+        await self.bridge.pulls.close()
 
     def path(self, session_id: str, page: str = "side") -> str:
         return f"/{page}/{quote(session_id, safe='')}?t={self.token}"
@@ -125,7 +130,7 @@ class Server:
     def opened(self, session_id: str, page: str = "side") -> dict:
         """The notice that makes Desktop open one of the chat's pages as a new Browser tab of it.
 
-        `page` is "side" or "subagents".
+        `page` is "side", "subagents" or "pr".
         """
         url = f"http://127.0.0.1:{self.port}{self.path(session_id, page)}"
         return {"method": OPENED, "params": {"sessionId": session_id, "previewUrl": url}}
@@ -177,6 +182,19 @@ class Server:
             if method == "GET" and route.startswith("/subagents/") and route.count("/") == 2:
                 shell = subagent_tab.page(unquote(route.removeprefix("/subagents/")), self.token)
                 return await respond(writer, 200, shell, "text/html")
+            if method == "GET" and route.startswith("/pr/assets/"):
+                name = route.removeprefix("/pr/assets/")
+                return await asset(writer, pr_tab.PAGE, pr_tab.ASSETS, name)
+            if method == "GET" and route == "/pr/events":
+                return await self.pull_events(reader, writer, query.get("session", ""))
+            if method == "POST" and route == "/pr/act":
+                done = await self.bridge.pulls.act(json.loads(body))
+                if done is None:
+                    return await respond(writer, 404, "Not found")
+                return await respond(writer, 200, json.dumps(done), "application/json")
+            if method == "GET" and route.startswith("/pr/") and route.count("/") == 2:
+                shell = pr_tab.page(unquote(route.removeprefix("/pr/")), self.token)
+                return await respond(writer, 200, shell, "text/html")
             await respond(writer, 404, "Not found")
         except (ValueError, AttributeError, OSError, asyncio.IncompleteReadError):
             with suppress(OSError):
@@ -221,6 +239,14 @@ class Server:
         roster = self.bridge.roster
         with roster.listen(session_id) as queue:
             await stream(reader, writer, queue, lambda _: roster.snapshot(session_id))
+
+    async def pull_events(
+        self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter, session_id: str
+    ) -> None:
+        """Server-sent snapshots of one chat's pull requests: on connecting, then on each change."""
+        pulls = self.bridge.pulls
+        with pulls.listen(session_id) as queue:
+            await stream(reader, writer, queue, lambda _: pulls.snapshot(session_id))
 
     async def answer(
         self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter, request: dict

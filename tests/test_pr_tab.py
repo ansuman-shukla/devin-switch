@@ -2501,12 +2501,16 @@ def test_links_a_chat_shows_reach_its_open_tab(gh, acp_native, tmp_path, monkeyp
             _, reader, stream = await request(address.port, "GET", events)
 
             running = asyncio.create_task(client.prompt(session_id, "say"))
-            seen = await streamed(reader, lambda shown: len(shown["pulls"]) == 4)
-            assert listed(seen[-1]) == [link(9), link(123), link(77), link(55)]
-            # The turn is still open, so the link its last message ends with is not counted yet.
-            await asyncio.sleep(0.3)
-            assert not running.done()
-            gate.touch()
+            try:
+                seen = await streamed(reader, lambda shown: len(shown["pulls"]) == 4)
+                assert listed(seen[-1]) == [link(9), link(123), link(77), link(55)]
+                # The turn is still open, so the link its last message ends with is not
+                # counted yet.
+                await asyncio.sleep(0.3)
+                assert not running.done()
+            finally:
+                # Also when this test fails: the stand-in agent must not wait on for good.
+                gate.touch()
             assert (await running)["result"] == {"stopReason": "end_turn"}
             seen += await streamed(reader, lambda shown: len(shown["pulls"]) == 5)
             assert listed(seen[-1]) == [link(9), link(123), link(77), link(55), link(45)]

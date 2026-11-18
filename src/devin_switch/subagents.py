@@ -25,6 +25,8 @@ from devin_switch.store import Store, SwitchError, private_directory, write_json
 
 STARTED = "cognition.ai/subagent_started"
 COMPLETED = "cognition.ai/subagent_completed"
+PAUSED = "cognition.ai/subagent_paused"
+CONTEXT = "cognition.ai/subagent_context"
 QUOTA_FAILURE = re.compile(r"usage quota has been exhausted|quota exhausted", re.IGNORECASE)
 TASK_LIMIT = 4000
 PROGRESS_LIMIT = 2000
@@ -272,3 +274,9 @@ def resume_text(store: Store, session_id: str, agents: dict) -> str:
             done = ""
         lines.append(f"Last saved progress:\n{done or '(none saved)'}")
     return "\n".join(lines)
+
+
+def named(event: object) -> str | None:
+    """The subagent an event is about, when it names one."""
+    agent = event.get("agentId") if isinstance(event, dict) else None
+    return agent if isinstance(agent, str) and agent else None

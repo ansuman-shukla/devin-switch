@@ -17,10 +17,8 @@ from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
 
-from devin_switch.subagents import COMPLETED, STARTED
+from devin_switch.subagents import COMPLETED, CONTEXT, PAUSED, STARTED, named
 
-PAUSED = "cognition.ai/subagent_paused"
-CONTEXT = "cognition.ai/subagent_context"
 STREAM = "cognition.ai/streamingMessageId"
 PAGE = Path(__file__).parent / "subagent_page"
 ASSETS = {
@@ -37,12 +35,6 @@ TEXT_LIMIT = 200
 REPLY_LIMIT = 50_000
 REPLY_PAUSE = 1
 SHOWN = ("id", "title", "profile", "background", "status", "started", "ended", "step", "note")
-
-
-def named(event: object) -> str | None:
-    """The subagent an event is about, when it names one."""
-    agent = event.get("agentId") if isinstance(event, dict) else None
-    return agent if isinstance(agent, str) and agent else None
 
 
 def author(update: object) -> str | None:

@@ -43,11 +43,10 @@
     el('main', { className: 'content' }, [el('div', { className: 'column' }, [trouble.node, empty, list])]),
   );
 
-  /** An error line that stays in the page across redraws, so a screen reader hears its text change. */
-  function newProblem(hide) {
-    const text = el('span', { className: 'problem-text', ariaLive: 'polite' });
-    const close = el('button', { type: 'button', className: 'close', textContent: '×', ariaLabel: 'Hide this error', onclick: hide });
-    const node = el('div', { className: 'problem', hidden: true }, [icon('bad'), text, close]);
+  /** A line that stays in the page across redraws, so a screen reader hears its text change. Empty, it is hidden. */
+  function newLine(className, tone, extras = []) {
+    const text = el('span', { className: `${className}-text`, ariaLive: 'polite' });
+    const node = el('div', { className, hidden: true }, [icon(tone), text, ...extras]);
     return {
       node,
       show(message) {
@@ -57,12 +56,19 @@
     };
   }
 
+  /** The error of an action, until the reader hides it. */
+  function newProblem(hide) {
+    return newLine('problem', 'bad', [el('button', { type: 'button', className: 'close', textContent: '×', ariaLabel: 'Hide this error', onclick: hide })]);
+  }
+
   function newCard(url) {
     const card = { url, number: ++numbered, json: '', controls: new Map(), focus: null };
     card.body = el('div', { className: 'card-body' });
+    // A refresh that failed is told apart from an action that failed: it goes away with the next good snapshot.
+    card.stale = newLine('stale', 'warn');
     card.problem = newProblem(() => change(url, view.hideError));
     // The card takes the keyboard focus when the control that had it is gone or switched off.
-    card.node = el('li', { className: 'card', tabIndex: -1 }, [card.body, card.problem.node]);
+    card.node = el('li', { className: 'card', tabIndex: -1 }, [card.body, card.stale.node, card.problem.node]);
     cards.set(url, card);
     return card;
   }
@@ -170,6 +176,7 @@
       card.controls.clear();
       card.node.className = `card ${model.kind}`;
       card.body.replaceChildren(...parts(card, model));
+      card.stale.show(model.stale);
       card.problem.show(model.error);
       card.json = json;
       const target = card.controls.get(card.focus ?? focused);

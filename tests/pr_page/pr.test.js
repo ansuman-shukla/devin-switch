@@ -98,6 +98,57 @@ test('loading, failed, merged and closed cards show their heading, the link out 
   }
 });
 
+test('a refresh that failed keeps the card whole and says so until the next good snapshot', async () => {
+  const fine = pull({ can: ALL, checks: checks('pass', 'pass') });
+  const failed = { ...fine, error: 'gh: connection <timed out>' };
+  const page = pageWith(fine);
+  const card = page.one('card');
+  assert.equal(page.all('stale').length, 0);
+  // What the reader did before the refresh failed: the check list opened, the confirm step on another method.
+  page.control('checks').click();
+  page.control('merge').click();
+  page.control('method-rebase').click();
+  const before = page.text(page.one('card-body', card));
+
+  page.send(snapshot(failed));
+  const stale = page.one('stale', card);
+  assert.deepEqual(stale.children.map((node) => node.textContent), ['!', "Couldn't refresh: gh: connection <timed out>"]);
+  assert.equal(page.one('icon', stale).ariaHidden, 'true');
+  assert.equal(page.one('stale-text', stale).ariaLive, 'polite');
+  assert.equal(page.text(page.one('card-body', card)), before, 'the card itself reads as before');
+  assert.equal(card.className, 'card open');
+  assert.equal(page.all('note', card).length + page.all('problem', card).length, 0, 'neither the error card nor the line of a failed action');
+  assert.deepEqual(page.one('methods', card).children.map((label) => label.children[0].checked), [false, false, true]);
+  assert.equal(page.all('check', card).length, 2);
+  assert.equal(focusedKey(page), 'method-rebase', 'the keyboard focus stays where it was');
+
+  // The buttons still work: the server decides on the click, and its answer is a line of its own.
+  page.control('confirm-merge').click();
+  assert.deepEqual(bodies(page), [{ session: 'chat 1', url: URL, action: 'merge', method: 'rebase' }]);
+  await page.answer({ error: 'Merge failed' });
+  assert.equal(page.text(page.one('problem-text', card)), 'Merge failed');
+  same(page.one('stale', card), stale, 'the same element, so a screen reader hears only changes');
+
+  page.send(snapshot(fine));
+  assert.equal(page.all('stale').length, 0, 'it goes away by itself');
+  assert.equal(page.text(page.one('problem-text', card)), 'Merge failed', 'the line of the action stays until it is hidden');
+  assert.deepEqual(buttons(page).map(([label]) => label), ['Merge', 'Update branch', 'Mark ready', 'Convert to draft', 'Re-run failed checks']);
+});
+
+test('a failed refresh shows on merged cards too, and never on a card that has nothing else to show', () => {
+  const page = pageWith(
+    pull({ state: 'merged', error: 'gh failed' }),
+    bare({ url: OTHER, number: 3, error: 'gh failed' }),
+    pull({ url: `${URL}4`, number: 4, loading: true, error: 'gh failed' }),
+  );
+  const [merged, unread, loading] = page.all('card');
+  assert.equal(page.text(page.one('card-body', merged)), 'acme/shop #596Merged×Add the cart pagefeat/cart → mainalice+12 −32 filesOpen on GitHub');
+  assert.equal(page.text(page.one('stale', merged)), "!Couldn't refresh: gh failed");
+  assert.equal(page.text(page.one('card-body', unread)), 'acme/shop #3×✕gh failedOpen on GitHub');
+  assert.equal(page.text(page.one('card-body', loading)), 'acme/shop #4×Loading…Open on GitHub');
+  assert.equal(page.all('stale', unread).length + page.all('stale', loading).length, 0);
+});
+
 test('cards follow the order of the snapshot and leave when their pull request does', () => {
   const second = pull({ url: OTHER, repo: 'acme/api', number: 3 });
   const page = pageWith(pull({}), second);

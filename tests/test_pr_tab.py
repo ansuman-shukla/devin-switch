@@ -1160,6 +1160,30 @@ def test_only_pull_requests_that_are_not_settled_are_looked_up_again(gh, pulls, 
     asyncio.run(scenario())
 
 
+def test_a_pull_request_added_while_github_is_slow_is_still_looked_up(gh, pulls, monkeypatch):
+    monkeypatch.setattr(pr_tab, "REFRESH", 0.1)
+    slow, added = gh.pull(1), gh.pull(2)
+    look = pulls.look
+
+    async def slowly(tab, pull):
+        if pull.url == slow:
+            # Longer than the pause between two passes: each pass runs straight into the next.
+            await asyncio.sleep(0.4)
+        await look(tab, pull)
+
+    pulls.look = slowly
+
+    async def scenario():
+        pulls.said("chat", slow)
+        with pulls.listen("chat"):
+            await asyncio.sleep(0.1)
+            pulls.said("chat", added)
+            await until(lambda: not row(pulls, added)["loading"], 4)
+            assert row(pulls, added)["title"] == "Add the thing"
+
+    asyncio.run(scenario())
+
+
 def test_an_open_page_keeps_looking_after_its_second_page_leaves(gh, pulls, monkeypatch):
     monkeypatch.setattr(pr_tab, "REFRESH", 0.2)
     url = gh.pull(596)
@@ -1198,7 +1222,7 @@ class Faulty:
         await self.look(tab, pull)
 
 
-def test_a_watcher_that_fails_says_so_and_refresh_starts_it_again(gh, pulls):
+def test_a_watcher_that_fails_says_so_and_refresh_starts_it_again(gh, pulls, caplog):
     url = gh.pull(596)
     faulty = Faulty(pulls)
 
@@ -1236,6 +1260,8 @@ def test_a_watcher_that_fails_says_so_and_refresh_starts_it_again(gh, pulls):
         assert running.cancelled() and pulls.snapshot("chat")["notice"] is None
 
     asyncio.run(scenario())
+    # Neither the failures nor the ending left anything for the event loop to complain about.
+    assert [record.getMessage() for record in caplog.records if record.name == "asyncio"] == []
 
 
 def test_a_watcher_that_fails_later_keeps_what_was_shown(gh, pulls, monkeypatch):

@@ -23,6 +23,8 @@ const buttons = (page, root) => page.seen(root).filter((node) => ACTIONS.include
 const texts = (page, className, root) => page.all(className, root).map((node) => page.text(node));
 const bodies = (page) => page.requests.map(({ body }) => body);
 const focusedKey = (page) => page.document.activeElement.dataset.key;
+/** Whether two elements are one and the same, without printing them when they are not. */
+const same = (actual, expected, message) => assert.ok(actual === expected, message);
 
 test('the page builds itself in the empty body and listens to the stream of its chat', () => {
   const page = openPage({ session: 'chat 1', token: 't&k' });
@@ -100,8 +102,13 @@ test('cards follow the order of the snapshot and leave when their pull request d
   const second = pull({ url: OTHER, repo: 'acme/api', number: 3 });
   const page = pageWith(pull({}), second);
   assert.deepEqual(texts(page, 'repo'), ['acme/shop #596', 'acme/api #3']);
+  // Moving the cards takes them out of the page for a moment; the control that had the focus gets it back.
+  const [, moved] = page.all('card');
+  page.control('open', moved).focus();
   page.send(snapshot(second, pull({})));
   assert.deepEqual(texts(page, 'repo'), ['acme/api #3', 'acme/shop #596']);
+  same(page.all('card')[0], moved, 'the same card, moved up');
+  same(page.document.activeElement, page.control('open', moved), 'the focus moved with it');
   page.send(snapshot(second));
   assert.deepEqual(texts(page, 'repo'), ['acme/api #3']);
   page.send(snapshot());
@@ -190,8 +197,7 @@ test('the confirm step closes when a snapshot says the pull request can no longe
   const reason = page.one('reason');
   assert.equal(page.text(reason), 'Needs 1 approving review');
   assert.equal(page.control('merge').attributes['aria-describedby'], reason.id);
-  assert.equal(focusedKey(page), undefined, 'the focus falls back to the card, not to the top of the page');
-  assert.equal(page.document.activeElement, page.one('card'));
+  same(page.document.activeElement, page.one('card'), 'the focus falls back to the card, not to the top of the page');
   page.control('merge').click();
   assert.equal(page.has('confirm-merge'), false, 'a Merge that is off does nothing');
 
@@ -245,7 +251,7 @@ test('an error answer shows on its card until the next action works or the reade
 
   // It stays over snapshots and while the next try is out, and goes when that one works.
   page.send(snapshot(pull({ can: ALL, title: 'Renamed' }), pull({ url: OTHER, number: 3, can: ALL })));
-  assert.equal(page.one('problem', card), problem, 'the same element, so a screen reader hears only changes');
+  same(page.one('problem', card), problem, 'the same element, so a screen reader hears only changes');
   page.control('update', card).click();
   assert.equal(page.text(page.one('problem-text', card)), 'The branch is <protected>');
   await page.answer({ ok: true });
@@ -329,6 +335,24 @@ test('× asks the bridge to remove the pull request, and a late answer for a car
   assert.equal(page.control('dismiss').disabled, false);
 });
 
+test('a pull request that left the tab and came back starts over', async () => {
+  const page = pageWith(pull({ can: ALL }));
+  page.control('update').click();
+  await page.answer({ error: 'The branch is protected' });
+  page.control('merge').click();
+  page.control('method-rebase').click();
+  assert.equal(page.all('problem').length, 1);
+  assert.equal(page.has('confirm'), true);
+
+  page.send(snapshot());
+  page.send(snapshot(pull({ can: ALL })));
+  assert.equal(page.all('problem').length, 0, 'the old error line does not come back');
+  assert.equal(page.has('confirm'), false);
+  page.control('merge').click();
+  assert.deepEqual(page.one('methods').children.map((label) => label.children[0].checked), [true, false, false], 'nor the old method');
+  assert.equal(page.requests.length, 1);
+});
+
 test('Refresh asks the bridge once at a time and shows a failure under the top bar', async () => {
   const page = pageWith(pull({}));
   const refresh = page.seen(page.one('toolbar')).find((node) => node.tagName === 'button');
@@ -389,30 +413,36 @@ test('a card is drawn again only when it changed, and then the keyboard focus st
   const otherTitle = page.one('title', other);
 
   page.send(snapshot(structuredClone(open), structuredClone(second)));
-  assert.equal(page.one('title', card), title, 'the same snapshot again leaves the elements, and a selection in them, alone');
+  same(page.one('title', card), title, 'the same snapshot again leaves the elements, and a selection in them, alone');
 
   page.control('checks', card).click();
   assert.deepEqual(texts(page, 'check', card), ['✓check-0Passed', '✓check-1Passed']);
   assert.equal(page.control('checks', card).ariaExpanded, 'true');
   assert.equal(focusedKey(page), 'checks');
-  assert.equal(page.one('title', other), otherTitle, 'only the card that changed is drawn again');
-  assert.deepEqual(page.all('card'), [card, other], 'the cards themselves stay');
+  same(page.one('title', other), otherTitle, 'only the card that changed is drawn again');
+  assert.ok(page.all('card').every((node, index) => node === [card, other][index]), 'the cards themselves stay');
 
   // A snapshot that changes the card keeps the list open and the focus on its toggle.
   page.send(snapshot({ ...open, behind: 4 }, second));
-  assert.notEqual(page.one('title', card), title);
+  assert.ok(page.one('title', card) !== title, 'a changed card is drawn again');
   assert.equal(page.text(page.control('checks', card)), 'Hide checks');
-  assert.equal(focusedKey(page), 'checks');
-  assert.equal(page.document.activeElement, page.control('checks', card));
+  same(page.document.activeElement, page.control('checks', card), 'the focus is on the new toggle');
   page.control('checks', card).click();
-  assert.deepEqual(page.all('check', card), []);
+  assert.equal(page.all('check', card).length + page.all('checks', card).length, 0, 'a closed list leaves nothing behind');
   assert.equal(page.control('checks', card).ariaExpanded, 'false');
 
   // When the focused control goes away, the focus stays in the card instead of jumping to the top.
   page.control('update', card).focus();
   page.send(snapshot({ ...open, can: { ...ALL, update: false } }, second));
-  assert.equal(page.document.activeElement, card);
+  same(page.document.activeElement, card, 'the card has the focus');
   assert.equal(page.requests.length, 0);
+});
+
+test('a pull request without checks has no list to open', () => {
+  const page = pageWith(pull({ checks: [] }));
+  assert.equal(page.text(page.all('status-line')[2]), 'No checks');
+  assert.equal(page.has('checks'), false);
+  assert.equal(page.all('toggle').length + page.all('checks').length, 0);
 });
 
 test('the page keeps to the bridge\'s content policy: no HTML parsing, no inline styles, nothing from outside', () => {

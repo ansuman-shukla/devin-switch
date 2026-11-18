@@ -8,21 +8,31 @@ const PAGE = path.join(__dirname, '../../src/devin_switch/pr_page');
 const SCRIPTS = ['pr-view.js', 'pr.js'].map((name) => new vm.Script(fs.readFileSync(path.join(PAGE, name), 'utf8'), { filename: name }));
 
 class Element {
+  // Private, so a failed assertion prints an element without walking the whole page through its parents.
+  #document;
+  #parent = null;
   constructor(document, tagName) {
-    Object.assign(this, { document, tagName, parent: null, nodes: [], dataset: {}, attributes: {}, className: '', hidden: false, disabled: false });
+    this.#document = document;
+    Object.assign(this, { tagName, nodes: [], dataset: {}, attributes: {}, className: '', hidden: false, disabled: false });
+  }
+  /** Leaving its parent takes the keyboard focus out of an element, as in a browser; coming back does not return it. */
+  #leave() {
+    if (this.contains(this.#document.focused)) this.#document.focused = null;
+    if (this.#parent) this.#parent.nodes = this.#parent.nodes.filter((other) => other !== this);
+    this.#parent = null;
   }
   /** Strings are text nodes; an element moves out of its old parent. */
   append(...nodes) {
     for (const node of nodes) {
       if (node instanceof Element) {
-        if (node.parent) node.parent.nodes = node.parent.nodes.filter((other) => other !== node);
-        node.parent = this;
+        node.#leave();
+        node.#parent = this;
       }
       this.nodes.push(node);
     }
   }
   replaceChildren(...nodes) {
-    for (const node of this.children) node.parent = null;
+    for (const node of this.children) node.#leave();
     this.nodes = [];
     this.append(...nodes);
   }
@@ -39,14 +49,14 @@ class Element {
     throw new Error('the page must never parse HTML');
   }
   contains(node) {
-    for (let at = node; at; at = at.parent) if (at === this) return true;
+    for (let at = node; at; at = at.#parent) if (at === this) return true;
     return false;
   }
   get isConnected() {
-    return this.document.body.contains(this);
+    return this.#document.body.contains(this);
   }
   focus() {
-    if (this.isConnected && !this.disabled) this.document.focused = this;
+    if (this.isConnected && !this.disabled) this.#document.focused = this;
   }
   setAttribute(name, value) {
     this.attributes[name] = String(value);
@@ -65,9 +75,9 @@ function openPage({ session = 'chat 1', token = 't&k' } = {}) {
   const document = {
     focused: null,
     createElement: (tagName) => new Element(document, tagName),
-    /** A control that left the page or was switched off no longer has the focus. */
+    /** A control that was switched off no longer has the focus. */
     get activeElement() {
-      return this.focused?.isConnected && !this.focused.disabled ? this.focused : this.body;
+      return this.focused && !this.focused.disabled ? this.focused : this.body;
     },
   };
   document.body = new Element(document, 'body');

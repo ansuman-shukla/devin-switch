@@ -5,7 +5,8 @@ repositories. This one is local. The bridge notes every GitHub pull request link
 in a chat: in what the agent and the user wrote, and in what a `gh pr` command was given and
 printed. `/pr` typed in the chat opens the page that lists them, served by `side.Server` like
 the side page. While a page is open the bridge looks them up with the `gh` CLI, under the
-user's own GitHub login. Everything is kept in memory only.
+user's own GitHub login, and the page's buttons run `gh` the same way. What may be done to a
+pull request is decided here, never in the page. Everything is kept in memory only.
 """
 
 import asyncio
@@ -15,7 +16,8 @@ import re
 import shutil
 import signal
 import time
-from collections.abc import Iterator
+import webbrowser
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager, suppress
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -33,6 +35,8 @@ LINK = re.compile(
 CHUNKS = ("agent_message_chunk", "user_message_chunk")
 STEPS = ("tool_call", "tool_call_update")
 COMMAND = "gh pr"
+NUMBER = re.compile(r"#?0*([1-9][0-9]{0,8})")
+RUN = re.compile(r"/actions/runs/([0-9]+)")
 # A tool call's command is written once the call runs; its output is whole once it has ended.
 RAN = ("in_progress", "completed", "failed")
 ENDED = ("completed", "failed")
@@ -55,6 +59,11 @@ BATCH = 4
 ERROR_LIMIT = 200
 MISSING = "GitHub CLI (gh) was not found"
 UNREADABLE = "gh printed something that is not a pull request"
+OK = {"ok": True}
+ACTIONS = ("merge", "update", "ready", "draft", "rerun")
+# What GitHub calls a pull request that can be merged now (hooks and failing optional checks
+# do not stop a merge).
+MERGEABLE = ("clean", "unstable", "has_hooks")
 STATES = {"OPEN": "open", "MERGED": "merged", "CLOSED": "closed"}
 CONFLICTS = {"CONFLICTING": True, "MERGEABLE": False}
 MERGE_STATES = ("clean", "behind", "blocked", "dirty", "draft", "unstable", "has_hooks")
@@ -246,10 +255,54 @@ def allowed(repository: dict) -> list[str]:
     return sorted(methods, key=lambda method: METHODS[method][0] != default)
 
 
+def failed_runs(checks: list[dict]) -> list[str]:
+    """The GitHub Actions runs of the checks that failed, each once."""
+    found = (RUN.search(item["url"] or "") for item in checks if item["status"] == "fail")
+    return list(dict.fromkeys(match[1] for match in found if match))
+
+
+def blocker(details: dict) -> str:
+    """Why an open pull request cannot be merged now: the first reason that applies."""
+    behind, conflicts, base = details["behind"], details["conflicts"], details["base"]
+    if details["draft"]:
+        return "Still a draft"
+    if conflicts:
+        return "Has merge conflicts"
+    if behind:
+        return f"{behind} commit{'' if behind == 1 else 's'} behind {base}"
+    if details["mergeState"] == "blocked":
+        return "Blocked by branch rules (reviews or required checks)"
+    if conflicts is None or details["mergeState"] == "unknown":
+        return "GitHub is still checking if it can merge"
+    if behind is None:
+        return f"Can't tell if it is behind {base}"
+    return "GitHub says it can't merge yet"
+
+
+def gate(details: dict) -> tuple[dict, dict]:
+    """What may be done to a pull request now, and why an open one cannot be merged.
+
+    A merge needs GitHub to say it can merge and the branch to hold all of its base.
+    """
+    opened, draft, behind = details["state"] == "open", details["draft"], details["behind"]
+    can = {
+        "merge": opened
+        and not draft
+        and details["conflicts"] is False
+        and behind == 0
+        and details["mergeState"] in MERGEABLE,
+        "update": opened and behind is not None and behind > 0,
+        "ready": opened and draft,
+        "draft": opened and not draft,
+        "rerun": opened and bool(failed_runs(details["checks"])),
+    }
+    return can, {"merge": blocker(details)} if opened and not can["merge"] else {}
+
+
 def describe(view: dict, behind: int | None, methods: list[str]) -> dict:
     """What the page shows of a pull request, from what `gh pr view` printed."""
     merge_state = word(view.get("mergeStateStatus")).lower()
-    return {
+    details = {
         "title": word(view.get("title")),
         "state": STATES.get(word(view.get("state")), "closed"),
         "draft": view.get("isDraft") is True,
@@ -267,6 +320,8 @@ def describe(view: dict, behind: int | None, methods: list[str]) -> dict:
         "checks": [check(item) for item in rows(view.get("statusCheckRollup"))],
         "methods": methods,
     }
+    details["can"], details["why"] = gate(details)
+    return details
 
 
 @dataclass
@@ -296,6 +351,52 @@ class Pull:
         }
 
 
+def refusal(pull: Pull, action: str, method: object) -> str | None:
+    """Why an action may not run on a pull request now (None: it may)."""
+    details = pull.details
+    if pull.busy:
+        return "Another action is still running on this pull request"
+    if not details:
+        return pull.error or "This pull request is still loading"
+    if details["state"] != "open":
+        return f"This pull request is {details['state']}"
+    if not details["can"][action]:
+        if action == "merge":
+            return details["why"]["merge"]
+        if action == "update":
+            known, base = details["behind"] is not None, details["base"]
+            return (
+                f"Already up to date with {base}" if known else f"Can't tell if it is behind {base}"
+            )
+        return {
+            "ready": "Already ready for review",
+            "draft": "Already a draft",
+            "rerun": "No failed GitHub Actions run to re-run",
+        }[action]
+    if action == "merge" and method not in details["methods"]:
+        if not details["methods"]:
+            return "Can't tell which merge methods this repository allows"
+        return "This repository does not allow that merge method"
+    return None
+
+
+def commands(pull: Pull, action: str, method: object) -> list[tuple[str, ...]]:
+    """The `gh` commands of an action that `refusal` let through."""
+    if action == "merge":
+        # The commit is named after the pull request, and only the commit the page showed is
+        # merged. The branch stays, and nothing waits for checks or overrides branch rules.
+        merge = ("pr", "merge", pull.url, f"--{method}", "--subject", pull.details["title"])
+        return [(*merge, "--match-head-commit", pull.oid)]
+    if action == "rerun":
+        runs = failed_runs(pull.details["checks"])
+        return [("run", "rerun", run, "--failed", "-R", pull.repo) for run in runs]
+    return {
+        "update": [("pr", "update-branch", pull.url)],
+        "ready": [("pr", "ready", pull.url)],
+        "draft": [("pr", "ready", pull.url, "--undo")],
+    }[action]
+
+
 @dataclass
 class Tab:
     """One chat's pull requests in first-seen order, the text still being read, and its pages."""
@@ -316,9 +417,11 @@ class Tab:
 class Pulls:
     """Each chat's pull requests, and the pages watching them."""
 
-    def __init__(self, store: Store) -> None:
+    def __init__(self, store: Store, browse: Callable[[str], bool] = webbrowser.open) -> None:
         self.store = store
+        self.browse = browse
         self.tabs: dict[str, Tab] = {}
+        self.tasks: set[asyncio.Task] = set()
         # Whether gh was missing the last time it was needed.
         self.missing = False
         self.methods: dict[str, list[str]] = {}
@@ -422,6 +525,90 @@ class Pulls:
             tab.added.set()
             self.tell(tab)
 
+    def show(self, session_id: str, words: list[str], folder: Path) -> None:
+        """Take a `/pr` typed in a chat: alone, or with links and numbers to add to its tab.
+
+        Nothing here waits. A number, or with nothing listed yet the pull request of the
+        branch checked out in the chat's folder, is found with `gh` beside the chat.
+        """
+        tab = self.tabs.setdefault(session_id, Tab())
+        tab.notice = None
+        self.flush(session_id)
+        numbers = []
+        for item in words:
+            if found := links(item, ended=True)[0]:
+                self.keep(tab, found, asked=True)
+            elif number := NUMBER.fullmatch(item):
+                numbers.append(number[1])
+            else:
+                tab.notice = f"Not a pull request link or number: {item[:ERROR_LIMIT]}"
+        if numbers or not (words or tab.pulls):
+            task = asyncio.create_task(self.find(tab, numbers, folder))
+            self.tasks.add(task)
+            task.add_done_callback(self.tasks.discard)
+        self.tell(tab)
+
+    async def find(self, tab: Tab, numbers: list[str], folder: Path) -> None:
+        """Add a folder's pull requests by number, or without one its current branch's."""
+        for number in numbers or [None]:
+            target = [number] if number else []
+            seen = answer(await self.gh("pr", "view", *target, "--json", "url", folder=folder))
+            if found := links(word(seen.get("url")) if seen else "", ended=True)[0]:
+                self.keep(tab, found, asked=True)
+            elif number:
+                tab.notice = f"No pull request #{number} in {folder.name}"
+                self.tell(tab)
+
+    async def act(self, request: dict) -> dict | None:
+        """Do what a page's button asks for: ok, or why not (None: the chat has no tab)."""
+        session_id, action, url = request.get("session"), request.get("action"), request.get("url")
+        if not isinstance(session_id, str) or not isinstance(action, str):
+            raise ValueError("an action names its chat and what to do")
+        tab = self.tabs.get(session_id)
+        if tab is None:
+            return None
+        if action == "refresh":
+            tab.notice = None
+            await self.refresh(tab, list(tab.pulls.values()))
+            return OK
+        key = url.lower() if isinstance(url, str) else None
+        if key not in tab.pulls:
+            return {"error": "That pull request is not in this chat's tab"}
+        pull = tab.pulls[key]
+        if action == "dismiss":
+            # Remembered, so the same link said again in the chat does not bring it back.
+            del tab.pulls[key]
+            tab.dismissed.add(key)
+            self.tell(tab)
+            return OK
+        if action == "open":
+            return await self.visit(pull, request.get("target") or pull.url)
+        if action not in ACTIONS:
+            return {"error": "Unknown action"}
+        if reason := refusal(pull, action, request.get("method")):
+            return {"error": reason}
+        pull.busy, failed = action, None
+        self.tell(tab)
+        try:
+            for arguments in commands(pull, action, request.get("method")):
+                ran = await self.gh(*arguments)
+                failed = failed or (trouble(ran) if ran.code else None)
+            # Whatever gh said, the page then shows the pull request as GitHub has it now.
+            await self.look(tab, pull)
+        finally:
+            pull.busy = None
+            self.tell(tab)
+        return {"error": failed} if failed else OK
+
+    async def visit(self, pull: Pull, target: object) -> dict:
+        """Open a pull request, or one of its checks, in the user's own browser."""
+        known = {pull.url, *(item["url"] for item in pull.details.get("checks", ()))}
+        web = isinstance(target, str) and target.startswith(("https://", "http://"))
+        if not web or target not in known:
+            return {"error": "That link is not this pull request's"}
+        opened = await asyncio.to_thread(self.browse, target)
+        return OK if opened else {"error": "The browser could not be opened"}
+
     async def gh(self, *arguments: str, folder: Path | None = None) -> Ran:
         """Run `gh`: in the user's home, or in a chat's folder for what depends on its repo."""
         ran = await run(self.store, folder or Path.home(), *arguments)
@@ -522,11 +709,11 @@ class Pulls:
 
     async def close(self) -> None:
         """End every connected page's stream, and stop looking pull requests up."""
-        watchers = [tab.watcher for tab in self.tabs.values() if tab.watcher]
+        running = [*self.tasks, *(tab.watcher for tab in self.tabs.values() if tab.watcher)]
         for tab in self.tabs.values():
             tab.watcher = None
             for queue in tab.listeners:
                 queue.put_nowait(None)
-        for watcher in watchers:
-            watcher.cancel()
-        await asyncio.gather(*watchers, return_exceptions=True)
+        for task in running:
+            task.cancel()
+        await asyncio.gather(*running, return_exceptions=True)

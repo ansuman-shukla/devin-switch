@@ -14,7 +14,8 @@ STREAM = "cognition.ai/streamingMessageId"
 CONTEXT = "cognition.ai/subagent_context"
 THOUGHT = "agent_thought_chunk"
 USER = "user_message_chunk"
-OID = "1f2e3d4c5b6a79880123456789abcdef01234567"
+# The head commit of the stand-in GitHub's pull request #596 (each has its own).
+OID = f"{596:040x}"
 # Exactly what the tab asks `gh pr view` and `gh repo view` for.
 FIELDS = (
     "number,title,state,isDraft,url,headRefName,baseRefName,headRefOid,mergeable,"
@@ -121,7 +122,7 @@ def view(number=596, repo="acme/app", **changes):
         "url": link(number, repo),
         "headRefName": "feature/thing",
         "baseRefName": "main",
-        "headRefOid": OID,
+        "headRefOid": f"{number:040x}",
         "mergeable": "MERGEABLE",
         "mergeStateStatus": "CLEAN",
         "reviewDecision": "APPROVED",
@@ -198,6 +199,16 @@ def gh(tmp_path, monkeypatch):
 @pytest.fixture
 def pulls(store):
     return pr_tab.Pulls(store)
+
+
+@pytest.fixture
+def unwatched(monkeypatch):
+    """Pages hear only of what a test itself does: nothing is looked up on its own."""
+
+    async def idle(self, tab):
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr(pr_tab.Pulls, "watch", idle)
 
 
 def row(pulls, url, session_id="chat"):
@@ -465,13 +476,7 @@ def test_whatever_a_native_sends_is_read_without_raising(pulls):
     assert urls(pulls) == [link(92)]
 
 
-def test_a_page_gets_one_token_per_change_and_closing_ends_its_stream(pulls, monkeypatch):
-    async def idle(self, tab):
-        await asyncio.Event().wait()
-
-    # Looking pull requests up tells pages too; here only what the chat says does.
-    monkeypatch.setattr(pr_tab.Pulls, "watch", idle)
-
+def test_a_page_gets_one_token_per_change_and_closing_ends_its_stream(pulls, unwatched):
     async def scenario():
         assert not pulls.showing("chat")
         with pulls.listen("chat") as page, pulls.listen("chat") as second, pulls.listen("b") as b:
@@ -613,6 +618,8 @@ def test_an_open_pull_request_is_shown_as_github_describes_it(gh, pulls):
             }
         ],
         "methods": ["squash", "merge"],
+        "can": {"merge": False, "update": True, "ready": False, "draft": True, "rerun": False},
+        "why": {"merge": "3 commits behind release/1.0"},
     }
     # Each by its link from the user's home; the base is one path segment of the comparison.
     assert gh.runs() == [
@@ -826,6 +833,8 @@ def test_whatever_gh_prints_about_a_pull_request_is_described_without_raising():
         "review": {"decision": "none", "reviews": [], "requested": []},
         "checks": [],
         "methods": [],
+        "can": {"merge": False, "update": False, "ready": False, "draft": False, "rerun": False},
+        "why": {},
     }
     odd = {key: [{"x": 1}] for key in FIELDS.split(",")}
     assert pr_tab.describe(odd, None, []) == {
@@ -1090,5 +1099,590 @@ def test_closing_ends_the_streams_and_the_looking(gh, pulls, tmp_path):
             assert [page.get_nowait(), page.get_nowait()] == [True, None]
             # The gh that was running went with it.
             assert gone(gh.calls()[0]["pid"])
+
+    asyncio.run(scenario())
+
+
+def described(behind=0, **changes):
+    return pr_tab.describe(view(**changes), behind, ["squash", "merge"])
+
+
+READY = {"merge": True, "update": False, "ready": False, "draft": True, "rerun": False}
+NOTHING = dict.fromkeys(READY, False)
+
+
+@pytest.mark.parametrize("merge_state", ["CLEAN", "UNSTABLE", "HAS_HOOKS"])
+def test_a_pull_request_github_can_merge_that_has_all_of_its_base_can_be_merged(merge_state):
+    details = described(mergeStateStatus=merge_state)
+    assert details["can"] == READY and details["why"] == {}
+
+
+@pytest.mark.parametrize(
+    ("behind", "changes", "why"),
+    [
+        (0, {"isDraft": True}, "Still a draft"),
+        (3, {"isDraft": True, "mergeable": "CONFLICTING"}, "Still a draft"),
+        (0, {"mergeable": "CONFLICTING"}, "Has merge conflicts"),
+        (3, {"mergeable": "CONFLICTING", "mergeStateStatus": "DIRTY"}, "Has merge conflicts"),
+        (1, {}, "1 commit behind main"),
+        (2, {"baseRefName": "release/1.0"}, "2 commits behind release/1.0"),
+        (12, {"mergeStateStatus": "BLOCKED"}, "12 commits behind main"),
+        (4, {"mergeable": "UNKNOWN"}, "4 commits behind main"),
+        (
+            0,
+            {"mergeStateStatus": "BLOCKED"},
+            "Blocked by branch rules (reviews or required checks)",
+        ),
+        (
+            None,
+            {"mergeStateStatus": "BLOCKED", "mergeable": "UNKNOWN"},
+            "Blocked by branch rules (reviews or required checks)",
+        ),
+        (0, {"mergeable": "UNKNOWN"}, "GitHub is still checking if it can merge"),
+        (0, {"mergeStateStatus": "UNKNOWN"}, "GitHub is still checking if it can merge"),
+        (None, {"mergeStateStatus": "UNKNOWN"}, "GitHub is still checking if it can merge"),
+        (None, {"mergeable": "UNKNOWN"}, "GitHub is still checking if it can merge"),
+        (None, {}, "Can't tell if it is behind main"),
+        (None, {"mergeStateStatus": "DIRTY"}, "Can't tell if it is behind main"),
+        (0, {"mergeStateStatus": "DIRTY"}, "GitHub says it can't merge yet"),
+        (0, {"mergeStateStatus": "BEHIND"}, "GitHub says it can't merge yet"),
+        (0, {"mergeStateStatus": "DRAFT"}, "GitHub says it can't merge yet"),
+    ],
+)
+def test_an_open_pull_request_that_cannot_be_merged_says_the_first_reason(behind, changes, why):
+    details = described(behind, **changes)
+    assert details["can"]["merge"] is False
+    assert details["why"] == {"merge": why}
+
+
+@pytest.mark.parametrize("state", ["MERGED", "CLOSED"])
+def test_nothing_can_be_done_to_a_pull_request_that_is_not_open(state):
+    failing = [check_run("unit", "FAILURE")]
+    for draft in (False, True):
+        details = described(None, state=state, isDraft=draft, statusCheckRollup=failing)
+        assert details["can"] == NOTHING and details["why"] == {}
+
+
+@pytest.mark.parametrize(
+    ("behind", "changes", "can"),
+    [
+        (0, {}, READY),
+        (2, {}, {**READY, "merge": False, "update": True}),
+        (None, {}, {**READY, "merge": False}),
+        (0, {"isDraft": True}, {**NOTHING, "ready": True}),
+        (2, {"isDraft": True}, {**NOTHING, "ready": True, "update": True}),
+        (1, {"mergeable": "CONFLICTING"}, {**NOTHING, "draft": True, "update": True}),
+        (0, {"statusCheckRollup": [check_run("unit", "FAILURE")]}, {**READY, "rerun": True}),
+        (0, {"statusCheckRollup": [check_run("unit", "CANCELLED")]}, {**READY, "rerun": True}),
+        # Only a failed check of a GitHub Actions run can be run again.
+        (0, {"statusCheckRollup": [commit_status("ci/build", "FAILURE")]}, READY),
+        (0, {"statusCheckRollup": [check_run("unit", "SKIPPED")]}, READY),
+        (0, {"statusCheckRollup": [check_run("unit", "", "IN_PROGRESS")]}, READY),
+        (0, {"statusCheckRollup": [{"name": "x", "status": "COMPLETED"}]}, READY),
+        (
+            0,
+            {
+                "statusCheckRollup": [
+                    {"name": "x", "status": "COMPLETED", "detailsUrl": "/actions/runs/"}
+                ]
+            },
+            READY,
+        ),
+    ],
+)
+def test_what_can_be_done_to_an_open_pull_request(behind, changes, can):
+    assert described(behind, **changes)["can"] == can
+
+
+def ask(pulls, action, url=None, session_id="chat", **more):
+    return pulls.act({"session": session_id, "url": url, "action": action, **more})
+
+
+def acted(gh):
+    """What gh was run for, besides looking pull requests up."""
+    lookups = (["pr", "view"], ["repo", "view"])
+    return [run for run in gh.runs() if run[:2] not in lookups and run[0] != "api"]
+
+
+@pytest.mark.parametrize("method", ["squash", "merge"])
+def test_merge_names_the_commit_after_the_pull_request_and_pins_what_was_shown(gh, pulls, method):
+    title = "--admin: fix the “thing” & more"
+    url = gh.pull(596, title=title)
+
+    async def scenario():
+        assert (await looked(pulls, url))["can"]["merge"] is True
+        asked = len(gh.calls())
+        assert await ask(pulls, "merge", url, method=method) == {"ok": True}
+        # No branch is deleted, nothing waits for checks, no branch rule is overridden.
+        assert acted(gh) == [
+            ["pr", "merge", url, f"--{method}", "--subject", title, "--match-head-commit", OID]
+        ]
+        # The page then shows it as GitHub has it now.
+        assert gh.runs()[asked:][1] == ["pr", "view", url, "--json", FIELDS]
+        assert (row(pulls, url)["state"], row(pulls, url)["busy"]) == ("merged", None)
+        assert row(pulls, url)["can"] == NOTHING
+        assert await ask(pulls, "merge", url, method=method) == {
+            "error": "This pull request is merged"
+        }
+        assert len(acted(gh)) == 1
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("method", ["rebase", "admin", "--admin", "", None, ["squash"], 5])
+def test_a_merge_method_the_repository_does_not_allow_is_refused(gh, pulls, method):
+    url = gh.pull(596)
+
+    async def scenario():
+        assert (await looked(pulls, url))["methods"] == ["squash", "merge"]
+        refused = {"error": "This repository does not allow that merge method"}
+        assert await ask(pulls, "merge", url, method=method) == refused
+        assert await ask(pulls, "merge", url) == refused
+        gh.put(fails={"repo view": "GraphQL: timeout"})
+        pulls.methods.clear()
+        assert (await looked(pulls, url))["methods"] == []
+        assert await ask(pulls, "merge", url, method="squash") == {
+            "error": "Can't tell which merge methods this repository allows"
+        }
+        assert acted(gh) == [] and row(pulls, url)["state"] == "open"
+
+    asyncio.run(scenario())
+
+
+def test_update_brings_the_branch_up_to_date_and_then_it_can_be_merged(gh, pulls):
+    url = gh.pull(596, behind=2)
+
+    async def scenario():
+        before = await looked(pulls, url)
+        assert (before["can"]["merge"], before["can"]["update"]) == (False, True)
+        assert await ask(pulls, "merge", url, method="squash") == {"error": "2 commits behind main"}
+        assert acted(gh) == []
+        assert await ask(pulls, "update", url) == {"ok": True}
+        assert acted(gh) == [["pr", "update-branch", url]]
+        after = row(pulls, url)
+        assert (after["behind"], after["can"]["merge"], after["can"]["update"]) == (0, True, False)
+        assert after["why"] == {}
+        assert await ask(pulls, "update", url) == {"error": "Already up to date with main"}
+        # The update made a new commit: that one is what a merge now pins.
+        assert await ask(pulls, "merge", url, method="merge") == {"ok": True}
+        assert acted(gh)[1:] == [
+            ["pr", "merge", url, "--merge", "--subject", "Add the thing"]
+            + ["--match-head-commit", "0" * 40]
+        ]
+
+    asyncio.run(scenario())
+
+
+def test_ready_and_draft_switch_a_pull_request_between_the_two(gh, pulls):
+    url = gh.pull(596, isDraft=True)
+
+    async def scenario():
+        assert (await looked(pulls, url))["why"] == {"merge": "Still a draft"}
+        assert await ask(pulls, "draft", url) == {"error": "Already a draft"}
+        assert await ask(pulls, "merge", url, method="squash") == {"error": "Still a draft"}
+        assert await ask(pulls, "ready", url) == {"ok": True}
+        assert acted(gh) == [["pr", "ready", url]]
+        assert (row(pulls, url)["draft"], row(pulls, url)["can"]["merge"]) == (False, True)
+        assert await ask(pulls, "ready", url) == {"error": "Already ready for review"}
+        assert await ask(pulls, "draft", url) == {"ok": True}
+        assert acted(gh) == [["pr", "ready", url], ["pr", "ready", url, "--undo"]]
+        assert row(pulls, url)["draft"] is True and row(pulls, url)["can"]["ready"] is True
+
+    asyncio.run(scenario())
+
+
+def test_rerun_restarts_each_failed_actions_run_once(gh, pulls):
+    rollup = [
+        check_run("unit", "FAILURE", run=7001),
+        check_run("lint", "TIMED_OUT", run=7001),
+        check_run("build", "SUCCESS", run=7003),
+        commit_status("ci/external", "FAILURE"),
+        check_run("e2e", "CANCELLED", run=7002),
+        check_run("docs", "SKIPPED", run=7004),
+    ]
+    url = gh.pull(596, statusCheckRollup=rollup)
+    quiet = gh.pull(597)
+
+    async def scenario():
+        assert (await looked(pulls, url))["can"]["rerun"] is True
+        assert (await looked(pulls, quiet))["can"]["rerun"] is False
+        assert await ask(pulls, "rerun", quiet) == {
+            "error": "No failed GitHub Actions run to re-run"
+        }
+        assert acted(gh) == []
+        assert await ask(pulls, "rerun", url) == {"ok": True}
+        assert acted(gh) == [
+            ["run", "rerun", "7001", "--failed", "-R", "acme/app"],
+            ["run", "rerun", "7002", "--failed", "-R", "acme/app"],
+        ]
+        statuses = {item["name"]: item["status"] for item in row(pulls, url)["checks"]}
+        assert statuses == {
+            "unit": "pending",
+            "lint": "pending",
+            "build": "pass",
+            "ci/external": "fail",
+            "e2e": "pending",
+            "docs": "skipped",
+        }
+        assert row(pulls, url)["can"]["rerun"] is False
+
+    asyncio.run(scenario())
+
+
+def test_a_run_that_cannot_be_rerun_does_not_stop_the_next(gh, pulls):
+    rollup = [check_run("unit", "FAILURE", run=7001), check_run("e2e", "FAILURE", run=7002)]
+    url = gh.pull(596, statusCheckRollup=rollup)
+    gh.put(fails={"run rerun": "run 7001 cannot be rerun; its workflow file may be broken\nhint"})
+
+    async def scenario():
+        await looked(pulls, url)
+        assert await ask(pulls, "rerun", url) == {
+            "error": "run 7001 cannot be rerun; its workflow file may be broken"
+        }
+        assert [run[2] for run in acted(gh)] == ["7001", "7002"]
+        assert row(pulls, url)["busy"] is None
+
+    asyncio.run(scenario())
+
+
+def test_what_gh_says_when_an_action_fails_comes_back_and_the_row_is_looked_up_again(gh, pulls):
+    url = gh.pull(596)
+    gh.put(fails={"pr merge": "GraphQL: Merging is blocked (mergePullRequest)\nmore text"})
+
+    async def scenario():
+        await looked(pulls, url)
+        asked = len(gh.calls())
+        gh.change(url, mergeStateStatus="BLOCKED")
+        assert await ask(pulls, "merge", url, method="squash") == {
+            "error": "GraphQL: Merging is blocked (mergePullRequest)"
+        }
+        assert [run[:2] for run in gh.runs()[asked:]][:2] == [["pr", "merge"], ["pr", "view"]]
+        shown_row = row(pulls, url)
+        assert (shown_row["state"], shown_row["busy"], shown_row["error"]) == ("open", None, None)
+        assert shown_row["why"] == {"merge": "Blocked by branch rules (reviews or required checks)"}
+
+    asyncio.run(scenario())
+
+
+def test_an_action_is_refused_for_a_pull_request_that_is_not_known_well_enough(gh, pulls):
+    url, closed = gh.pull(596, behind=None), gh.pull(7, state="CLOSED")
+    gh.put(behind={})
+
+    async def scenario():
+        pulls.said("chat", f"{url} {closed} {link(8)}")
+        loading = {"error": "This pull request is still loading"}
+        for action in pr_tab.ACTIONS:
+            assert await ask(pulls, action, url, method="squash") == loading
+        tab = pulls.tabs["chat"]
+        await pulls.refresh(tab, list(tab.pulls.values()))
+        assert await ask(pulls, "update", url) == {"error": "Can't tell if it is behind main"}
+        assert await ask(pulls, "merge", url, method="squash") == {
+            "error": "Can't tell if it is behind main"
+        }
+        for action in pr_tab.ACTIONS:
+            assert await ask(pulls, action, closed, method="squash") == {
+                "error": "This pull request is closed"
+            }
+            # One gh could not look up says what gh said.
+            assert await ask(pulls, action, link(8), method="squash") == {
+                "error": "GraphQL: Could not resolve to a PullRequest with that number."
+            }
+        assert await ask(pulls, "close", url) == {"error": "Unknown action"}
+        assert await ask(pulls, "", url) == {"error": "Unknown action"}
+        assert acted(gh) == []
+
+    asyncio.run(scenario())
+
+
+def test_an_action_needs_a_pull_request_of_its_own_chat(gh, pulls):
+    url, theirs = gh.pull(596, isDraft=True), gh.pull(7, isDraft=True)
+    opened = []
+    pulls.browse = opened.append
+
+    async def scenario():
+        await looked(pulls, url)
+        await looked(pulls, theirs, "other-chat")
+        stranger = {"error": "That pull request is not in this chat's tab"}
+        for action in (*pr_tab.ACTIONS, "open", "dismiss", "close"):
+            for target in (theirs, link(99), None, "", 5, ["x"]):
+                assert await ask(pulls, action, target, method="squash") == stranger
+        assert acted(gh) == [] and opened == []
+        assert urls(pulls, "other-chat") == [theirs]
+        # A link is the same pull request however its owner and repository are capitalised.
+        assert await ask(pulls, "ready", url.replace("acme/app", "ACME/App")) == {"ok": True}
+        assert acted(gh) == [["pr", "ready", url]]
+
+        # A chat without a tab has nothing to act on, and a request must say what it wants.
+        assert await ask(pulls, "ready", theirs, "no-such-chat") is None
+        assert await ask(pulls, "refresh", session_id="no-such-chat") is None
+        for request in ({"session": 5, "action": "refresh"}, {"session": "chat"}, {}):
+            with pytest.raises(ValueError):
+                await pulls.act(request)
+        with pytest.raises(ValueError):
+            await pulls.act({"session": "chat", "action": ["refresh"]})
+
+    asyncio.run(scenario())
+
+
+def test_a_running_action_is_shown_and_holds_the_others_off(gh, pulls, tmp_path, unwatched):
+    url, other = gh.pull(596, behind=2), gh.pull(7)
+    gate = tmp_path / "merged"
+    gh.put(gates={"pr update-branch": str(gate)})
+    opened = []
+    pulls.browse = lambda target: opened.append(target) or True
+
+    async def scenario():
+        await looked(pulls, url)
+        await looked(pulls, other)
+        with pulls.listen("chat") as page:
+            assert page.get_nowait() is True and page.empty()
+            running = asyncio.create_task(ask(pulls, "update", url))
+            await until(lambda: len(acted(gh)) == 1)
+            # The page was told at once, before gh answered.
+            assert page.get_nowait() is True and page.empty()
+            assert (row(pulls, url)["busy"], row(pulls, other)["busy"]) == ("update", None)
+            busy = {"error": "Another action is still running on this pull request"}
+            for action in pr_tab.ACTIONS:
+                assert await ask(pulls, action, url, method="squash") == busy
+            assert acted(gh) == [["pr", "update-branch", url]]
+            # Looking, opening and another pull request go on meanwhile.
+            assert await ask(pulls, "refresh") == {"ok": True}
+            assert await ask(pulls, "open", url) == {"ok": True}
+            assert await ask(pulls, "merge", other, method="squash") == {"ok": True}
+            assert row(pulls, url)["busy"] == "update" and not running.done()
+            told = []
+
+            async def read():
+                while await page.get():
+                    told.append((row(pulls, url)["busy"], row(pulls, url)["behind"]))
+
+            reading = asyncio.create_task(read())
+            gate.touch()
+            assert await running == {"ok": True}
+            after = row(pulls, url)
+            assert (after["busy"], after["behind"], after["can"]["merge"]) == (None, 0, True)
+            # It stays busy until GitHub's new state is in: no page is told the old one, idle.
+            await until(lambda: told[-1:] == [(None, 0)])
+            assert (None, 2) not in told
+            reading.cancel()
+        assert opened == [url]
+
+    asyncio.run(scenario())
+
+
+def test_open_shows_a_pull_request_or_one_of_its_checks_in_the_browser(gh, pulls):
+    odd = commit_status("local", "FAILURE") | {"targetUrl": "file:///etc/passwd"}
+    rollup = [check_run("unit", run=8001), commit_status("ci/x", "PENDING"), odd]
+    url, other = gh.pull(596, statusCheckRollup=rollup), gh.pull(7)
+    opened, works = [], True
+
+    def browse(target):
+        opened.append(target)
+        return works
+
+    pulls.browse = browse
+
+    async def scenario():
+        nonlocal works
+        pulls.said("chat", f"{url} {other}")
+        # Its own link opens before anything is known about it.
+        assert await ask(pulls, "open", url) == {"ok": True}
+        tab = pulls.tabs["chat"]
+        await pulls.refresh(tab, list(tab.pulls.values()))
+        job = "https://github.com/acme/app/actions/runs/8001/job/80019"
+        for target in (job, "https://ci.example/ci/x", url, None, ""):
+            assert await ask(pulls, "open", url, target=target) == {"ok": True}
+        assert opened == [url, job, "https://ci.example/ci/x", url, url, url]
+        refused = {"error": "That link is not this pull request's"}
+        # Not another pull request's link or check, and nothing but a web page.
+        strange = (other, "https://evil.example/", f"{url}/files", "file:///etc/passwd", 5, [url])
+        for target in strange:
+            assert await ask(pulls, "open", url, target=target) == refused
+        assert await ask(pulls, "open", other, target=job) == refused
+        assert len(opened) == 6
+        works = False
+        assert await ask(pulls, "open", url) == {"error": "The browser could not be opened"}
+        assert acted(gh) == []
+
+    asyncio.run(scenario())
+
+
+def test_a_dismissed_pull_request_stays_away_until_the_user_asks_for_it(
+    gh, pulls, tmp_path, unwatched
+):
+    url, kept = gh.pull(596), gh.pull(7)
+
+    async def scenario():
+        await looked(pulls, url)
+        await looked(pulls, kept)
+        await looked(pulls, url, "other-chat")
+        with pulls.listen("chat") as page:
+            assert page.get_nowait() is True and page.empty()
+            assert await ask(pulls, "dismiss", url) == {"ok": True}
+            assert page.get_nowait() is True and page.empty()
+        assert urls(pulls) == [kept] and urls(pulls, "other-chat") == [url]
+        assert await ask(pulls, "dismiss", url) == {
+            "error": "That pull request is not in this chat's tab"
+        }
+        # The chat saying the link again, in any way it is read, does not bring it back.
+        pulls.feed("chat", said(f"As said, {url} and https://github.com/ACME/app/pull/596 ."))
+        pulls.feed("chat", said(f"see {url} ", kind=USER))
+        pulls.said("chat", f"what about {url}")
+        pulls.feed("chat", step("c1", "tool_call", title="gh pr view", status="completed"))
+        pulls.feed("chat", step("c1", status="completed", content=printed(f"{url}\n")))
+        pulls.flush("chat")
+        assert urls(pulls) == [kept]
+        # Asking for it does, as new as any other.
+        pulls.show("chat", [url], tmp_path)
+        assert urls(pulls) == [kept, url]
+        assert row(pulls, url) == waiting(596)
+        # And it is then an ordinary one again.
+        assert await ask(pulls, "dismiss", url) == {"ok": True}
+        pulls.feed("chat", said(f"once more {url} ", stream="m7"))
+        assert urls(pulls) == [kept]
+        assert acted(gh) == []
+
+    asyncio.run(scenario())
+
+
+def test_refresh_looks_every_pull_request_of_the_chat_up_now(gh, pulls):
+    first, second = gh.pull(1), gh.pull(2)
+    elsewhere = gh.pull(3)
+
+    async def scenario():
+        pulls.said("chat", f"{first} {second}")
+        pulls.said("other-chat", elsewhere)
+        assert await ask(pulls, "refresh") == {"ok": True}
+        assert [pull["loading"] for pull in shown(pulls)] == [False, False]
+        assert [pull["title"] for pull in shown(pulls)] == ["Add the thing"] * 2
+        assert row(pulls, elsewhere, "other-chat")["loading"]
+        assert sorted(run[2] for run in gh.runs("pr", "view")) == [first, second]
+        gh.change(second, title="Renamed")
+        # The link is not needed, and one given is not looked at.
+        assert await ask(pulls, "refresh", link(99)) == {"ok": True}
+        assert [pull["title"] for pull in shown(pulls)] == ["Add the thing", "Renamed"]
+        assert len(gh.runs("pr", "view")) == 4
+
+    asyncio.run(scenario())
+
+
+async def settled(pulls):
+    """Wait for what a `/pr` left gh to find."""
+    await until(lambda: not pulls.tasks)
+
+
+def test_pr_adds_the_links_and_numbers_it_is_given(gh, pulls, tmp_path):
+    folder = tmp_path / "my-project"
+    folder.mkdir()
+    by_link, by_number, hashed = gh.pull(596), gh.pull(12), gh.pull(13)
+    gh.put(numbers={"12": by_number, "13": hashed})
+
+    async def scenario():
+        pulls.show("chat", [by_link, "12", "#013", f"<{link(7)}/files>,"], folder)
+        # Links are there at once; numbers once gh has found them in the chat's folder.
+        assert urls(pulls) == [by_link, link(7)]
+        await settled(pulls)
+        assert urls(pulls) == [by_link, link(7), by_number, hashed]
+        assert gh.runs() == [
+            ["pr", "view", "12", "--json", "url"],
+            ["pr", "view", "13", "--json", "url"],
+        ]
+        assert {Path(call["cwd"]) for call in gh.calls()} == {folder.resolve()}
+        assert pulls.snapshot("chat")["notice"] is None
+        # Nothing new: nothing changes, and gh is asked about a number only.
+        pulls.show("chat", [by_link], folder)
+        await settled(pulls)
+        assert len(gh.calls()) == 2 and len(urls(pulls)) == 4
+
+    asyncio.run(scenario())
+
+
+def test_pr_says_which_number_or_word_it_could_not_use(gh, pulls, tmp_path):
+    folder = tmp_path / "my-project"
+    folder.mkdir()
+    found = gh.pull(12)
+    gh.put(numbers={"12": found})
+
+    async def scenario():
+        with pulls.listen("chat") as page:
+            pulls.show("chat", ["77", "12"], folder)
+            await settled(pulls)
+            assert pulls.snapshot("chat")["notice"] == "No pull request #77 in my-project"
+            assert urls(pulls) == [found]
+            assert page.get_nowait() is True
+            # The next /pr starts clean, and so does a refresh.
+            pulls.show("chat", [], folder)
+            assert pulls.snapshot("chat")["notice"] is None
+            pulls.show("chat", ["soon", "#12"], folder)
+            assert pulls.snapshot("chat")["notice"] == "Not a pull request link or number: soon"
+            assert await ask(pulls, "refresh") == {"ok": True}
+            assert pulls.snapshot("chat")["notice"] is None
+            pulls.show("chat", ["0", "12abc", "https://github.com/acme/app/issues/5"], folder)
+            await settled(pulls)
+            assert pulls.snapshot("chat")["notice"] == (
+                "Not a pull request link or number: https://github.com/acme/app/issues/5"
+            )
+        assert [run[2] for run in gh.runs("pr", "view") if run[2].isdigit()] == ["77", "12", "12"]
+
+    asyncio.run(scenario())
+
+
+def test_pr_alone_finds_the_pull_request_of_the_folders_branch_for_an_empty_tab(
+    gh, pulls, tmp_path
+):
+    folder, bare = tmp_path / "my-project", tmp_path / "no-pull-request"
+    folder.mkdir()
+    bare.mkdir()
+    mine = gh.pull(596)
+    gh.put(branches={"my-project": mine})
+
+    async def scenario():
+        # A folder whose branch has none: silently nothing.
+        pulls.show("quiet-chat", [], bare)
+        await settled(pulls)
+        assert pulls.snapshot("quiet-chat") == {"pulls": [], "notice": None}
+        assert gh.runs() == [["pr", "view", "--json", "url"]]
+        assert Path(gh.calls()[0]["cwd"]) == bare.resolve()
+
+        pulls.show("chat", [], folder)
+        await settled(pulls)
+        assert urls(pulls) == [mine]
+        assert Path(gh.calls()[1]["cwd"]) == folder.resolve()
+        # A tab that has pull requests is shown as it is.
+        pulls.show("chat", [], folder)
+        await settled(pulls)
+        assert len(gh.calls()) == 2
+        # Dismissed and asked for again with an empty tab, it is back.
+        assert await ask(pulls, "dismiss", mine) == {"ok": True}
+        pulls.show("chat", [], folder)
+        await settled(pulls)
+        assert urls(pulls) == [mine] and len(gh.calls()) == 3
+
+    asyncio.run(scenario())
+
+
+def test_pr_counts_the_link_a_message_was_ending_with(gh, pulls, tmp_path):
+    async def scenario():
+        pulls.feed("chat", step("c1", "tool_call", title="gh pr create", rawOutput=link(42)))
+        pulls.feed("chat", said(f"Opened {link(41)}"))
+        assert urls(pulls) == []
+        pulls.show("chat", [], tmp_path)
+        assert urls(pulls) == [link(41), link(42)]
+        await settled(pulls)
+        # The tab was not empty, so the folder's branch was not asked for.
+        assert gh.calls() == []
+
+    asyncio.run(scenario())
+
+
+def test_closing_stops_what_a_pr_command_left_running(gh, pulls, tmp_path):
+    gh.put(gates={"pr view": str(tmp_path / "never")})
+
+    async def scenario():
+        pulls.show("chat", ["12"], tmp_path)
+        await until(lambda: len(gh.calls()) == 1)
+        (finding,) = pulls.tasks
+        await pulls.close()
+        assert finding.cancelled() and gone(gh.calls()[0]["pid"])
 
     asyncio.run(scenario())

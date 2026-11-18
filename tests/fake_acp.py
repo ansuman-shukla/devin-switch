@@ -60,6 +60,15 @@ foreground = None
 # prompt un-pauses it; it finishes once FAKE_SUBAGENT_GATE (when set) opens.
 WORKER = "5e1f0c2a"
 parked = False
+# The foreground subagent of the "rerun" turns, which is run again with `resume`. As captured
+# from CLI 3000.14, a resumed run is reported exactly like the first: the same agent ID and
+# tool call, and no run ID anywhere. With FAKE_RUN_IDS the native names each run on its start.
+RESUMED = "d29b75b1"
+RERUNS = {"rerun", "rerun-again", "rerun-paused"}
+reruns = 0
+# Set when the bridge closes this process's input: a "rerun" turn waiting at its gate gives up,
+# so a test that fails before opening the gate leaves no process behind.
+input_closed = asyncio.Event()
 INFERENCE = "/exa.api_server_pb.ApiServerService/GetChatMessage"
 STATUS = "/exa.seat_management_pb.SeatManagementService/GetUserStatus"
 
@@ -150,16 +159,17 @@ def lifecycle(agent_id, status, key, **details):
     return {**change, "_meta": {key: {"agentId": agent_id, **details, "depth": 1}}}
 
 
-def launched(agent_id, background):
+def launched(agent_id, background, task="Run sleep 30, then report", **named):
     return lifecycle(
         agent_id,
         "in_progress",
         "cognition.ai/subagent_started",
         title="Sleeper",
-        task="Run sleep 30, then report",
+        task=task,
         profile="General",
         isBackground=background,
         model="SWE-1.6",
+        **named,
     )
 
 
@@ -174,6 +184,39 @@ def parking(agent_id, paused):
     change = {"sessionUpdate": "tool_call_update", "toolCallId": agent_id}
     event = {"agentId": agent_id, "paused": paused}
     return {**change, "_meta": {"cognition.ai/subagent_paused": event}}
+
+
+def rerun_updates(task, saved=False):
+    """One run of the subagent that gets resumed, bar its end: live, or as a load replays it."""
+    global reruns
+    reruns += 1
+    named = {"runId": f"native-run-{reruns}"} if os.environ.get("FAKE_RUN_IDS") else {}
+    yield launched(RESUMED, False, task, **named)
+    for kind, words in (("agent_thought_chunk", "…"), ("agent_message_chunk", f"On it: {task}")):
+        # A replay sends each message whole, named by its saved event.
+        marks = {"cognition.ai/eventId": "45", **stamp()} if saved else streaming(str(uuid.uuid4()))
+        yield produced(RESUMED, chunk(kind, words), **marks)
+    yield produced(RESUMED, {"sessionUpdate": "usage_update", "used": 1, "size": 10})
+
+
+async def rerun(text):
+    """A turn that runs a foreground subagent and then runs it again with `resume`.
+
+    "rerun-again" is one more resumed run, and "rerun-paused" parks the resumed run for a
+    moment. The turn's last run ends once FAKE_SUBAGENT_GATE (when set) opens.
+    """
+    tasks = ["Read on"] if text == "rerun-again" else ["Read notes.md", "Now the rest"]
+    for task in tasks:
+        for change in rerun_updates(task):
+            update(loaded, change)
+        if task == tasks[-1]:
+            if text == "rerun-paused":
+                update(loaded, parking(RESUMED, True))
+                update(loaded, parking(RESUMED, False))
+            gate = os.environ.get("FAKE_SUBAGENT_GATE")
+            while gate and not Path(gate).exists() and not input_closed.is_set():
+                await asyncio.sleep(0.02)
+        update(loaded, finished(RESUMED, True, f"Did: {task}"))
 
 
 async def delegate(request_id):
@@ -427,6 +470,12 @@ async def handle(message):
                 update(session_id, produced("9d2e41aa", {**read, "title": "Read notes.md"}))
                 update(session_id, produced("9d2e41aa", report, **saved))
                 update(session_id, finished("9d2e41aa", True, "Read the notes."))
+            if os.environ.get("FAKE_REPLAY_RESUMED"):
+                # Like CLI 3000.14, both runs of a resumed subagent replay in full, in order.
+                for task in ("Read notes.md", "Now the rest"):
+                    for change in rerun_updates(task, saved=True):
+                        update(session_id, change)
+                    update(session_id, finished(RESUMED, True, f"Did: {task}"))
         elif not os.environ.get("FAKE_SAVE_ON_PROMPT"):
             connection.execute(
                 "INSERT INTO sessions VALUES (?, ?, ?, ?, 0)",
@@ -587,6 +636,8 @@ async def handle(message):
                         "summary": "done" if success else "[Error] Canceled by user",
                     },
                 )
+        if text in RERUNS:
+            await rerun(text)
         if text == "side-noise":
             # A side answer streaming while this main turn runs.
             update(
@@ -869,6 +920,7 @@ async def main():
         task = asyncio.create_task(handle(message))
         tasks.add(task)
         task.add_done_callback(tasks.discard)
+    input_closed.set()
     if emitter:
         emitter.cancel()
     if tasks:

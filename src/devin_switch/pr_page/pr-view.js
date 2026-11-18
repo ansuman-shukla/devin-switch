@@ -48,15 +48,15 @@
 
   const filesLabel = (count) => (count === 1 ? '1 file' : `${count} files`);
 
-  /** The meta line in parts: "feature → main", the author, "+12", "−3", "2 files". */
+  /** The parts of the meta line: "feature → main", the author, "+12", "−3", "2 files". */
   function metaOf(pull) {
-    return [
-      { kind: 'branch', text: `${pull.head} → ${pull.base}` },
-      { kind: 'author', text: pull.author },
-      { kind: 'added', text: `+${pull.additions}` },
-      { kind: 'removed', text: `−${pull.deletions}` },
-      { kind: 'files', text: filesLabel(pull.files) },
-    ];
+    return {
+      branch: `${pull.head} → ${pull.base}`,
+      author: pull.author,
+      added: `+${pull.additions}`,
+      removed: `−${pull.deletions}`,
+      files: filesLabel(pull.files),
+    };
   }
 
   function behindRow(pull) {
@@ -158,7 +158,7 @@
       title: '',
       pill: null,
       note: '',
-      meta: [],
+      meta: null,
       status: null,
       actions: [],
       reason: '',

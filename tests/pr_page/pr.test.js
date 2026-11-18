@@ -64,14 +64,14 @@ test('a card shows the pull request as text, whatever GitHub put in it', () => {
   assert.equal(page.text(page.one('pill', card)), 'Open');
   assert.equal(page.one('title', card).textContent, title);
   assert.equal(page.one('title', card).title, title, 'the tooltip keeps a clamped title readable');
-  assert.deepEqual(page.one('meta', card).children.map((node) => node.textContent), ['feat/cart → main', '<i>eve</i>', '+12', '−3', '2 files']);
+  assert.deepEqual(page.one('meta', card).children.map((node) => node.textContent), ['feat/cart → main', '<i>eve</i>', '+12 −3', '2 files']);
   // Every status row leads with a glyph, so it never reads by colour alone.
   assert.deepEqual(
     page.all('status', card).map((row) => [page.text(page.one('icon', row.children[0])), page.text(page.one('status-line', row))]),
     [['!', '2 commits behind main'], ['✕', 'Has merge conflicts'], ['✕', '1 failed, 1 passedHide checks'], ['✓', 'Approved']],
   );
   assert.deepEqual(texts(page, 'check', card), ['✕<script>build</script> CIFailed', '✓lintPassed']);
-  assert.deepEqual(texts(page, 'quiet', card), ['bob approved · carol commented', 'Waiting on dave, team-x']);
+  assert.deepEqual(texts(page, 'sub', card), ['bob approved · carol commented', 'Waiting on dave, team-x']);
   assert.deepEqual(page.all('icon', card).map((node) => node.ariaHidden), Array(6).fill('true'));
   for (const node of page.seen()) assert.ok(!['img', 'script', 'b', 'i'].includes(node.tagName), node.tagName);
 });
@@ -86,7 +86,7 @@ test('loading, failed, merged and closed cards show their heading, the link out 
   const [loading, failed, merged, closed] = page.all('card');
   assert.equal(page.text(page.one('card-body', loading)), 'acme/shop #1×Loading…Open on GitHub');
   assert.equal(page.text(page.one('card-body', failed)), 'acme/shop #2×✕gh: <not found>Open on GitHub');
-  assert.equal(page.text(page.one('card-body', merged)), 'acme/shop #3Merged×Add the cart pagefeat/cart → mainalice+12−32 filesOpen on GitHub');
+  assert.equal(page.text(page.one('card-body', merged)), 'acme/shop #3Merged×Add the cart pagefeat/cart → mainalice+12 −32 filesOpen on GitHub');
   assert.equal(page.text(page.one('pill', closed)), 'Closed');
   for (const card of [loading, failed, merged, closed]) {
     assert.deepEqual(buttons(page, card), []);
@@ -173,7 +173,7 @@ test('a repository with one merge method gets no chooser, and that method is the
   page.control('merge').click();
   const step = page.control('confirm');
   assert.deepEqual(page.all('methods', step), []);
-  assert.deepEqual(texts(page, 'quiet', step), ['Squash and merge'], 'it still says how it will merge');
+  assert.deepEqual(texts(page, 'sub', step), ['Squash and merge'], 'it still says how it will merge');
   assert.deepEqual(page.all('warning', step), []);
   page.control('confirm-merge').click();
   assert.deepEqual(bodies(page), [{ session: 'chat 1', url: URL, action: 'merge', method: 'squash' }]);

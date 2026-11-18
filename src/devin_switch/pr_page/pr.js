@@ -99,7 +99,7 @@
   }
 
   function statusList(card, { behind, conflicts, checks, review }) {
-    const reviewed = lines('quiet', [review.reviewers.join(' · '), review.waiting]);
+    const reviewed = lines('sub', [review.reviewers.join(' · '), review.waiting]);
     return el('ul', { className: 'statuses' }, [statusRow(behind), statusRow(conflicts), checksRow(card, checks), statusRow(review, [], reviewed)]);
   }
 
@@ -112,7 +112,7 @@
     };
     const methods = confirm.chooser
       ? [el('fieldset', { className: 'methods', ariaLabel: 'Merge method' }, confirm.methods.map(radio))]
-      : lines('quiet', confirm.methods.map(({ label }) => label));
+      : lines('sub', confirm.methods.map(({ label }) => label));
     const warning = confirm.warning ? [el('p', { className: 'warning' }, [icon('warn'), confirm.warning])] : [];
     const buttons = [
       button(card, 'confirm-merge', 'Confirm merge', () => act(url, 'merge', { method: confirm.method }), { className: 'button primary', disabled: !confirm.enabled }),
@@ -137,18 +137,24 @@
     return el('div', { className: 'actions' }, [...buttons, button(card, 'open', 'Open on GitHub', () => openLink(url), { className: 'link' })]);
   }
 
+  function metaLine({ branch, author, added, removed, files }) {
+    const part = (className, textContent) => el('span', { className, textContent });
+    // The two halves of the diff stay on one line.
+    const diff = el('span', { className: 'diff' }, [part('added', added), ' ', part('removed', removed)]);
+    return el('div', { className: 'meta' }, [part('branch', branch), part('author', author), diff, part('files', files)]);
+  }
+
   /** A card's elements from its view model. */
   function parts(card, model) {
     const { url } = card;
     const dismiss = button(card, 'dismiss', '×', () => act(url, 'dismiss'), { className: 'close', ariaLabel: 'Remove from this tab', disabled: model.locked });
     const pill = model.pill ? [el('span', { className: `pill ${model.pill.kind}`, textContent: model.pill.text })] : [];
-    const meta = model.meta.map(({ kind, text }) => el('span', { className: kind, textContent: text }));
     return [
       el('div', { className: 'head' }, [el('span', { className: 'repo', textContent: model.heading }), ...pill, dismiss]),
       // A long title is clamped; the tooltip keeps the full text.
       model.title && el('h2', { className: 'title', textContent: model.title, title: model.title }),
       model.note && el('p', { className: `note ${model.kind}` }, model.kind === 'error' ? [icon('bad'), model.note] : [model.note]),
-      meta.length > 0 && el('div', { className: 'meta' }, meta),
+      model.meta && metaLine(model.meta),
       model.status && statusList(card, model.status),
       model.confirm && confirmStep(card, model.confirm),
       actionRow(card, model),

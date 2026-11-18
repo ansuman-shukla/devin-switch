@@ -22,17 +22,14 @@ test('the state pill reads Open, Draft, Merged or Closed', () => {
 test('the heading names the repository and number, the meta line the branches, author, diff and files', () => {
   assert.equal(view.headingOf(pull({})), 'acme/shop #596');
   assert.equal(view.headingOf(bare({ repo: 'o/r', number: 7 })), 'o/r #7');
-  assert.deepEqual(view.metaOf(pull({})), [
-    { kind: 'branch', text: 'feat/cart → main' },
-    { kind: 'author', text: 'alice' },
-    { kind: 'added', text: '+12' },
-    { kind: 'removed', text: '−3' },
-    { kind: 'files', text: '2 files' },
-  ]);
-  assert.deepEqual(
-    view.metaOf(pull({ head: 'fix', base: 'release', author: 'bob', additions: 0, deletions: 0, files: 1 })).map(({ text }) => text),
-    ['fix → release', 'bob', '+0', '−0', '1 file'],
-  );
+  assert.deepEqual(view.metaOf(pull({})), { branch: 'feat/cart → main', author: 'alice', added: '+12', removed: '−3', files: '2 files' });
+  assert.deepEqual(view.metaOf(pull({ head: 'fix', base: 'release', author: 'bob', additions: 0, deletions: 1450, files: 1 })), {
+    branch: 'fix → release',
+    author: 'bob',
+    added: '+0',
+    removed: '−1450',
+    files: '1 file',
+  });
 });
 
 test('one file is singular, every other count plural', () => {
@@ -332,7 +329,7 @@ test('a loading card shows only its heading and never reads the missing fields',
     title: '',
     pill: null,
     note: 'Loading…',
-    meta: [],
+    meta: null,
     status: null,
     actions: [],
     reason: '',
@@ -355,7 +352,7 @@ test('a failed card shows its heading and the error and never reads the missing 
     title: '',
     pill: null,
     note: 'gh: Could not resolve to a PullRequest',
-    meta: [],
+    meta: null,
     status: null,
     actions: [],
     reason: '',
@@ -390,7 +387,7 @@ test('merged and closed cards keep the heading, title, pill and meta line and ha
       error: '',
       locked: false,
     });
-    assert.equal(card.meta.length, 5);
+    assert.equal(card.meta.branch, 'feat/cart → main');
   }
 });
 

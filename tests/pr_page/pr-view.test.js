@@ -328,6 +328,7 @@ test('a loading card shows only its heading and never reads the missing fields',
     title: '',
     pill: null,
     note: 'Loading…',
+    stale: '',
     meta: null,
     status: null,
     actions: [],
@@ -342,7 +343,7 @@ test('a loading card shows only its heading and never reads the missing fields',
   assert.deepEqual(view.cardOf(loading), view.cardOf(loading, view.fresh()), 'the page state is optional');
 });
 
-test('a failed card shows its heading and the error and never reads the missing fields', () => {
+test('a pull request that was never read shows its heading and the error and never reads the missing fields', () => {
   const failed = bare({ error: 'gh: Could not resolve to a PullRequest' });
   assert.equal(view.kindOf(failed), 'error');
   assert.deepEqual(view.cardOf(failed, local({ confirming: true, method: 'rebase' })), {
@@ -351,6 +352,7 @@ test('a failed card shows its heading and the error and never reads the missing 
     title: '',
     pill: null,
     note: 'gh: Could not resolve to a PullRequest',
+    stale: '',
     meta: null,
     status: null,
     actions: [],
@@ -361,9 +363,58 @@ test('a failed card shows its heading and the error and never reads the missing 
   });
   // While the server tries again the card reads Loading…, not the old error.
   assert.equal(view.cardOf(bare({ loading: true, error: 'gh failed' }), view.fresh()).note, 'Loading…');
-  // An error wins over details that came along with it.
-  const stale = view.cardOf(pull({ error: 'gh timed out' }), view.fresh());
-  assert.deepEqual([stale.kind, stale.note, stale.status, stale.actions], ['error', 'gh timed out', null, []]);
+});
+
+test('a pull request that was read before keeps its whole card when a later lookup fails', () => {
+  const fine = pull({ can: { ...CAN, merge: true, update: true }, checks: checks('fail', 'pass') });
+  const failed = { ...fine, error: 'gh: connection timed out' };
+  assert.equal(view.kindOf(failed), 'open');
+  const card = view.cardOf(failed, view.fresh());
+  // Exactly the card it had, plus the line that says it could not be refreshed.
+  assert.deepEqual(card, { ...view.cardOf(fine, view.fresh()), stale: "Couldn't refresh: gh: connection timed out" });
+  assert.equal(card.note, '', 'the error is not the body of the card');
+  assert.deepEqual(labels(card.actions), ['Merge', 'Update branch']);
+  assert.equal(card.status.checks.text, '1 failed, 1 passed');
+  assert.equal(view.cardOf(fine, view.fresh()).stale, '', 'the line goes with the next clean snapshot');
+
+  for (const [state, text] of [['merged', 'Merged'], ['closed', 'Closed']]) {
+    const done = pull({ state, error: 'gh failed' });
+    assert.equal(view.kindOf(done), 'done');
+    const shown = view.cardOf(done, view.fresh());
+    assert.deepEqual(shown, { ...view.cardOf(pull({ state }), view.fresh()), stale: "Couldn't refresh: gh failed" });
+    assert.deepEqual([shown.pill.text, shown.note, shown.status, shown.actions], [text, '', null, []]);
+  }
+});
+
+test('only a pull request with its details keeps its card over an error, and loading wins over both', () => {
+  // Nothing was read yet: the error card, which does not repeat the error as a warning.
+  const unread = view.cardOf(bare({ error: 'gh failed' }), view.fresh());
+  assert.deepEqual([unread.kind, unread.note, unread.stale], ['error', 'gh failed', '']);
+  // An empty title is still a title: the details are there.
+  const untitled = view.cardOf(pull({ title: '', error: 'gh failed' }), view.fresh());
+  assert.deepEqual([untitled.kind, untitled.note, untitled.stale], ['open', '', "Couldn't refresh: gh failed"]);
+  // Loading shows nothing else, with or without details and an error.
+  for (const loading of [bare({ loading: true, error: 'gh failed' }), pull({ loading: true, error: 'gh failed' }), pull({ loading: true })]) {
+    const card = view.cardOf(loading, view.fresh());
+    assert.deepEqual([card.kind, card.note, card.stale, card.title, card.pill, card.status, card.actions], ['loading', 'Loading…', '', '', null, null, []]);
+  }
+});
+
+test('a failed refresh leaves what the reader did to the pull request alone', () => {
+  const fine = pull({ checks: checks('pass', 'pass') });
+  const failed = { ...fine, error: 'gh: connection timed out' };
+  const used = local({ confirming: true, method: 'rebase', checksOpen: true, error: 'Merge failed' });
+  assert.deepEqual(view.reconcile(used, failed), used);
+  const card = view.cardOf(failed, view.reconcile(used, failed));
+  assert.equal(card.confirm.method, 'rebase', 'the confirm step is still open on the chosen method');
+  assert.equal(card.status.checks.open, true);
+  assert.equal(card.error, 'Merge failed', 'the error of an action is its own line');
+  assert.equal(card.stale, "Couldn't refresh: gh: connection timed out");
+  // What the server no longer allows still closes the step, failed refresh or not.
+  assert.equal(view.reconcile(used, { ...failed, can: CAN }).confirming, false);
+  assert.equal(view.reconcile(used, { ...failed, busy: 'update' }).confirming, false);
+  // A pull request without its details has nothing to confirm.
+  assert.equal(view.reconcile(used, bare({ error: 'gh failed' })).confirming, false);
 });
 
 test('merged and closed cards keep the heading, title, pill and meta line and have no status or actions', () => {
@@ -378,6 +429,7 @@ test('merged and closed cards keep the heading, title, pill and meta line and ha
       title: 'Add the cart page',
       pill: { kind: state, text },
       note: '',
+      stale: '',
       meta: view.metaOf(done),
       status: null,
       actions: [],
@@ -407,6 +459,7 @@ test('an open card carries the title, pill, meta line, the four status rows and 
     title: 'Add the cart page',
     pill: { kind: 'draft', text: 'Draft' },
     note: '',
+    stale: '',
     meta: view.metaOf(open),
     status: {
       behind: { tone: 'warn', text: '2 commits behind main' },

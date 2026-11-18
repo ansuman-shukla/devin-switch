@@ -36,8 +36,17 @@
   ];
   const UNREACHED = "That didn't work. Try again.";
 
-  /** A `loading` or `error` pull request may carry nothing but its address; `done` is merged or closed. */
-  const kindOf = (pull) => (pull.loading ? 'loading' : pull.error ? 'error' : pull.state === 'open' ? 'open' : 'done');
+  /** A pull request that was looked up once carries all its details, its title among them, and keeps them. */
+  const known = (pull) => pull.title != null;
+
+  /**
+   * Which card a pull request gets. A `loading` or `error` one may carry nothing but its address; `done` is
+   * merged or closed. A lookup that fails later leaves the card as it was: see `staleOf`.
+   */
+  const kindOf = (pull) => (pull.loading ? 'loading' : pull.error && !known(pull) ? 'error' : pull.state === 'open' ? 'open' : 'done');
+
+  /** A later lookup failed: the card shows what was last known and says that it could not be refreshed. */
+  const staleOf = (pull) => (pull.error ? `Couldn't refresh: ${pull.error}` : '');
   const headingOf = (pull) => `${pull.repo} #${pull.number}`;
 
   /** Open, Draft (open and a draft), Merged or Closed; null while the state is not known. */
@@ -160,6 +169,7 @@
       title: '',
       pill: null,
       note: '',
+      stale: '',
       meta: null,
       status: null,
       actions: [],
@@ -170,7 +180,7 @@
     };
     if (kind === 'loading') return { ...card, note: 'Loading…' };
     if (kind === 'error') return { ...card, note: pull.error };
-    Object.assign(card, { title: pull.title, pill: pillOf(pull), meta: metaOf(pull) });
+    Object.assign(card, { title: pull.title, pill: pillOf(pull), meta: metaOf(pull), stale: staleOf(pull) });
     if (kind === 'done') return card;
     card.status = { behind: behindRow(pull), conflicts: conflictsRow(pull), checks: checksRow(pull, local), review: reviewRow(pull) };
     const confirm = confirmOf(pull, local);

@@ -1981,6 +1981,11 @@ def test_pr_command_opens_the_tab_without_waiting_for_the_turn(gh, acp_native, t
             # The tab loads the page, whose event stream shows the pull request asked for.
             status, _, body = await get(address.port, f"{address.path}?{address.query}")
             assert status == 200 and f'data-session="{session_id}"' in body
+            # The page's own files are there to be served, whatever they hold.
+            files = re.findall(r'(?:src|href)="([^"]*)"', body)
+            assert len(files) == 3
+            for source in files:
+                assert (await get(address.port, source))[0] == 200
             events = f"/pr/events?session={quote(session_id, safe='')}&{address.query}"
             status, reader, stream = await request(address.port, "GET", events)
             assert status == 200

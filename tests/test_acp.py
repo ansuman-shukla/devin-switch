@@ -165,6 +165,8 @@ async def connect(native, *arguments, auto_respond=True):
         stdin=asyncio.subprocess.PIPE,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
+        # Like Desktop, the client reads the bridge's lines however long they are.
+        limit=2**30,
     )
     client = Client(process, auto_respond=auto_respond)
     try:

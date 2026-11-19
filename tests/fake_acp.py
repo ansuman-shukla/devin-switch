@@ -1,4 +1,5 @@
 import asyncio
+import hashlib
 import json
 import os
 import shlex
@@ -376,6 +377,11 @@ async def handle(message):
                             for block in params.get("prompt") or []
                             if block.get("type") == "text"
                         ],
+                        "images": [
+                            hashlib.sha256(block["data"].encode()).hexdigest()
+                            for block in params.get("prompt") or []
+                            if block.get("type") == "image"
+                        ],
                         "uri": params.get("uri"),
                         "process_cwd": process_cwd(),
                         "chat_id": whiteboard_chat(params),
@@ -591,7 +597,10 @@ async def handle(message):
             return
         if text == "say":
             # A turn that sends just the updates a test gives it, and ends once its gate opens.
-            for said in json.loads(os.environ["FAKE_SAY"]):
+            # FAKE_SAY_FILE holds them when they are too long for the environment.
+            written = os.environ.get("FAKE_SAY_FILE")
+            updates = Path(written).read_text() if written else os.environ["FAKE_SAY"]
+            for said in json.loads(updates):
                 update(loaded, said)
             gate = os.environ.get("FAKE_SAY_GATE")
             while gate and not Path(gate).exists():
@@ -660,6 +669,12 @@ async def handle(message):
                 },
                 {"cognition.ai/chain": "side"},
             )
+        if text == "noise":
+            # A line that is no ACP message at all, in the middle of a turn.
+            print("native: a line meant for a terminal", flush=True)
+        if text == "odd":
+            # An update without its update: a message the bridge can read but not use.
+            emit({"method": "session/update", "params": {"sessionId": loaded}})
         if text == "slow":
             await asyncio.sleep(0.5)
         if text == "wait":
@@ -844,6 +859,10 @@ async def handle(message):
         settings["model"] = params["modelId"]
     elif method == "_cognition.ai/command/revise":
         result = {"command": params["command"] + " --revised"}
+    elif method == "_cognition.ai/session/loadPage" and os.environ.get("FAKE_PAGE"):
+        # Like CLI 3000.14, a page of older rows is one answer line, however long: the test
+        # writes the page to this file.
+        result = json.loads(Path(os.environ["FAKE_PAGE"]).read_text())
     elif method.startswith("_cognition.ai/mcp/") or method == "_cognition.ai/scope_search":
         # Like the native, user-scope servers live in this login's config directory.
         path = Path(os.environ["XDG_CONFIG_HOME"]) / "devin/mcp_config.json"
@@ -917,7 +936,8 @@ async def periodic(kind):
 
 
 async def main():
-    reader = asyncio.StreamReader()
+    # Like the native, a prompt is read however long it is: attached images are part of it.
+    reader = asyncio.StreamReader(limit=2**30)
     await asyncio.get_running_loop().connect_read_pipe(
         lambda: asyncio.StreamReaderProtocol(reader), sys.stdin
     )

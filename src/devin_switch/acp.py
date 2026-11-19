@@ -24,7 +24,16 @@ from devin_switch import (
 from devin_switch.native import API_SERVER_VARIABLE, Native
 from devin_switch.store import Account, SwitchError, write_json
 
-MAX_MESSAGE = 8 * 1024 * 1024
+# ACP lines have no small limit: Desktop 3.14 asks for a chat's older history in one request
+# that the native answers in one line (15 MB for a chat with images), and a prompt carries its
+# images. A line over this is dropped and the next one is read; it never ends a connection.
+MAX_MESSAGE = 1024 * 1024 * 1024
+# How far a stream is read ahead of the bridge before its pipe is paused, not a message size.
+READ_AHEAD = 8 * 1024 * 1024
+UNREADABLE = (
+    "The GUI agent sent a message that could not be read, so this request may have lost its "
+    "answer. The agent is still running: ask again."
+)
 LIFECYCLE_TIMEOUT = 30
 SHUTDOWN_TIMEOUT = 10
 IDLE_TIMEOUT = 15 * 60
@@ -182,6 +191,10 @@ class RpcError(SwitchError):
         self.data = data
 
 
+class LineTooLong(ValueError):
+    """A line over `MAX_MESSAGE` was skipped: the stream is at the start of the next line."""
+
+
 class CatalogUnavailable(SwitchError):
     pass
 
@@ -306,6 +319,33 @@ def show_question_details(update: dict) -> None:
         ]
         if lines:
             card["question"] = f"{card['question']}\n\n" + "\n".join(lines)
+
+
+async def read_line(reader: asyncio.StreamReader) -> bytes:
+    """The stream's next line, however long; empty once the stream has ended.
+
+    `StreamReader.readline` fails on a line longer than the stream's buffer and throws away
+    what it read of it, so a long line is taken from the buffer part by part instead.
+    """
+    parts: list[bytes] = []
+    size = 0
+    while True:
+        try:
+            part, whole = await reader.readuntil(b"\n"), True
+        except asyncio.IncompleteReadError as cut:
+            # The stream ended: what is left is its last line, or nothing.
+            part, whole = cut.partial, True
+        except asyncio.LimitOverrunError as overrun:
+            part, whole = await reader.readexactly(overrun.consumed), False
+        size += len(part)
+        if size > MAX_MESSAGE:
+            parts.clear()  # Read on to the end of the line without holding it.
+        else:
+            parts.append(part)
+        if whole:
+            if size > MAX_MESSAGE:
+                raise LineTooLong(size)
+            return b"".join(parts)
 
 
 def is_activity(message: dict) -> bool:
@@ -448,7 +488,7 @@ class Backend:
             )
             self.watcher = asyncio.create_task(self.watch())
             loop = asyncio.get_running_loop()
-            self.reader = asyncio.StreamReader(limit=MAX_MESSAGE)
+            self.reader = asyncio.StreamReader(limit=READ_AHEAD)
             self.read_transport, _ = await loop.connect_read_pipe(
                 lambda: asyncio.StreamReaderProtocol(self.reader),
                 self.process.stdout,
@@ -633,31 +673,42 @@ class Backend:
                 listing[f"current{category.title()}Id"] = getattr(self, category)
         return result
 
+    def fail_pending(self, text):
+        for future in self.pending.values():
+            if not future.done():
+                future.set_exception(SwitchError(text))
+
     async def read(self):
         try:
-            while line := await self.reader.readline():
-                message = json.loads(line)
-                if not isinstance(message, dict) or message.get("jsonrpc") != "2.0":
-                    raise ValueError
-                if is_activity(message):
-                    self.last_activity = time.monotonic()
-                if "method" in message:
-                    await self.bridge.from_backend(self, message)
-                elif future := self.pending.get(message.get("id")):
-                    if not future.done():
-                        future.set_result(message)
-        except (ValueError, TypeError, KeyError, OSError, SwitchError):
+            while True:
+                try:
+                    if not (line := await read_line(self.reader)):
+                        break
+                    message = json.loads(line)
+                    if not isinstance(message, dict) or message.get("jsonrpc") != "2.0":
+                        raise ValueError
+                    if is_activity(message):
+                        self.last_activity = time.monotonic()
+                    if "method" in message:
+                        await self.bridge.from_backend(self, message)
+                    elif future := self.pending.get(message.get("id")):
+                        if not future.done():
+                            future.set_result(message)
+                except (ValueError, TypeError, KeyError):
+                    # One line that is too long, not a message, or of no use to the bridge says
+                    # nothing about the native: it is dropped and the native stays. It may have
+                    # been the answer a request waits for, and a dropped message must not pass
+                    # unnoticed, so every request waiting on this native fails now.
+                    self.fail_pending(UNREADABLE)
+        except (OSError, SwitchError):
+            # Only a stream that ended or broke closes the connection.
             pass
         finally:
             if self.writer:
                 self.writer.close()
-            for future in self.pending.values():
-                if not future.done():
-                    future.set_exception(
-                        SwitchError(
-                            "The GUI agent connection closed. Reopen the saved chat to reconnect."
-                        )
-                    )
+            self.fail_pending(
+                "The GUI agent connection closed. Reopen the saved chat to reconnect."
+            )
 
     def close_pipes(self):
         if self.writer:
@@ -2176,7 +2227,7 @@ class Bridge:
 
 async def serve(native: Native, *, account=None, sandbox=False):
     loop = asyncio.get_running_loop()
-    reader = asyncio.StreamReader(limit=MAX_MESSAGE)
+    reader = asyncio.StreamReader(limit=READ_AHEAD)
     transport, _ = await loop.connect_read_pipe(
         lambda: asyncio.StreamReaderProtocol(reader), sys.stdin
     )
@@ -2192,10 +2243,13 @@ async def serve(native: Native, *, account=None, sandbox=False):
     bridge = Bridge(native, emit, account=account, sandbox=sandbox)
     poll = asyncio.create_task(bridge.poll())
     try:
-        while line := await reader.readline():
+        while True:
             try:
+                if not (line := await read_line(reader)):
+                    break
                 message = json.loads(line)
             except ValueError:
+                # Too long or not JSON: answered as an invalid message, and the next is read.
                 message = None
             bridge.spawn(bridge.handle(message))
     finally:

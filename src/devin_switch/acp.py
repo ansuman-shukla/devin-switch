@@ -13,6 +13,7 @@ from devin_switch import (
     acp_state,
     agent_browser,
     handoff,
+    pr_tab,
     relay,
     sessions,
     side,
@@ -61,6 +62,11 @@ LOCAL_COMMANDS = [
     {
         "name": "subagents",
         "description": "Show this chat's subagents live in a tab; this chat keeps working",
+    },
+    {
+        "name": "pr",
+        "description": "Show this chat's pull requests in a tab; this chat keeps working",
+        "input": {"hint": "optional link or number"},
     },
 ]
 LOCAL_NAMES = {"/" + command["name"] for command in LOCAL_COMMANDS}
@@ -758,6 +764,7 @@ class Bridge:
         self.side_server = None
         self.side_sinks = {}
         self.roster = subagent_tab.Roster()
+        self.pulls = pr_tab.Pulls(native.store)
         self.run_ids = subagents.RunIds()
         # Whether Desktop itself asked for the native's revert notices.
         self.reverts = False
@@ -854,6 +861,9 @@ class Bridge:
                 for key in (subagents.STARTED, subagents.COMPLETED):
                     if isinstance(event := meta.get(key), dict):
                         await self.track_subagent(backend, key, event)
+            if backend.chat:
+                # Live or replayed, and whoever wrote it: the PR tab lists the links a chat shows.
+                self.pulls.feed(params.get("sessionId"), update)
             # Desktop 3.12 puts every agent message at the chat's top level, so a subagent's
             # report would read as Devin's own. Live or replayed, it never reaches Desktop or
             # the reload record: the Subagents tab shows it instead (the roster above kept it).
@@ -1027,6 +1037,11 @@ class Bridge:
         if method == "session/prompt" and prompt_command(params)[2] == "/subagents":
             # A view beside the chat: like /btw it never waits for (or joins) the turn.
             return await self.show_subagents(chat)
+        if method == "session/prompt" and prompt_command(params)[2] == "/pr":
+            # Another view beside the chat; what follows names pull requests to add to it.
+            return await self.show_pulls(chat, prompt_command(params)[1][1:])
+        if method == "session/prompt":
+            self.pulls.said(session_id, prompt_text(params))
         if method in SIDE_REQUESTS and chat.suspended and await self.held_elsewhere(session_id):
             # The native answers this for a chat it hasn't loaded; Desktop ignores it quietly.
             raise RpcError("Session not found: this chat is open in another window.", -32602)
@@ -1085,6 +1100,7 @@ class Bridge:
                     )
                 self.chats.pop(session_id)
                 self.roster.forget(session_id)
+                self.pulls.forget(session_id)
                 self.run_ids.forget(session_id)
                 return {}
             if method == "session/prompt":
@@ -1099,6 +1115,8 @@ class Bridge:
                     return await self.prompt_turn(chat, params)
                 finally:
                     chat.prompting = False
+                    # The turn is over, so a link its last message ended with is whole.
+                    self.pulls.flush(session_id)
                     await self.show_rewind(chat)
             if method == "session/cancel" and chat.suspended:
                 return {}
@@ -1283,6 +1301,20 @@ class Bridge:
         """
         if not self.roster.showing(chat.session_id):
             notice = self.side_server.opened(chat.session_id, "subagents")
+            async with chat.backend.emitting:
+                await self.emit({"jsonrpc": "2.0", **notice})
+        return {"stopReason": "end_turn"}
+
+    async def show_pulls(self, chat, words):
+        """A /pr typed in the chat: its pull requests page opens as a Browser tab of it.
+
+        The links and numbers after the command are added to the page. Desktop opens a new tab
+        for every notice, so a chat whose page is connected gets none. Nothing reaches the
+        chat's agent or waits for its turn, and gh is asked beside the answer, not before it.
+        """
+        self.pulls.show(chat.session_id, words, chat.backend.project)
+        if not self.pulls.showing(chat.session_id):
+            notice = self.side_server.opened(chat.session_id, "pr")
             async with chat.backend.emitting:
                 await self.emit({"jsonrpc": "2.0", **notice})
         return {"stopReason": "end_turn"}

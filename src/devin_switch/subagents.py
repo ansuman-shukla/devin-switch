@@ -25,6 +25,11 @@ from devin_switch.store import Store, SwitchError, private_directory, write_json
 
 STARTED = "cognition.ai/subagent_started"
 COMPLETED = "cognition.ai/subagent_completed"
+PAUSED = "cognition.ai/subagent_paused"
+CONTEXT = "cognition.ai/subagent_context"
+# The payloads that can say which run of a subagent they belong to, and each one's field for
+# the subagent.
+RUN_EVENTS = {STARTED: "agentId", COMPLETED: "agentId", PAUSED: "agentId", CONTEXT: "parentAgentId"}
 QUOTA_FAILURE = re.compile(r"usage quota has been exhausted|quota exhausted", re.IGNORECASE)
 TASK_LIMIT = 4000
 PROGRESS_LIMIT = 2000
@@ -272,3 +277,77 @@ def resume_text(store: Store, session_id: str, agents: dict) -> str:
             done = ""
         lines.append(f"Last saved progress:\n{done or '(none saved)'}")
     return "\n".join(lines)
+
+
+def named(event: object, field: str = "agentId") -> str | None:
+    """The subagent an event is about, when it names one."""
+    agent = event.get(field) if isinstance(event, dict) else None
+    return agent if isinstance(agent, str) and agent else None
+
+
+class Runs:
+    """The runs in one transcript of a chat."""
+
+    def __init__(self) -> None:
+        # Per subagent: how many starts the transcript holds, and the ID given to the run the
+        # subagent is on (none: its first run, or a run the native named).
+        self.starts: dict[str, int] = {}
+        self.given: dict[str, str] = {}
+
+
+class RunIds:
+    """Names the runs of a resumed subagent for Desktop, because the native does not.
+
+    The native reports a subagent that is run again (`run_subagent` with `resume`) like its
+    first run: the same `agentId` and no `runId`, a field both sides define. Desktop 3.14 keys
+    a subagent's row by `runId ?? agentId` and files a second start under a row nothing finds
+    again, so that run's end, pauses and own updates land on the first row and the new one
+    counts as running for good. From a subagent's second start on, every payload of the run
+    therefore gets `runId` "<agentId>-<n>". A first run stays as sent, and so does every run
+    whose start the native named itself: once the native fills `runId`, this changes nothing
+    and can be removed.
+
+    A replay that Desktop is not shown (a handoff's, a resume's) still fills the bridge's
+    reload record, which Desktop is shown on a reload during a turn. Its runs are numbered
+    on their own, from the replay's first, and a run after it takes no number it holds.
+    """
+
+    def __init__(self) -> None:
+        # Per chat: the runs Desktop was sent, and those of the latest replay kept from it.
+        self.shown: dict[str, Runs] = {}
+        self.kept: dict[str, Runs] = {}
+
+    def stamp(self, session_id: str, update: dict, *, shown: bool = True) -> None:
+        """Name the run in an update on its way to Desktop, or (not `shown`) to the record alone.
+
+        Never raises on what a native might send: the caller is the chat's read loop.
+        """
+        meta = update.get("_meta")
+        if not isinstance(meta, dict):
+            return
+        chats = self.shown if shown else self.kept
+        if agent := named(started := meta.get(STARTED)):
+            runs = chats.setdefault(session_id, Runs())
+            count = runs.starts[agent] = runs.starts.get(agent, 0) + 1
+            runs.given.pop(agent, None)
+            if count > 1 and started.get("runId") is None:
+                runs.given[agent] = f"{agent}-{count}"
+            if not shown:
+                # Desktop's count never falls behind the record's: the next run it is sent
+                # takes one more than the larger of the two.
+                sent = self.shown.setdefault(session_id, Runs()).starts
+                sent[agent] = max(sent.get(agent, 0), count)
+        if (runs := chats.get(session_id)) and runs.given:
+            for key, field in RUN_EVENTS.items():
+                event = meta.get(key)
+                run = runs.given.get(named(event, field))
+                if run and event.get("runId") is None:
+                    event["runId"] = run
+
+    def forget(self, session_id: str | None, *, shown: bool = True) -> None:
+        """Number a chat's runs from the first again: in the record, which every load's replay
+        starts anew, and in Desktop's rows when it is `shown` that replay (or closed the chat).
+        """
+        self.kept.pop(session_id, None)
+        if shown:
+            self.shown.pop(session_id, None)

@@ -1,4 +1,5 @@
 import asyncio
+import copy
 import json
 import re
 import time
@@ -21,7 +22,7 @@ from test_acp import (
 )
 from test_side import fetch, lines, opened, request
 
-from devin_switch import acp, side, subagent_tab
+from devin_switch import acp, side, subagent_tab, subagents
 from devin_switch.store import SwitchError
 
 AGENT = "acb63708"
@@ -29,6 +30,9 @@ AGENT = "acb63708"
 PAST = "9d2e41aa"
 # The foreground subagent the fake's "foreground" turn reports (FAKE_FOREGROUND_SUBAGENT).
 WORKER = "5e1f0c2a"
+# The foreground subagent the fake's "rerun" turns run, and then run again with `resume`.
+RESUMED = "d29b75b1"
+SECOND, THIRD, FOURTH = f"{RESUMED}-2", f"{RESUMED}-3", f"{RESUMED}-4"
 # What the fake's delegate subagent says, in two messages, before its first command.
 REPLY = "I'll run the command.\n\n## Plan\nSleep, then **report**."
 STARTED = "cognition.ai/subagent_started"
@@ -37,6 +41,8 @@ PAUSED = "cognition.ai/subagent_paused"
 CONTEXT = "cognition.ai/subagent_context"
 STREAM = "cognition.ai/streamingMessageId"
 STAMP = {"cognition.ai/timestamp": "2026-11-11T07:22:21.637022+00:00"}
+# The payloads that can name the run they belong to, and their field for the subagent.
+RUN_EVENTS = {STARTED: "agentId", COMPLETED: "agentId", PAUSED: "agentId", CONTEXT: "parentAgentId"}
 LISTED = {
     "id",
     "title",
@@ -859,6 +865,485 @@ def test_a_reopened_chat_shows_a_past_subagents_steps_but_not_what_it_said(
             await stop(bridge, chat, turn)
 
     asyncio.run(scenario())
+
+
+def about(messages, agent=RESUMED):
+    """The updates Desktop was sent that are a subagent's start, end, pause or own work."""
+    return [
+        update
+        for message in messages
+        if message.get("method") == "session/update"
+        and isinstance(meta := (update := message["params"]["update"]).get("_meta"), dict)
+        and any(
+            isinstance(event := meta.get(key), dict) and event.get(field) == agent
+            for key, field in RUN_EVENTS.items()
+        )
+    ]
+
+
+def run_ids(messages, agent=RESUMED):
+    """Each of those updates in order: what it is, and the run it says it belongs to."""
+    found = []
+    for update in about(messages, agent):
+        for key, field in RUN_EVENTS.items():
+            event = update["_meta"].get(key)
+            if isinstance(event, dict) and event.get(field) == agent:
+                what = update["sessionUpdate"] if key == CONTEXT else key.rpartition("_")[2]
+                found.append((what, event.get("runId")))
+    return found
+
+
+def one_run(run=None, *between):
+    """What Desktop is shown of one run of the fake's resumed subagent, each part in `run`."""
+    parts = ("started", "agent_thought_chunk", "usage_update", *between, "completed")
+    return [(part, run) for part in parts]
+
+
+def in_run(update, run):
+    """An update as it reads once each of its run payloads names `run`."""
+    update = copy.deepcopy(update)
+    for key in RUN_EVENTS.keys() & update["_meta"].keys():
+        update["_meta"][key]["runId"] = run
+    return update
+
+
+def reported(task, *between, **named):
+    """One run as the fake's "rerun" turns send it, bar its thought (which carries a time)."""
+    start = started(RESUMED, task=task, isBackground=False, **named)
+    return [start, by(RESUMED, USAGE), *between, completed(RESUMED, True, f"Did: {task}")]
+
+
+def unthinking(updates):
+    return [update for update in updates if update["sessionUpdate"] != "agent_thought_chunk"]
+
+
+def named_by(ids, update, chat="chat"):
+    """An update as `ids` sends it on, the one given left as it was."""
+    update = copy.deepcopy(update)
+    ids.stamp(chat, update)
+    return update
+
+
+def ask(bridge, chat, text):
+    return bridge.dispatch("session/prompt", prompt_params(chat.session_id, text))
+
+
+def test_a_resumed_subagents_run_reaches_desktop_under_a_run_id_of_its_own(acp_native, tmp_path):
+    """The native reports a resumed run like the first: the same agent ID and no run ID. Desktop
+    3.14 then files the second start under a row nothing finds again, and counts it as running
+    for good ("N subagents running")."""
+
+    async def scenario():
+        async with in_process(acp_native) as (bridge, messages):
+            chat = await new_chat(bridge, tmp_path)
+            await ask(bridge, chat, "rerun")
+            # The first run is as the native sent it. The resumed one names itself on its
+            # start, on its own updates and on its end.
+            assert run_ids(messages) == one_run() + one_run(SECOND)
+            shown = about(messages)
+            resumed = [in_run(update, SECOND) for update in reported("Now the rest")]
+            assert unthinking(shown) == reported("Read notes.md") + resumed
+            thoughts = [
+                update for update in shown if update["sessionUpdate"] == "agent_thought_chunk"
+            ]
+            assert [(update["content"]["text"], set(update["_meta"])) for update in thoughts] == [
+                ("…", {CONTEXT, STREAM, "cognition.ai/timestamp"})
+            ] * 2
+            assert [update["_meta"][CONTEXT] for update in thoughts] == [
+                {"parentAgentId": RESUMED},
+                {"parentAgentId": RESUMED, "runId": SECOND},
+            ]
+
+            # Every further run gets the next number.
+            start = len(messages)
+            await ask(bridge, chat, "rerun-again")
+            assert run_ids(messages[start:]) == one_run(THIRD)
+            assert unthinking(about(messages[start:])) == [
+                in_run(update, THIRD) for update in reported("Read on")
+            ]
+            # What the subagent said stays out of the chat all the same: its row has it.
+            assert "On it:" not in json.dumps(messages)
+            assert bridge.roster.reply(chat.session_id, RESUMED) == "On it: Read on"
+
+    asyncio.run(scenario())
+
+
+def test_a_resumed_run_that_is_paused_says_which_run_was_paused(acp_native, tmp_path):
+    async def scenario():
+        async with in_process(acp_native) as (bridge, messages):
+            chat = await new_chat(bridge, tmp_path)
+            await ask(bridge, chat, "rerun-paused")
+            assert run_ids(messages) == one_run() + one_run(SECOND, "paused", "paused")
+            parked = [paused(RESUMED, True), paused(RESUMED, False)]
+            resumed = [in_run(update, SECOND) for update in reported("Now the rest", *parked)]
+            assert unthinking(about(messages)) == reported("Read notes.md") + resumed
+            assert states(bridge.roster, chat.session_id) == {RESUMED: "done"}
+
+    asyncio.run(scenario())
+
+
+def test_a_run_id_of_the_natives_own_reaches_desktop_as_sent(acp_native, tmp_path, monkeypatch):
+    """A native that names its runs needs no help: nothing is renamed, nothing is added."""
+    monkeypatch.setenv("FAKE_RUN_IDS", "1")
+
+    async def scenario():
+        async with in_process(acp_native) as (bridge, messages):
+            chat = await new_chat(bridge, tmp_path)
+            await ask(bridge, chat, "rerun")
+            await ask(bridge, chat, "rerun-again")
+            tasks = ("Read notes.md", "Now the rest", "Read on")
+            sent = [
+                update
+                for number, task in enumerate(tasks, 1)
+                for update in reported(task, runId=f"native-run-{number}")
+            ]
+            assert unthinking(about(messages)) == sent
+            # The fake names a run on its start alone: the rest of the run stays unnamed.
+            named = [run for _, run in run_ids(messages) if run]
+            assert named == ["native-run-1", "native-run-2", "native-run-3"]
+
+    asyncio.run(scenario())
+
+
+def test_a_reload_during_a_turn_replays_a_resumed_run_as_it_went_out(
+    acp_native, tmp_path, monkeypatch
+):
+    gate = tmp_path / "may-finish"
+    monkeypatch.setenv("FAKE_SUBAGENT_GATE", str(gate))
+
+    async def scenario():
+        async with in_process(acp_native) as (bridge, messages):
+            chat = await new_chat(bridge, tmp_path)
+            turn = asyncio.create_task(ask(bridge, chat, "rerun"))
+            # The resumed run is working: only its end is still to come.
+            await until(lambda: len(about(messages)) == 7)
+            live = about(messages)
+            assert run_ids(messages) == one_run() + one_run(SECOND)[:-1]
+
+            # The bridge's own record answers a reload during a turn. Asked twice, it reads
+            # the same: a replay is no new start.
+            for _ in range(2):
+                start = len(messages)
+                await bridge.dispatch("session/load", chat.setup)
+                replay = about(messages[start:])
+                assert run_ids(messages[start:]) == [
+                    ("started", None),
+                    ("agent_thought_chunk", None),
+                    ("completed", None),
+                    ("started", SECOND),
+                    ("agent_thought_chunk", SECOND),
+                    # A record keeps only the latest usage update, and sends it last.
+                    ("usage_update", SECOND),
+                ]
+                steps = [update for update in live if update["sessionUpdate"] != "usage_update"]
+                assert replay == [*steps, live[-1]]
+            assert native_loads(acp_native) == []
+
+            start = len(messages)
+            gate.touch()
+            assert await turn == {"stopReason": "end_turn"}
+            assert run_ids(messages[start:]) == [("completed", SECOND)]
+            start = len(messages)
+            await ask(bridge, chat, "rerun-again")
+            assert run_ids(messages[start:]) == one_run(THIRD)
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("reopened", ["open", "released", "closed"])
+def test_the_natives_own_replay_numbers_a_resumed_subagents_runs_from_the_first(
+    acp_native, tmp_path, monkeypatch, reopened
+):
+    """Desktop builds its transcript anew from what a load replays, so the runs in it are
+    numbered anew as well, however many the bridge counted before."""
+    monkeypatch.setenv("FAKE_REPLAY_RESUMED", "1")
+
+    async def scenario():
+        async with in_process(acp_native) as (bridge, messages):
+            chat = await new_chat(bridge, tmp_path)
+            await ask(bridge, chat, "rerun")
+            assert run_ids(messages) == one_run() + one_run(SECOND)
+            if reopened == "released":
+                chat.backend.last_activity -= acp.IDLE_TIMEOUT + 1
+                assert await bridge.release_idle(chat)
+            if reopened == "closed":
+                await bridge.dispatch("session/close", {"sessionId": chat.session_id})
+                # A closed chat's runs are not kept.
+                end = completed(RESUMED)
+                assert named_by(bridge.run_ids, end, chat.session_id) == end
+
+            for loads in (1, 2):
+                start = len(messages)
+                await bridge.dispatch("session/load", chat.setup)
+                assert len(native_loads(acp_native)) == loads
+                assert run_ids(messages[start:]) == one_run() + one_run(SECOND)
+
+            # A run after the replay carries on from the replay's numbers.
+            start = len(messages)
+            await ask(bridge, chat, "rerun-again")
+            assert run_ids(messages[start:]) == one_run(THIRD)
+
+    asyncio.run(scenario())
+
+
+def test_a_load_under_a_running_turn_numbers_the_runs_like_any_replay_of_the_native(
+    acp_native, tmp_path, monkeypatch
+):
+    """From CLI 3000.14 on the native itself answers a load during a turn."""
+    gate = tmp_path / "may-finish"
+    monkeypatch.setenv("FAKE_SUBAGENT_GATE", str(gate))
+    for switch in ("PROCESS_MODEL", "REPLAY_RESUMED"):
+        monkeypatch.setenv(f"FAKE_{switch}", "1")
+
+    async def scenario():
+        async with in_process(acp_native) as (bridge, messages):
+            chat = await new_chat(bridge, tmp_path)
+            turn = asyncio.create_task(ask(bridge, chat, "rerun"))
+            await until(lambda: len(about(messages)) == 7)
+            start = len(messages)
+            await bridge.dispatch("session/load", chat.setup)
+            assert native_loads(acp_native) == [chat.backend.process.pid]
+            assert run_ids(messages[start:]) == one_run() + one_run(SECOND)
+
+            # The working run's end names the run its replayed start named.
+            start = len(messages)
+            gate.touch()
+            assert await turn == {"stopReason": "end_turn"}
+            assert run_ids(messages[start:]) == [("completed", SECOND)]
+            start = len(messages)
+            await ask(bridge, chat, "rerun-again")
+            assert run_ids(messages[start:]) == one_run(THIRD)
+
+    asyncio.run(scenario())
+
+
+def recorded(first, second, working):
+    """A record replay of two finished runs and one at work, each with the run ID it names.
+
+    A record keeps only the latest usage update, and sends it last.
+    """
+    finished = [
+        (part, run)
+        for run in (first, second)
+        for part in ("started", "agent_thought_chunk", "completed")
+    ]
+    return [*finished, *one_run(working)[:2], ("usage_update", working)]
+
+
+@pytest.mark.parametrize("unseen", ["handoff", "release"])
+def test_a_replay_desktop_never_sees_is_numbered_for_the_record_alone(
+    acp_native, tmp_path, monkeypatch, unseen
+):
+    """Desktop keeps its transcript over a handoff and over an idle release: the new native's
+    replay of the chat is not shown, so its starts are none Desktop has rows for. The bridge's
+    record holds that replay, though, and a reload during a turn shows Desktop the record."""
+    gate = tmp_path / "may-finish"
+    monkeypatch.setenv("FAKE_SUBAGENT_GATE", str(gate))
+    monkeypatch.setenv("FAKE_REPLAY_RESUMED", "1")
+
+    async def scenario():
+        async with in_process(acp_native) as (bridge, messages):
+            chat = await new_chat(bridge, tmp_path)
+            old = chat.backend
+            gate.touch()
+            await ask(bridge, chat, "rerun")
+            await ask(bridge, chat, "rerun-again")
+            assert run_ids(messages) == one_run() + one_run(SECOND) + one_run(THIRD)
+
+            start = len(messages)
+            if unseen == "handoff":
+                await ask(bridge, chat, "/switch ansuman-2")
+            else:
+                old.last_activity -= acp.IDLE_TIMEOUT + 1
+                assert await bridge.release_idle(chat)
+            gate.unlink()
+            turn = asyncio.create_task(ask(bridge, chat, "rerun-again"))
+            await until(lambda: len(about(messages[start:])) == 3)
+            # The new native replayed the two runs it has saved, to the bridge alone. Desktop
+            # was sent three, so the run now at work is its fourth.
+            assert chat.backend is not old
+            assert native_loads(acp_native) == [chat.backend.process.pid]
+            assert run_ids(messages[start:]) == one_run(FOURTH)[:-1]
+
+            # The record's replay is numbered from its own first run, like one of the
+            # native's that Desktop is shown; the run at work reads as it went out.
+            start = len(messages)
+            await bridge.dispatch("session/load", chat.setup)
+            assert run_ids(messages[start:]) == recorded(None, SECOND, FOURTH)
+            assert len(native_loads(acp_native)) == 1
+            start = len(messages)
+            gate.touch()
+            assert await turn == {"stopReason": "end_turn"}
+            assert run_ids(messages[start:]) == [("completed", FOURTH)]
+
+    asyncio.run(scenario())
+
+
+def test_a_run_never_takes_a_number_the_record_holds_from_a_replay_desktop_never_saw(
+    acp_native, tmp_path, monkeypatch
+):
+    """A resume asks for no replay, so Desktop is sent none of the chat's earlier runs, while
+    the record holds them. The next run must be told apart from those in both."""
+    gate = tmp_path / "may-finish"
+    monkeypatch.setenv("FAKE_SUBAGENT_GATE", str(gate))
+    monkeypatch.setenv("FAKE_REPLAY_RESUMED", "1")
+
+    async def scenario():
+        async with in_process(acp_native) as (bridge, messages):
+            chat = await new_chat(bridge, tmp_path)
+            # Each such replay is numbered from its own first run.
+            for loads in (1, 2):
+                await bridge.dispatch("session/resume", chat.setup)
+                assert len(native_loads(acp_native)) == loads
+            assert about(messages) == []
+
+            turn = asyncio.create_task(ask(bridge, chat, "rerun-again"))
+            await until(lambda: len(about(messages)) == 3)
+            assert run_ids(messages) == one_run(THIRD)[:-1]
+            start = len(messages)
+            await bridge.dispatch("session/load", chat.setup)
+            assert run_ids(messages[start:]) == recorded(None, SECOND, THIRD)
+            gate.touch()
+            assert await turn == {"stopReason": "end_turn"}
+
+    asyncio.run(scenario())
+
+
+def test_a_resumed_subagent_stays_one_row_known_by_its_agent_id(acp_native, tmp_path, monkeypatch):
+    gate = tmp_path / "may-finish"
+    monkeypatch.setenv("FAKE_SUBAGENT_GATE", str(gate))
+
+    async def scenario():
+        async with in_process(acp_native) as (bridge, messages):
+            chat = await new_chat(bridge, tmp_path)
+            session_id, roster, server = chat.session_id, bridge.roster, bridge.side_server
+            store = acp_native.store
+            turn = asyncio.create_task(ask(bridge, chat, "rerun"))
+            await until(lambda: len(about(messages)) == 7)
+            (running,) = rows(roster, session_id)
+            assert set(running) == LISTED
+            assert (running["id"], running["title"], running["status"], running["step"]) == (
+                RESUMED,
+                "Sleeper",
+                "running",
+                "Writing",
+            )
+            assert chat.backend.running == {RESUMED}
+            assert list(subagents.load(store, session_id)["running"]) == [RESUMED]
+
+            gate.touch()
+            assert await turn == {"stopReason": "end_turn"}
+            # Desktop was told of two runs, the page and the saved records of one subagent.
+            assert run_ids(messages) == one_run() + one_run(SECOND)
+            (done,) = rows(roster, session_id)
+            assert done == {**running, "status": "done", "ended": done["ended"]}
+            assert running["started"] <= done["ended"] <= time.time()
+            _, reader, writer = await request(server.port, "GET", events_url(server, session_id))
+            assert await lines(reader, 1) == [{"subagents": [done]}]
+            writer.close()
+            assert roster.reply(session_id, RESUMED) == "On it: Now the rest"
+            assert not chat.backend.running
+            assert subagents.load(store, session_id)["running"] == {}
+            assert list(subagents.load_ended(store, session_id)["finished"]) == [RESUMED]
+
+    asyncio.run(scenario())
+
+
+def test_a_run_the_native_named_is_left_alone_among_runs_it_did_not_name():
+    ids = subagents.RunIds()
+    run = [started(), by(AGENT, THOUGHT), paused(AGENT, True), completed()]
+    assert [named_by(ids, update) for update in run] == run
+    second = [in_run(update, f"{AGENT}-2") for update in run]
+    assert [named_by(ids, update) for update in run] == second
+    # Named on its start alone, or on everything: either way nothing is added or renamed.
+    for own in ([started(runId="r3"), *run[1:]], [in_run(update, "r4") for update in run]):
+        assert [named_by(ids, update) for update in own] == own
+    # Every start counted, and a name left empty is no name.
+    assert named_by(ids, started(runId=None)) == started(runId=f"{AGENT}-5")
+    assert named_by(ids, completed()) == in_run(completed(), f"{AGENT}-5")
+    # A name of the native's on a later event of a run that the bridge named stays as well.
+    assert named_by(ids, in_run(by(AGENT, TOOL), "own")) == in_run(by(AGENT, TOOL), "own")
+
+
+def test_runs_are_numbered_per_chat_and_subagent_until_the_chat_is_forgotten():
+    ids = subagents.RunIds()
+    for update in (started(), started(), started("b2")):
+        ids.stamp("chat", update)
+    assert named_by(ids, completed()) == in_run(completed(), f"{AGENT}-2")
+    assert named_by(ids, completed("b2")) == completed("b2")
+    assert named_by(ids, by("root", USAGE)) == by("root", USAGE)
+    assert named_by(ids, started(), "other") == started()
+    assert named_by(ids, by(AGENT, TOOL), "other") == by(AGENT, TOOL)
+    # One update can be a subagent's own work and another one's start: each names its own.
+    nested = {**started("b2"), "_meta": {**started("b2")["_meta"], **by(AGENT, {})["_meta"]}}
+    stamped = named_by(ids, nested)["_meta"]
+    assert (stamped[STARTED]["runId"], stamped[CONTEXT]["runId"]) == ("b2-2", f"{AGENT}-2")
+
+    ids.forget("chat")
+    assert named_by(ids, completed()) == completed()
+    assert named_by(ids, started()) == started()
+    assert named_by(ids, started(), "other") == started(runId=f"{AGENT}-2")
+
+
+def test_a_replay_kept_from_desktop_is_numbered_on_its_own_from_its_first_run():
+    ids = subagents.RunIds()
+    run = [started(), by(AGENT, THOUGHT), paused(AGENT, True), completed()]
+    third = [in_run(update, f"{AGENT}-3") for update in run]
+    for _ in range(3):
+        shown = [named_by(ids, update) for update in run]
+    assert shown == third
+
+    def kept(update):
+        update = copy.deepcopy(update)
+        ids.stamp("chat", update, shown=False)
+        return update
+
+    # Each replay Desktop is not shown starts the record anew: so are its runs numbered.
+    for _ in range(2):
+        ids.forget("chat", shown=False)
+        assert [kept(update) for update in run] == run
+        assert [kept(update) for update in run] == [in_run(update, f"{AGENT}-2") for update in run]
+        assert kept(started("b2")) == started("b2")
+    # Desktop's rows are as they were: the run it was last sent is still the third...
+    assert named_by(ids, completed()) == in_run(completed(), f"{AGENT}-3")
+    assert named_by(ids, started(), "other") == started()
+    # ...and the next one is the fourth.
+    assert named_by(ids, started()) == started(runId=f"{AGENT}-4")
+    assert kept(completed()) == in_run(completed(), f"{AGENT}-2")
+
+    # Where the record holds more runs than Desktop was sent, the next run takes none of
+    # their numbers: a reload during a turn shows Desktop the record.
+    assert named_by(ids, started("b2")) == started("b2", runId="b2-2")
+    ids.forget("chat", shown=False)
+    for _ in range(6):
+        ids.stamp("chat", started(), shown=False)
+    assert named_by(ids, started()) == started(runId=f"{AGENT}-7")
+    # A replay that Desktop is shown starts both anew.
+    ids.forget("chat")
+    assert named_by(ids, started()) == started()
+    assert kept(started()) == started()
+
+
+def test_naming_runs_never_raises_on_odd_updates():
+    ids = subagents.RunIds()
+    for _ in range(2):
+        ids.stamp("chat", started())
+    odd_ids = (None, "", 7, ["a"], {"a": 1})
+    for meta in (
+        None,
+        "text",
+        [STARTED],
+        *({key: value} for key in RUN_EVENTS for value in (None, "x", [1])),
+        *({key: {field: odd}} for key, field in RUN_EVENTS.items() for odd in odd_ids),
+        {key: {"title": "No ID"} for key in RUN_EVENTS},
+    ):
+        update = {"sessionUpdate": "tool_call_update", "_meta": meta}
+        assert named_by(ids, update) == update
+        ids.stamp("chat", sent := copy.deepcopy(update), shown=False)
+        assert sent == update
+    ids.stamp("chat", {"sessionUpdate": "usage_update"})
+    # None of them was a start.
+    assert named_by(ids, started()) == started(runId=f"{AGENT}-3")
 
 
 async def get(port, target, host=None):

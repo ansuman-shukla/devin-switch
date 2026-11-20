@@ -14,6 +14,7 @@ file: older bridges still running in other windows rewrite the first one with on
 they know.
 """
 
+import copy
 import json
 import re
 import sqlite3
@@ -30,6 +31,10 @@ CONTEXT = "cognition.ai/subagent_context"
 # The payloads that can say which run of a subagent they belong to, and each one's field for
 # the subagent.
 RUN_EVENTS = {STARTED: "agentId", COMPLETED: "agentId", PAUSED: "agentId", CONTEXT: "parentAgentId"}
+# Per chat, the most ends and pauses that wait for the history page with their run's start,
+# and the most pages whose added rows are remembered: `History` says what one more loses.
+CARRIED_LIMIT = 100
+PAGE_LIMIT = 100
 QUOTA_FAILURE = re.compile(r"usage quota has been exhausted|quota exhausted", re.IGNORECASE)
 TASK_LIMIT = 4000
 PROGRESS_LIMIT = 2000
@@ -294,6 +299,15 @@ def name_runs(meta: dict, given: dict[str, str]) -> None:
             event["runId"] = run
 
 
+def alone(update: dict, key: str) -> dict:
+    """A copy of an end or a pause for an older page: there it starts and ends nothing else."""
+    found = copy.deepcopy(update)
+    for other in (STARTED, COMPLETED, PAUSED):
+        if other != key:
+            found["_meta"].pop(other, None)
+    return found
+
+
 class Runs:
     """The runs in one transcript of a chat."""
 
@@ -302,6 +316,74 @@ class Runs:
         # subagent is on (none: its first run, or a run the native named).
         self.starts: dict[str, int] = {}
         self.given: dict[str, str] = {}
+
+
+class History:
+    """What a chat's stream and its history pages owe each other since its last shown load.
+
+    Desktop loads a chat's newest rows (the tail) and then its older rows page by page,
+    newest page first. It applies a subagent's end or pause as the segment that holds it
+    arrives, to a row of that segment: one whose run started in an older page finds no row
+    and is dropped for good. So such an event is kept here, and the page that brings the
+    run's start brings a copy of it too.
+    """
+
+    def __init__(self) -> None:
+        # The subagents with a start in the stream Desktop was sent: the tail and what came
+        # live. What follows a start belongs to that run, never to a page's.
+        self.started: set[str] = set()
+        # Per subagent, oldest first: its ends and pauses that led a segment, as the native
+        # sent them. At most CARRIED_LIMIT in all: one more is not kept, and its run stays
+        # running in the page that holds its start.
+        self.carried: dict[str, list[dict]] = {}
+        # Per subagent: the name of its run that the newest page with a start of it left
+        # open, for what the stream still brings of that run.
+        self.open: dict[str, str] = {}
+        # Per page, by the rows it covers: the rows it was given, for the same answer when
+        # Desktop asks again. At most PAGE_LIMIT pages: one more is named and nothing else,
+        # so nothing is copied to it or kept from it, and no live event takes a name from it.
+        self.added: dict[tuple[int, int], list[dict]] = {}
+
+    def carry(self, agent: str, events: list[dict], *, older: bool = False) -> None:
+        """Keep events that led a segment: the stream's, or (`older`) a page's, which
+        happened before everything kept from the segments that arrived before it.
+        """
+        room = CARRIED_LIMIT - sum(len(kept) for kept in self.carried.values())
+        if events := events[: max(room, 0)]:
+            kept = self.carried.get(agent, [])
+            self.carried[agent] = events + kept if older else kept + events
+
+    def place(
+        self,
+        session_id: str,
+        given: dict[str, str],
+        starts: dict[str, int],
+        running: set[str],
+        leading: dict[str, list[dict]],
+    ) -> list[dict]:
+        """Settle a page with what is owed, once, and return the rows it gains.
+
+        Of the page: each subagent's `starts`, the name `given` to the run it is on at the
+        page's end, the subagents `running` there, and the ends and pauses `leading` it.
+        """
+        added = []
+        for agent in starts:
+            # What led a newer segment belongs to this page's last run of the subagent, so
+            # no older page may get it, whether this one can use it or not.
+            events = self.carried.pop(agent, [])
+            run = given.get(agent)
+            if run is None or agent not in running:
+                continue
+            for update in events:
+                name_runs(update["_meta"], given)
+                added.append({"sessionId": session_id, "update": update})
+                if COMPLETED in update["_meta"]:
+                    running.discard(agent)
+            if agent in running:
+                self.open.setdefault(agent, run)
+        for agent, events in leading.items():
+            self.carry(agent, events, older=True)
+        return added
 
 
 class RunIds:
@@ -319,12 +401,19 @@ class RunIds:
     A replay that Desktop is not shown (a handoff's, a resume's) still fills the bridge's
     reload record, which Desktop is shown on a reload during a turn. Its runs are numbered
     on their own, from the replay's first, and a run after it takes no number it holds.
+
+    Older rows reach Desktop as history pages, each folded on its own: `stamp_page` names
+    the runs of a page after the page, and `History` holds what a run that spans segments
+    needs.
     """
 
     def __init__(self) -> None:
         # Per chat: the runs Desktop was sent, and those of the latest replay kept from it.
         self.shown: dict[str, Runs] = {}
         self.kept: dict[str, Runs] = {}
+        # Per chat: what the stream and the history pages owe each other since its last load
+        # that Desktop was shown.
+        self.history: dict[str, History] = {}
 
     def stamp(self, session_id: str, update: dict, *, shown: bool = True) -> None:
         """Name the run in an update on its way to Desktop, or (not `shown`) to the record alone.
@@ -341,13 +430,45 @@ class RunIds:
             runs.given.pop(agent, None)
             if count > 1 and started.get("runId") is None:
                 runs.given[agent] = f"{agent}-{count}"
-            if not shown:
+            if shown:
+                self.history.setdefault(session_id, History()).started.add(agent)
+            else:
                 # Desktop's count never falls behind the record's: the next run it is sent
                 # takes one more than the larger of the two.
                 sent = self.shown.setdefault(session_id, Runs()).starts
                 sent[agent] = max(sent.get(agent, 0), count)
+        if shown:
+            self.lead(session_id, update, meta)
         if (runs := chats.get(session_id)) and runs.given:
             name_runs(meta, runs.given)
+
+    def lead(self, session_id: str, update: dict, meta: dict) -> None:
+        """Deal with what the stream brings of a run that started in older history.
+
+        Desktop was sent no start of that subagent since the chat's last shown load, so the
+        run's row is in a history page. Where a page left that run open, the event gets the
+        name the page gave it. Otherwise an end or a pause goes out as sent, and a copy waits
+        for the page that holds its start.
+        """
+        history = self.history.get(session_id)
+        for key in (PAUSED, COMPLETED):
+            agent = named(event := meta.get(key))
+            if agent is None or event.get("runId") is not None:
+                continue
+            history = history or self.history.setdefault(session_id, History())
+            if agent in history.started:
+                continue
+            if run := history.open.get(agent):
+                event["runId"] = run
+                if key == COMPLETED:
+                    del history.open[agent]
+            else:
+                history.carry(agent, [alone(update, key)])
+        if history and history.open:
+            agent = named(context := meta.get(CONTEXT), "parentAgentId")
+            run = history.open.get(agent)
+            if run and agent not in history.started and context.get("runId") is None:
+                context["runId"] = run
 
     def stamp_page(self, session_id: str, page: dict) -> None:
         """Name the runs in a page of older rows on its way to Desktop, in place: it can be 15 MB.
@@ -358,6 +479,10 @@ class RunIds:
         its first one too: unnamed, that one would share a row with the first run of the tail,
         which is unnamed. What belongs to a run that started in an older page stays as sent.
 
+        A run still open at the page's end gets, as the page's last rows, copies of the pauses
+        and the end that a newer segment brought of it, under its name (see `History`). The
+        same page asked for again gets the same rows. A page past PAGE_LIMIT is named only.
+
         Never raises on what a native might send: an oddly shaped page is left as it is.
         """
         rows, covered = page.get("updates"), page.get("coveredRange")
@@ -367,9 +492,12 @@ class RunIds:
         if type(first) is not int or type(end) is not int:
             return
         # Per subagent: its starts in the page so far, and the name of the run it is on (none:
-        # a run the native named, or one from an older page).
+        # a run the native named, or one from an older page). Then the subagents whose last
+        # start has no end yet, and the ends and pauses from before a subagent's first start.
         starts: dict[str, int] = {}
         given: dict[str, str] = {}
+        running: set[str] = set()
+        leading: dict[str, list[dict]] = {}
         for row in rows:
             update = row.get("update") if isinstance(row, dict) else None
             meta = update.get("_meta") if isinstance(update, dict) else None
@@ -378,10 +506,29 @@ class RunIds:
             if agent := named(started := meta.get(STARTED)):
                 count = starts[agent] = starts.get(agent, 0) + 1
                 given.pop(agent, None)
+                running.add(agent)
                 if started.get("runId") is None:
                     given[agent] = f"{agent}-h{end}-{count}"
+            for key in (PAUSED, COMPLETED):
+                agent = named(event := meta.get(key))
+                if agent in starts:
+                    if key == COMPLETED:
+                        running.discard(agent)
+                elif agent and event.get("runId") is None:
+                    leading.setdefault(agent, []).append(alone(update, key))
             if given:
                 name_runs(meta, given)
+        if not starts and not leading:
+            return
+        history = self.history.setdefault(session_id, History())
+        added = history.added.get((first, end))
+        if added is None:
+            if len(history.added) >= PAGE_LIMIT:
+                return
+            added = history.added[first, end] = history.place(
+                session_id, given, starts, running, leading
+            )
+        rows.extend(added)
 
     def forget(self, session_id: str | None, *, shown: bool = True) -> None:
         """Number a chat's runs from the first again: in the record, which every load's replay
@@ -390,3 +537,5 @@ class RunIds:
         self.kept.pop(session_id, None)
         if shown:
             self.shown.pop(session_id, None)
+            # A new tail: its history pages come again, and what the old one owed is void.
+            self.history.pop(session_id, None)

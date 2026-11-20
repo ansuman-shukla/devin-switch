@@ -859,6 +859,10 @@ async def handle(message):
         settings["model"] = params["modelId"]
     elif method == "_cognition.ai/command/revise":
         result = {"command": params["command"] + " --revised"}
+    elif method == "_cognition.ai/session/loadPage" and os.environ.get("FAKE_PAGE_ERROR"):
+        # A page the native refuses, with the error a test gives it.
+        emit({"id": message["id"], "error": json.loads(os.environ["FAKE_PAGE_ERROR"])})
+        return
     elif method == "_cognition.ai/session/loadPage" and os.environ.get("FAKE_PAGE"):
         # Like CLI 3000.14, a page of older rows is one answer line, however long: the test
         # writes the page to this file.

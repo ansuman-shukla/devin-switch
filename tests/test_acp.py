@@ -2689,6 +2689,62 @@ def test_gui_live_end_names_the_run_that_a_history_page_left_open(
     asyncio.run(scenario())
 
 
+def test_gui_history_page_fetched_again_after_a_reload_from_the_record_ends_its_run(
+    acp_native, tmp_path, monkeypatch
+):
+    """A reload during a turn that the bridge answers from its record, then the pages again.
+
+    The record holds the live end under the name of a run whose row is in a page, so Desktop
+    reads the end before any row of that run and drops it. The page that holds the start is
+    fetched again after that, and must bring what came live of the run it left open.
+    """
+    answer, gate = tmp_path / "page.json", tmp_path / "say-gate"
+    live = [
+        run_event(HELPER, "paused", paused=True),
+        run_event(HELPER, "completed", success=True, summary="Done."),
+    ]
+    monkeypatch.setenv("FAKE_PAGE", str(answer))
+    monkeypatch.setenv("FAKE_SAY", json.dumps(live))
+    monkeypatch.setenv("FAKE_SAY_GATE", str(gate))
+
+    async def scenario():
+        async with connect(acp_native) as client:
+            session_id = await client.new(tmp_path)
+            params = {"sessionId": session_id, "cwd": str(tmp_path), "mcpServers": []}
+            name = f"{HELPER}-h125-1"
+            open_run = run_event(HELPER, "started", name)
+            named = [
+                run_event(HELPER, "paused", name, paused=True),
+                run_event(HELPER, "completed", name, success=True, summary="Done."),
+            ]
+            answer.write_text(json.dumps(page_of(session_id, [run_event(HELPER, "started")])))
+
+            async def page():
+                request = client.request(LOAD_PAGE, {"sessionId": session_id, **PAGE})
+                return (await asyncio.wait_for(request, 5)).get("result")
+
+            assert await page() == page_of(session_id, [open_run])
+            turn = asyncio.create_task(client.prompt(session_id, "say"))
+            try:
+                await until(lambda: len(about_runs(client.messages)) == 2)
+                assert about_runs(client.messages) == named
+                # The reload replays the record: the pause and the end, and no row of the run.
+                start = len(client.messages)
+                assert "result" in await asyncio.wait_for(client.request("session/load", params), 5)
+                assert about_runs(client.messages[start:]) == named
+                # The page fetched again brings both after its own rows, in order, named.
+                assert await page() == page_of(session_id, [open_run, *named])
+            finally:
+                gate.touch()
+            assert (await turn)["result"]["stopReason"] == "end_turn"
+            # The reload was answered from the record, never by the native, and the page
+            # answers the same once the turn is over.
+            assert not [call for call in logged(acp_native) if call["method"] == "session/load"]
+            assert await page() == page_of(session_id, [open_run, *named])
+
+    asyncio.run(scenario())
+
+
 def test_gui_second_load_starts_the_history_pages_over(acp_native, tmp_path, monkeypatch):
     """A load shows Desktop a new tail, and Desktop fetches every page again from it."""
     answer, gate = tmp_path / "page.json", tmp_path / "say-gate"

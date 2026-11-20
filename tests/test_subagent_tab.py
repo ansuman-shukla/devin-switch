@@ -1719,10 +1719,103 @@ def test_a_history_page_asked_for_again_gets_the_same_answer():
     answer = in_page(f"{AGENT}-h120-1", started(), paused(AGENT, True), end)
     for _ in range(3):
         assert paged(ids, started(), **OLDER) == answer
-    # Asking again changed nothing that is still owed: the other run is open as it was.
+    # Asking again changed nothing that is still owed: the other run is open as it was, and
+    # its end, when it comes, is the newer page's alone.
     assert named_by(ids, completed(OTHER)) == in_run(completed(OTHER), f"{OTHER}-h125-1")
-    assert paged(ids, *newer) == first
+    assert paged(ids, *newer) == [*first, in_run(completed(OTHER), f"{OTHER}-h125-1")]
     assert paged(ids, started(), **OLDER) == answer
+
+
+def test_what_comes_live_of_a_run_that_a_page_left_open_joins_that_pages_answer():
+    """Desktop asks for a page again on a retry, and for every page after a reload that the
+    bridge answered from its record. There the live end comes before any row of its run and
+    is dropped, so the page that holds the start must bring the end from then on."""
+    ids = subagents.RunIds()
+    name = f"{AGENT}-h125-1"
+    parked = paused(AGENT, True)
+    assert named_by(ids, parked) == parked
+    given = in_page(name, started(), parked)
+    assert paged(ids, started()) == given
+    older = in_page(f"{OTHER}-h120-1", started(OTHER), completed(OTHER))
+    assert paged(ids, started(OTHER), completed(OTHER), **OLDER) == older
+
+    end = ended(where="a live turn")
+    live = [by(AGENT, TOOL), paused(AGENT, False), by(AGENT, THOUGHT), end]
+    sent = copy.deepcopy(live)
+    for update in sent:
+        ids.stamp("chat", update)
+    assert sent == in_page(name, *live)
+    # The pause and the end follow the page's own rows and what it was given before, in the
+    # order they happened, under the run's name. The run's own work belongs to no page.
+    answer = [*given, *in_page(name, paused(AGENT, False), end)]
+    for _ in range(3):
+        assert paged(ids, started()) == answer
+    # They are copies: what went out live is as it was, and no other page gains anything.
+    assert sent == in_page(name, *live)
+    assert paged(ids, started(OTHER), completed(OTHER), **OLDER) == older
+    # The end closed the run: what follows it is not that page's.
+    for update in (completed(), paused(AGENT, True), by(AGENT, TOOL)):
+        assert named_by(ids, update) == update
+    assert paged(ids, started()) == answer
+
+
+def test_a_live_copy_is_named_like_a_row_of_its_page_and_starts_nothing_again():
+    ids = subagents.RunIds()
+    names = {AGENT: f"{AGENT}-h125-1", OTHER: f"{OTHER}-h125-1"}
+    opened = [in_run(started(), names[AGENT]), in_run(started(OTHER), names[OTHER])]
+    assert paged(ids, started(), started(OTHER)) == opened
+    # One update can end a subagent, be its parent's own work and start another subagent.
+    end = completed(OTHER)["_meta"][COMPLETED]
+    parts = {COMPLETED: end, CONTEXT: {"parentAgentId": AGENT}, **started("c3")["_meta"]}
+    named = {
+        COMPLETED: {**end, "runId": names[OTHER]},
+        CONTEXT: {"parentAgentId": AGENT, "runId": names[AGENT]},
+    }
+    # Live, both open runs are named, and the stream's own first run of the third is not.
+    assert named_by(ids, {**completed(OTHER), "_meta": parts}) == {
+        **completed(OTHER),
+        "_meta": {**named, **started("c3")["_meta"]},
+    }
+    assert paged(ids, started(), started(OTHER)) == [
+        *opened,
+        {**completed(OTHER), "_meta": named},
+    ]
+
+
+def test_a_page_takes_only_so_many_copies_of_what_comes_live():
+    ids = subagents.RunIds()
+    name = f"{AGENT}-h125-1"
+    first = paused(AGENT, True)
+    assert named_by(ids, first) == first
+    assert paged(ids, started()) == in_page(name, started(), first)
+    parked = [paused(AGENT, number % 2 == 1) for number in range(subagents.CARRIED_LIMIT + 1)]
+    end = ended(where="a live turn")
+    # Every one of them is named as it goes out, whatever the page keeps.
+    for update in (*parked, end):
+        assert named_by(ids, update) == in_run(update, name)
+    # The page keeps that many copies, the one it was given before among them; a pause past
+    # the limit is not copied. The end always is: it is what ends the run in that page.
+    kept = parked[: subagents.CARRIED_LIMIT - 1]
+    for _ in range(2):
+        assert paged(ids, started()) == in_page(name, started(), first, *kept, end)
+
+
+def test_a_load_that_desktop_is_shown_forgets_what_came_live_of_an_open_run():
+    ids = subagents.RunIds()
+    name = f"{AGENT}-h125-1"
+    end = ended(where="a live turn")
+    assert paged(ids, started()) == in_page(name, started())
+    assert named_by(ids, end) == in_run(end, name)
+    assert paged(ids, started()) == in_page(name, started(), end)
+    # A replay kept from Desktop is no new tail: the page answers as it did.
+    ids.forget("chat", shown=False)
+    assert paged(ids, started()) == in_page(name, started(), end)
+    # A replay Desktop is shown is one. Its tail or a newer page holds that end now; the
+    # page starts over, and so does what it gains of the run it leaves open this time.
+    ids.forget("chat")
+    assert paged(ids, started()) == in_page(name, started())
+    assert named_by(ids, paused(AGENT, True)) == in_run(paused(AGENT, True), name)
+    assert paged(ids, started()) == in_page(name, started(), paused(AGENT, True))
 
 
 def test_a_load_that_desktop_is_shown_starts_the_pages_over():

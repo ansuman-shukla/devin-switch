@@ -89,6 +89,8 @@ ASKING_AGAIN = "Sending your message again…"
 CANCEL_REQUEST = "$/cancel_request"
 QUESTIONS = "cognition.ai/questions"
 TOOL_CALL = "cognition.ai/toolCallId"
+EVENT_ID = "cognition.ai/eventId"
+LOAD_PAGE = "_cognition.ai/session/loadPage"
 RESOURCE_EXHAUSTED = -32011
 RESOURCE_NOT_FOUND = -32002
 AUTO_SWITCH_LIMIT = 3
@@ -137,7 +139,7 @@ SIDE_REQUESTS = {
     "_cognition.ai/queuedMessages/update",
     "_cognition.ai/diagnostics/sessionExport",
     # Desktop 3.14: older rows of a bounded load, fetched on open and on scroll.
-    "_cognition.ai/session/loadPage",
+    LOAD_PAGE,
     "_cognition.ai/session/feedback",
     "_cognition.ai/session/reaction",
     "_cognition.ai/session/stop",
@@ -319,6 +321,26 @@ def show_question_details(update: dict) -> None:
         ]
         if lines:
             card["question"] = f"{card['question']}\n\n" + "\n".join(lines)
+
+
+def drop_event_id(update: object) -> None:
+    """Take the saved event's id off a replayed agent message, so it reads like a live one.
+
+    It runs in a chat's read loop for every update, so it never raises on odd native input.
+    """
+    if not isinstance(update, dict) or update.get("sessionUpdate") != "agent_message_chunk":
+        return
+    meta = update.get("_meta")
+    if isinstance(meta, dict):
+        meta.pop(EVENT_ID, None)
+
+
+def drop_page_event_ids(page: dict) -> None:
+    """The same for each row of a history page, in place: a page can be 15 MB of JSON."""
+    rows = page.get("updates")
+    for row in rows if isinstance(rows, list) else ():
+        if isinstance(row, dict):
+            drop_event_id(row.get("update"))
 
 
 async def read_line(reader: asyncio.StreamReader) -> bytes:
@@ -927,6 +949,12 @@ class Bridge:
             # reload record holds. A no-op once the native sends `runId` itself: remove it then.
             if backend.session_id:
                 self.run_ids.stamp(backend.session_id, update, shown=not backend.suppress_replay)
+            # Desktop 3.14 takes a replayed reply that names its saved event for a cloud
+            # message: a click on its file link waits for a snippet that nothing sends in a
+            # local chat. Without the id it opens the file, as in a live reply, which never has
+            # one. A replay kept from Desktop is recorded the same way. Remove once Desktop opens
+            # local files for such replies or the native stops sending the id.
+            drop_event_id(update)
             if backend.chat:
                 backend.record(message)
             if backend.suppress_replay:
@@ -1386,6 +1414,10 @@ class Bridge:
         if method in {"session/set_mode", "session/set_model"}:
             category = "mode" if method == "session/set_mode" else "model"
             backend.remember_selection(category, params[f"{category}Id"])
+        if method == LOAD_PAGE:
+            # Older rows are a replay that comes as an answer, past `from_backend`: its
+            # replies lose their event ids here, for the reason given there.
+            drop_page_event_ids(result)
         return result
 
     def remember_editor(self, method, params):

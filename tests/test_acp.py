@@ -2330,6 +2330,285 @@ def test_gui_reload_mid_turn_replays_from_the_latest_native_load(acp_native, tmp
     asyncio.run(scenario())
 
 
+EVENT = "cognition.ai/eventId"
+STREAMING = "cognition.ai/streamingMessageId"
+LOAD_PAGE = "_cognition.ai/session/loadPage"
+SAVED_AT = "2026-11-19T09:30:00.000Z"
+README = '<ref_file file="/work/app/README.md" />'
+LINKS = f'See {README} and <ref_snippet file="/work/app/main.py" lines="3-9" />.'
+
+
+def saved(kind, text, event=None):
+    """One message as CLI 3000.14 replays it: whole, and named by its saved event if it has one."""
+    meta = {EVENT: event, "timestamp": SAVED_AT} if event else {"timestamp": SAVED_AT}
+    return {"sessionUpdate": kind, "content": {"type": "text", "text": text}, "_meta": meta}
+
+
+def saved_chat(shown=False):
+    """A saved chat's rows as the native replays them, or as Desktop is `shown` them.
+
+    Desktop 3.14 takes an agent message that names an event for a cloud message: a click on its
+    file link waits for a snippet that nothing sends in a local chat. So the agent's messages
+    reach Desktop without that name, and everything else as the native sent it.
+    """
+    read = {"sessionUpdate": "tool_call", "toolCallId": "call_1", "title": "Read README.md"}
+    return [
+        saved("user_message_chunk", f"What is in {README}?", "23934"),
+        saved("agent_message_chunk", "Let me read it.", None if shown else "23935"),
+        saved("agent_thought_chunk", f"{README} is short.", "23936"),
+        {**read, "status": "completed", "_meta": {EVENT: "23936", "timestamp": SAVED_AT}},
+        saved("agent_message_chunk", LINKS, None if shown else "23937"),
+    ]
+
+
+def saved_page(session_id, shown=False):
+    """An answer to `loadPage` that holds those rows, with a page's own fields around them."""
+    return {
+        "updates": [{"sessionId": session_id, "update": row} for row in saved_chat(shown)],
+        "coveredRange": {"startRowId": 120, "endRowId": 125},
+        "nextEndRowId": 120,
+        "exhausted": False,
+        "replayFilterVersion": "1",
+    }
+
+
+def live_reply(text):
+    """One chunk of a reply as CLI 3000.14 streams it: named by its message, never by an event."""
+    return {**agent_text(text), "_meta": {STREAMING: "0b6f1c1e", "timestamp": SAVED_AT}}
+
+
+def rows(messages):
+    """The chat's rows among what Desktop was sent, in order (its settings come beside them)."""
+    return [
+        message["params"]["update"]
+        for message in messages
+        if message.get("method") == "session/update"
+        and message["params"]["update"].get("sessionUpdate") not in acp.BACKGROUND_UPDATES
+    ]
+
+
+def test_gui_replayed_reply_reaches_desktop_without_its_event_id(acp_native, tmp_path, monkeypatch):
+    """A file link in a reply opened its file only until the chat was loaded again."""
+    monkeypatch.setenv("FAKE_REPLAY_SAY", json.dumps(saved_chat()))
+
+    async def scenario():
+        async with connect(acp_native) as client:
+            session_id = await client.new(tmp_path)
+            params = {"sessionId": session_id, "cwd": str(tmp_path), "mcpServers": []}
+            start = len(client.messages)
+            assert "result" in await client.request("session/load", params)
+            _, question, first, thought, tool, reply = rows(client.messages[start:])
+            # The reply's text and time are the native's; only the event's name is gone.
+            assert reply == saved("agent_message_chunk", LINKS)
+            assert first == saved("agent_message_chunk", "Let me read it.")
+            # Desktop shows a user message's tags as text and knows it by this id elsewhere,
+            # and thoughts and tool calls were not checked: all three stay as sent.
+            assert [question, thought, tool] == [saved_chat()[0], *saved_chat()[2:4]]
+            assert all(EVENT in row["_meta"] for row in (question, thought, tool))
+
+    asyncio.run(scenario())
+
+
+def test_gui_live_reply_reaches_desktop_exactly_as_sent(acp_native, tmp_path, monkeypatch):
+    """A live reply names no event, so nothing in it changes: not a key, not their order."""
+    live = live_reply(LINKS)
+    monkeypatch.setenv("FAKE_SAY", json.dumps([live]))
+
+    async def scenario():
+        async with connect(acp_native) as client:
+            session_id = await client.new(tmp_path)
+            assert (await client.prompt(session_id, "say"))["result"]["stopReason"] == "end_turn"
+            (sent,) = rows(client.messages)
+            assert json.dumps(sent) == json.dumps(live)
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("reopen", ["reload", "switch"])
+def test_gui_reload_mid_turn_replays_replies_without_event_ids(
+    acp_native, tmp_path, monkeypatch, reopen
+):
+    """The reload record holds what Desktop is shown, also of a replay that was kept from it."""
+    live, gate = live_reply("Working on it."), tmp_path / "say-gate"
+    monkeypatch.setenv("FAKE_REPLAY_SAY", json.dumps(saved_chat()))
+    monkeypatch.setenv("FAKE_SAY", json.dumps([live]))
+    monkeypatch.setenv("FAKE_SAY_GATE", str(gate))
+
+    async def scenario():
+        async with connect(acp_native) as client:
+            session_id = await client.new(tmp_path)
+            params = {"sessionId": session_id, "cwd": str(tmp_path), "mcpServers": []}
+            if reopen == "reload":
+                assert "result" in await client.request("session/load", params)
+            else:
+                # A handoff loads the chat in the next login's native and keeps that replay
+                # from Desktop, which already shows the chat.
+                await client.prompt(session_id, "/switch ansuman-2")
+                assert acp_native.store.selected().name == "ansuman-2"
+                assert README not in json.dumps(client.messages)
+            turn = asyncio.create_task(client.prompt(session_id, "say"))
+            try:
+                await until(lambda: live in rows(client.messages))
+                start = len(client.messages)
+                assert "result" in await asyncio.wait_for(client.request("session/load", params), 5)
+                assert rows(client.messages[start:]) == [
+                    agent_text("historical replay"),
+                    *saved_chat(shown=True),
+                    {**agent_text("say"), "sessionUpdate": "user_message_chunk"},
+                    live,
+                ]
+            finally:
+                # Also when this test fails: the stand-in agent must not wait on for good.
+                gate.touch()
+            assert (await turn)["result"]["stopReason"] == "end_turn"
+            # The reload during the turn was answered from the record, not by the native.
+            loads = [call for call in logged(acp_native) if call["method"] == "session/load"]
+            assert len(loads) == 1
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("working", [False, True])
+def test_gui_history_page_replies_reach_desktop_without_event_ids(
+    acp_native, tmp_path, monkeypatch, working
+):
+    """Desktop 3.14 fetches older rows as an answer, on open and on scroll, also mid-turn.
+
+    An answer never passes the path a chat's updates take, and it is a replay like a load's.
+    """
+    answer, gate = tmp_path / "page.json", tmp_path / "say-gate"
+    monkeypatch.setenv("FAKE_PAGE", str(answer))
+    monkeypatch.setenv("FAKE_SAY", json.dumps([agent_text("live progress")]))
+    monkeypatch.setenv("FAKE_SAY_GATE", str(gate))
+
+    async def scenario():
+        async with connect(acp_native) as client:
+            session_id = await client.new(tmp_path)
+
+            async def page(sent):
+                answer.write_text(json.dumps(sent))
+                request = client.request(LOAD_PAGE, {"sessionId": session_id, **PAGE})
+                return (await asyncio.wait_for(request, 5)).get("result")
+
+            turn = asyncio.create_task(client.prompt(session_id, "say")) if working else None
+            try:
+                if working:
+                    await wait_for_text(client, "live progress")
+                # The rows in the native's order and the page's own fields are as sent.
+                assert await page(saved_page(session_id)) == saved_page(session_id, shown=True)
+                # A row that is no row is passed on as it is, and the rows beside it are read.
+                odd, reply = [None, {"update": "text"}], saved("agent_message_chunk", "Hi", "7")
+                assert await page({"updates": [*odd, {"update": reply}], "exhausted": True}) == {
+                    "updates": [*odd, {"update": saved("agent_message_chunk", "Hi")}],
+                    "exhausted": True,
+                }
+                assert await page({"updates": "none"}) == {"updates": "none"}
+                assert not turn or not turn.done()
+            finally:
+                gate.touch()
+            if turn:
+                assert (await turn)["result"]["stopReason"] == "end_turn"
+            only_native(acp_native, session_id)
+
+    asyncio.run(scenario())
+
+
+def test_gui_history_page_the_native_refuses_is_answered_with_its_error(
+    acp_native, tmp_path, monkeypatch
+):
+    """An error is not a page: whatever its details hold reaches Desktop as before."""
+    details = {"cognition.ai/errorKind": "internal", "updates": saved_page("any")["updates"]}
+    refused = {"code": -32603, "message": "Internal error", "data": details}
+    monkeypatch.setenv("FAKE_PAGE_ERROR", json.dumps(refused))
+
+    async def scenario():
+        async with in_process(acp_native) as (bridge, messages):
+            created = await bridge.dispatch("session/new", {"cwd": str(tmp_path), "mcpServers": []})
+            error = await wire_error(bridge, messages, LOAD_PAGE, {**created, **PAGE})
+            assert error["code"] == -32603
+            assert error["message"].startswith("Native ACP rejected the request")
+            assert error["data"] == details
+
+    asyncio.run(scenario())
+
+
+def test_gui_answer_to_another_request_keeps_its_event_ids(acp_native, tmp_path, monkeypatch):
+    """Only a history page is a replay: no other answer is read, whatever it holds."""
+
+    async def scenario():
+        async with in_process(acp_native) as (bridge, _):
+            created = await bridge.dispatch("session/new", {"cwd": str(tmp_path), "mcpServers": []})
+            session_id = created["sessionId"]
+
+            async def answer(method, params, timeout=None):
+                return saved_page(session_id)
+
+            monkeypatch.setattr(bridge.chats[session_id].backend, "request", answer)
+            steps = await bridge.dispatch("_cognition.ai/revert/listSteps", created)
+            assert steps == saved_page(session_id)
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize(
+    ("kind", "kept"),
+    [
+        ("agent_message_chunk", False),
+        ("user_message_chunk", True),
+        ("agent_thought_chunk", True),
+        ("tool_call", True),
+        ("tool_call_update", True),
+        ("usage_update", True),
+    ],
+)
+def test_event_id_is_dropped_from_an_agent_message_alone(kind, kept):
+    update = saved(kind, LINKS, "23937")
+    acp.drop_event_id(update)
+    assert update == saved(kind, LINKS, "23937" if kept else None)
+
+
+ODD_UPDATES = [
+    None,
+    7,
+    "agent_message_chunk",
+    ["agent_message_chunk"],
+    {},
+    {"_meta": {EVENT: "1"}},
+    {"sessionUpdate": ["agent_message_chunk"], "_meta": {EVENT: "1"}},
+    {"sessionUpdate": "agent_message_chunk"},
+    {"sessionUpdate": "agent_message_chunk", "_meta": None},
+    {"sessionUpdate": "agent_message_chunk", "_meta": EVENT},
+    {"sessionUpdate": "agent_message_chunk", "_meta": [EVENT]},
+    {"sessionUpdate": "agent_message_chunk", "_meta": {}},
+]
+
+
+@pytest.mark.parametrize("update", ODD_UPDATES)
+def test_event_id_drop_leaves_an_odd_update_as_it_is(update):
+    """It runs in a chat's read loop, where an error fails the chat's requests or its reading."""
+    given = json.dumps(update)
+    acp.drop_event_id(update)
+    assert json.dumps(update) == given
+
+
+@pytest.mark.parametrize(
+    "page",
+    [
+        {},
+        {"exhausted": True, "nextEndRowId": None},
+        {"updates": None},
+        {"updates": "none"},
+        {"updates": {"0": {"update": saved("agent_message_chunk", "Hi", "7")}}},
+        {"updates": [None, 7, "row", [], {}, {"sessionId": "any"}]},
+        {"updates": [{"update": odd} for odd in ODD_UPDATES]},
+    ],
+)
+def test_event_id_drop_leaves_an_odd_history_page_as_it_is(page):
+    given = json.dumps(page)
+    acp.drop_page_event_ids(page)
+    assert json.dumps(page) == given
+
+
 def test_gui_switch_preserves_workspace_and_mcp_context_without_persisting_it(
     acp_native, tmp_path, monkeypatch
 ):

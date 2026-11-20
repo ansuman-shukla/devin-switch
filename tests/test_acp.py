@@ -1,4 +1,5 @@
 import asyncio
+import hashlib
 import json
 import os
 import sys
@@ -165,6 +166,8 @@ async def connect(native, *arguments, auto_respond=True):
         stdin=asyncio.subprocess.PIPE,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
+        # Like Desktop, the client reads the bridge's lines however long they are.
+        limit=2**30,
     )
     client = Client(process, auto_respond=auto_respond)
     try:
@@ -657,6 +660,300 @@ def test_gui_sidebar_requests_answer_during_a_turn(acp_native, tmp_path, method)
             assert "result" in answer and not turn.done()
             await client.send({"method": "session/cancel", "params": {"sessionId": session_id}})
             await turn
+
+    asyncio.run(scenario())
+
+
+MEBIBYTE = 1024 * 1024
+# What Desktop 3.14's pager sends after a bounded load: every row before the replayed tail, up
+# to its default of 10,000 (`.probes/history-page` in the main checkout).
+PAGE = {"startRowId": 0, "endRowId": 23475, "limit": 10000}
+UNREADABLE = "The GUI agent sent a message that could not be read"
+CLOSED = "The GUI agent connection closed. Reopen the saved chat to reconnect."
+
+
+def image_block(size, mark=0):
+    """An attached image as ACP carries it: `size` bytes of base64 text, told apart by `mark`."""
+    return {"type": "image", "mimeType": "image/png", "data": f"{mark:04d}".ljust(size, "A")}
+
+
+def history_page(session_id, mebibytes):
+    """An answer to `loadPage` like CLI 3000.14's: older rows in ONE line, images and all."""
+    return {
+        "updates": [
+            {
+                "sessionId": session_id,
+                "update": {
+                    "sessionUpdate": "user_message_chunk",
+                    "content": image_block(MEBIBYTE, row),
+                },
+            }
+            for row in range(mebibytes)
+        ],
+        "coveredRange": {"startRowId": 0, "endRowId": PAGE["endRowId"]},
+        "nextEndRowId": None,
+        "exhausted": True,
+        "replayFilterVersion": "1",
+    }
+
+
+def agent_text(text):
+    return {"sessionUpdate": "agent_message_chunk", "content": {"type": "text", "text": text}}
+
+
+def only_native(native, session_id):
+    """The one native process that served a chat's requests, checked to be running still."""
+    (pid,) = {call["pid"] for call in logged(native) if call["sessionId"] == session_id}
+    os.kill(pid, 0)
+    return pid
+
+
+@pytest.mark.parametrize("mebibytes", [9, 40])
+def test_gui_history_page_of_any_length_reaches_desktop_and_keeps_the_agent(
+    acp_native, tmp_path, monkeypatch, mebibytes
+):
+    """Desktop 3.14 asks for a chat's older rows at once, and the native answers in one line.
+
+    A chat with 11.5 MB of images answered 15.4 MB. The bridge read lines of up to 8 MiB, and
+    a longer one ended the chat's healthy native: every later message got "has stopped".
+    """
+    answer = tmp_path / "page.json"
+    monkeypatch.setenv("FAKE_PAGE", str(answer))
+
+    async def scenario():
+        async with connect(acp_native) as client:
+            session_id = await client.new(tmp_path)
+            page = history_page(session_id, mebibytes)
+            answer.write_text(json.dumps(page))
+            assert answer.stat().st_size > mebibytes * MEBIBYTE
+            got = await client.request(
+                "_cognition.ai/session/loadPage", {"sessionId": session_id, **PAGE}
+            )
+            assert got.get("result") == page
+            assert (await client.prompt(session_id, "hello"))["result"]["stopReason"] == "end_turn"
+            assert client.agent_replies()[-1]["session"] == session_id
+            pages = [call for call in logged(acp_native) if call["method"].endswith("/loadPage")]
+            assert [call["pid"] for call in pages] == [only_native(acp_native, session_id)]
+
+    asyncio.run(scenario())
+
+
+def test_gui_update_longer_than_the_read_buffer_reaches_desktop(acp_native, tmp_path, monkeypatch):
+    """A turn's update of 9 MiB, such as an image, is an update like any other."""
+    said = tmp_path / "said.json"
+    monkeypatch.setenv("FAKE_SAY_FILE", str(said))
+    long = {"sessionUpdate": "user_message_chunk", "content": image_block(9 * MEBIBYTE)}
+    after = agent_text("after the long one")
+    said.write_text(json.dumps([long, after]))
+
+    async def scenario():
+        async with connect(acp_native) as client:
+            session_id = await client.new(tmp_path)
+            assert (await client.prompt(session_id, "say"))["result"]["stopReason"] == "end_turn"
+            updates = [
+                message["params"]["update"]
+                for message in client.messages
+                if message.get("method") == "session/update"
+            ]
+            assert updates.index(long) < updates.index(after)
+            assert (await client.prompt(session_id, "hello"))["result"]["stopReason"] == "end_turn"
+            assert client.agent_replies()[-1]["session"] == session_id
+            only_native(acp_native, session_id)
+
+    asyncio.run(scenario())
+
+
+def test_gui_prompt_longer_than_the_read_buffer_reaches_the_agent_and_other_chats_go_on(
+    acp_native, tmp_path
+):
+    """A prompt with pasted images is one line too; reading it once ended the whole bridge."""
+
+    async def scenario():
+        async with connect(acp_native) as client:
+            first = await client.new(tmp_path)
+            other = await client.new(tmp_path)
+            image = image_block(9 * MEBIBYTE)
+            params = {"sessionId": first, "prompt": [{"type": "text", "text": "hello"}, image]}
+            answered = await client.request("session/prompt", params)
+            assert answered["result"]["stopReason"] == "end_turn"
+            (sent,) = [call for call in logged(acp_native) if call["method"] == "session/prompt"]
+            assert sent["images"] == [hashlib.sha256(image["data"].encode()).hexdigest()]
+            # A line that is no message is answered as invalid, and the window's chats go on.
+            client.process.stdin.write(b"not a message\n")
+            await client.process.stdin.drain()
+            invalid = {"code": -32600, "message": "Invalid ACP message."}
+            await until(lambda: invalid in [message.get("error") for message in client.messages])
+            assert (await client.prompt(other, "hello"))["result"]["stopReason"] == "end_turn"
+            assert client.agent_replies()[-1]["session"] == other
+            assert client.process.returncode is None
+
+    asyncio.run(scenario())
+
+
+def test_gui_desktop_line_over_the_ceiling_is_answered_and_the_bridge_keeps_serving(
+    acp_native, monkeypatch
+):
+    """Desktop's lines follow the same rule: a dropped one must not end every chat's bridge."""
+    monkeypatch.setattr(acp, "MAX_MESSAGE", 64 * 1024)
+    (bridge_in, desktop_out), (desktop_in, bridge_out) = os.pipe(), os.pipe()
+    monkeypatch.setattr(sys, "stdin", os.fdopen(bridge_in, "rb"))
+    monkeypatch.setattr(sys, "stdout", os.fdopen(bridge_out, "wb"))
+
+    async def scenario():
+        loop = asyncio.get_running_loop()
+        answers = asyncio.StreamReader()
+        await loop.connect_read_pipe(
+            lambda: asyncio.StreamReaderProtocol(answers), os.fdopen(desktop_in, "rb")
+        )
+        desktop, _ = await loop.connect_write_pipe(
+            asyncio.BaseProtocol, os.fdopen(desktop_out, "wb")
+        )
+        serving = asyncio.create_task(acp.serve(acp_native))
+        desktop.write(b"x" * (65 * 1024) + b"\n")
+        dropped = json.loads(await asyncio.wait_for(answers.readline(), 10))
+        assert dropped["error"] == {"code": -32600, "message": "Invalid ACP message."}
+        listing = {"jsonrpc": "2.0", "id": 1, "method": "session/list"}
+        desktop.write(json.dumps(listing).encode() + b"\n")
+        answer = json.loads(await asyncio.wait_for(answers.readline(), 10))
+        assert (answer["id"], answer["error"]["message"]) == (1, "Initialize the GUI bridge first.")
+        desktop.close()
+        await asyncio.wait_for(serving, 10)
+
+    asyncio.run(scenario())
+
+
+def test_gui_answer_over_the_ceiling_fails_its_request_and_keeps_the_agent(
+    acp_native, tmp_path, monkeypatch
+):
+    """A line over the ceiling is dropped unread, so the request it may have answered is told."""
+    monkeypatch.setattr(acp, "MAX_MESSAGE", 9 * MEBIBYTE)
+    answer = tmp_path / "page.json"
+    monkeypatch.setenv("FAKE_PAGE", str(answer))
+
+    async def scenario():
+        async with in_process(acp_native) as (bridge, _):
+            created = await bridge.dispatch("session/new", {"cwd": str(tmp_path), "mcpServers": []})
+            session_id = created["sessionId"]
+            backend = bridge.chats[session_id].backend
+            answer.write_text(json.dumps(history_page(session_id, 12)))
+            with pytest.raises(SwitchError, match=UNREADABLE):
+                # Bounded: a request must never wait for an answer that was dropped.
+                await asyncio.wait_for(
+                    bridge.dispatch("_cognition.ai/session/loadPage", {"sessionId": session_id}), 10
+                )
+            reply = await bridge.dispatch("session/prompt", prompt_params(session_id, "hello"))
+            assert reply["stopReason"] == "end_turn"
+            assert bridge.chats[session_id].backend is backend
+            assert backend.process.poll() is None and not backend.writer.is_closing()
+
+    asyncio.run(scenario())
+
+
+def test_gui_update_over_the_ceiling_is_dropped_and_the_next_one_arrives(
+    acp_native, tmp_path, monkeypatch
+):
+    """Nothing says what a dropped line was, so the turn's request is not left waiting either."""
+    monkeypatch.setattr(acp, "MAX_MESSAGE", 9 * MEBIBYTE)
+    said = tmp_path / "said.json"
+    monkeypatch.setenv("FAKE_SAY_FILE", str(said))
+    long = {"sessionUpdate": "user_message_chunk", "content": image_block(12 * MEBIBYTE)}
+    said.write_text(json.dumps([long, agent_text("after the long one")]))
+
+    async def scenario():
+        async with in_process(acp_native) as (bridge, messages):
+            created = await bridge.dispatch("session/new", {"cwd": str(tmp_path), "mcpServers": []})
+            session_id = created["sessionId"]
+            backend = bridge.chats[session_id].backend
+            with pytest.raises(SwitchError, match=UNREADABLE):
+                await asyncio.wait_for(
+                    bridge.dispatch("session/prompt", prompt_params(session_id, "say")), 10
+                )
+            await until(
+                lambda: "after the long one" in replayed_texts(messages, "agent_message_chunk")
+            )
+            assert not replayed(messages, "user_message_chunk")
+            reply = await bridge.dispatch("session/prompt", prompt_params(session_id, "hello"))
+            assert reply["stopReason"] == "end_turn"
+            assert bridge.chats[session_id].backend is backend
+            assert backend.process.poll() is None and not backend.writer.is_closing()
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("turn", ["noise", "odd"])
+def test_gui_line_that_is_no_usable_message_is_dropped_and_keeps_the_agent(
+    acp_native, tmp_path, turn
+):
+    """`noise` prints a line that is not JSON; `odd` sends an update without its update."""
+
+    async def scenario():
+        async with in_process(acp_native) as (bridge, messages):
+            created = await bridge.dispatch("session/new", {"cwd": str(tmp_path), "mcpServers": []})
+            session_id = created["sessionId"]
+            backend = bridge.chats[session_id].backend
+            with pytest.raises(SwitchError, match=UNREADABLE):
+                await asyncio.wait_for(
+                    bridge.dispatch("session/prompt", prompt_params(session_id, turn)), 10
+                )
+            # The turn's reply came after that line, and still arrives.
+            await until(lambda: len(replayed(messages, "agent_message_chunk")) == 1)
+            reply = await bridge.dispatch("session/prompt", prompt_params(session_id, "hello"))
+            assert reply["stopReason"] == "end_turn"
+            assert len(replayed(messages, "agent_message_chunk")) == 2
+            assert bridge.chats[session_id].backend is backend
+            assert backend.process.poll() is None and not backend.writer.is_closing()
+
+    asyncio.run(scenario())
+
+
+def test_gui_native_exit_still_ends_the_connection_for_a_waiting_request(acp_native, tmp_path):
+    """Only a stream that really ended closes a native's connection, with the message it had."""
+
+    async def scenario():
+        async with in_process(acp_native) as (bridge, _):
+            created = await bridge.dispatch("session/new", {"cwd": str(tmp_path), "mcpServers": []})
+            session_id = created["sessionId"]
+            backend = bridge.chats[session_id].backend
+            with pytest.raises(SwitchError) as failure:
+                await asyncio.wait_for(
+                    bridge.dispatch("session/prompt", prompt_params(session_id, "crash")), 10
+                )
+            assert str(failure.value) == CLOSED
+            await until(lambda: backend.process.poll() is not None)
+            assert backend.process.poll() == 7 and backend.writer.is_closing()
+
+    asyncio.run(scenario())
+
+
+def test_read_line_takes_lines_of_any_length_and_skips_only_one_over_the_ceiling(monkeypatch):
+    monkeypatch.setattr(acp, "MAX_MESSAGE", 100)
+
+    async def scenario():
+        # A buffer far shorter than the lines, so each is read in parts.
+        reader = asyncio.StreamReader(limit=16)
+        at_ceiling, over = b"a" * 99 + b"\n", b"b" * 100 + b"\n"
+        reader.feed_data(b"short\n" + at_ceiling + over + b"after\n" + b"cut off by the end")
+        reader.feed_eof()
+        assert await acp.read_line(reader) == b"short\n"
+        assert await acp.read_line(reader) == at_ceiling
+        with pytest.raises(acp.LineTooLong):
+            await acp.read_line(reader)
+        assert await acp.read_line(reader) == b"after\n"
+        assert await acp.read_line(reader) == b"cut off by the end"
+        assert await acp.read_line(reader) == b""
+
+        async def trickle(line):
+            for start in range(0, len(line), 7):
+                arriving.feed_data(line[start : start + 7])
+                await asyncio.sleep(0)
+
+        arriving = asyncio.StreamReader(limit=16)
+        monkeypatch.setattr(acp, "MAX_MESSAGE", 5000)
+        long = bytes(range(32, 127)) * 40 + b"\n"
+        feeding = asyncio.create_task(trickle(long + b"next\n"))
+        assert await acp.read_line(arriving) == long
+        assert await acp.read_line(arriving) == b"next\n"
+        await feeding
 
     asyncio.run(scenario())
 

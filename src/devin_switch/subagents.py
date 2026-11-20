@@ -420,6 +420,8 @@ class RunIds:
     Older rows reach Desktop as history pages, each folded on its own: `stamp_page` names
     the runs of a page after the page, and `History` holds what a run that spans segments
     needs.
+    That part outlives the naming: Desktop drops an end whose start sits in an older
+    page whoever named the run, and a run the native named is not carried today.
     """
 
     def __init__(self) -> None:

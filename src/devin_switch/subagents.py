@@ -285,6 +285,15 @@ def named(event: object, field: str = "agentId") -> str | None:
     return agent if isinstance(agent, str) and agent else None
 
 
+def name_runs(meta: dict, given: dict[str, str]) -> None:
+    """Say on each run payload of an update which run it is, never over a name of the native's."""
+    for key, field in RUN_EVENTS.items():
+        event = meta.get(key)
+        run = given.get(named(event, field))
+        if run and event.get("runId") is None:
+            event["runId"] = run
+
+
 class Runs:
     """The runs in one transcript of a chat."""
 
@@ -338,11 +347,41 @@ class RunIds:
                 sent = self.shown.setdefault(session_id, Runs()).starts
                 sent[agent] = max(sent.get(agent, 0), count)
         if (runs := chats.get(session_id)) and runs.given:
-            for key, field in RUN_EVENTS.items():
-                event = meta.get(key)
-                run = runs.given.get(named(event, field))
-                if run and event.get("runId") is None:
-                    event["runId"] = run
+            name_runs(meta, runs.given)
+
+    def stamp_page(self, session_id: str, page: dict) -> None:
+        """Name the runs in a page of older rows on its way to Desktop, in place: it can be 15 MB.
+
+        Desktop folds a page on its own and merges its rows into the ones it holds by row ID,
+        so what a page's runs are called must hold inside the page and clash with nothing
+        outside it. Every run that starts in the page is "<agentId>-h<the page's endRowId>-<n>",
+        its first one too: unnamed, that one would share a row with the first run of the tail,
+        which is unnamed. What belongs to a run that started in an older page stays as sent.
+
+        Never raises on what a native might send: an oddly shaped page is left as it is.
+        """
+        rows, covered = page.get("updates"), page.get("coveredRange")
+        if not isinstance(rows, list) or not isinstance(covered, dict):
+            return
+        first, end = covered.get("startRowId"), covered.get("endRowId")
+        if type(first) is not int or type(end) is not int:
+            return
+        # Per subagent: its starts in the page so far, and the name of the run it is on (none:
+        # a run the native named, or one from an older page).
+        starts: dict[str, int] = {}
+        given: dict[str, str] = {}
+        for row in rows:
+            update = row.get("update") if isinstance(row, dict) else None
+            meta = update.get("_meta") if isinstance(update, dict) else None
+            if not isinstance(meta, dict):
+                continue
+            if agent := named(started := meta.get(STARTED)):
+                count = starts[agent] = starts.get(agent, 0) + 1
+                given.pop(agent, None)
+                if started.get("runId") is None:
+                    given[agent] = f"{agent}-h{end}-{count}"
+            if given:
+                name_runs(meta, given)
 
     def forget(self, session_id: str | None, *, shown: bool = True) -> None:
         """Number a chat's runs from the first again: in the record, which every load's replay

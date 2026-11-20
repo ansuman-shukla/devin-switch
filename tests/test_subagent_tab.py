@@ -1346,6 +1346,185 @@ def test_naming_runs_never_raises_on_odd_updates():
     assert named_by(ids, started()) == started(runId=f"{AGENT}-3")
 
 
+# A second subagent, and the rows a history page covers: its runs are named after `endRowId`.
+OTHER = "b7e2c9d4"
+ROWS = {"startRowId": 120, "endRowId": 125}
+RUN = [started(), by(AGENT, THOUGHT), completed()]
+
+
+def page_of(*updates, chat="chat", **rows):
+    """An answer to `_cognition.ai/session/loadPage` that holds these updates, oldest first."""
+    covered = {**ROWS, **rows}
+    return {
+        "updates": [{"sessionId": chat, "update": copy.deepcopy(update)} for update in updates],
+        "coveredRange": covered,
+        "nextEndRowId": covered["startRowId"],
+        "exhausted": False,
+        "replayFilterVersion": "1",
+    }
+
+
+def paged(ids, *updates, chat="chat", **rows):
+    """The updates of that page as Desktop gets them; nothing else of the page may change."""
+    page = page_of(*updates, chat=chat, **rows)
+    ids.stamp_page(chat, page)
+    assert {**page, "updates": []} == {**page_of(chat=chat, **rows), "updates": []}
+    assert all(set(row) == {"sessionId", "update"} for row in page["updates"])
+    assert {row["sessionId"] for row in page["updates"]} <= {chat}
+    return [row["update"] for row in page["updates"]]
+
+
+def in_page(run, *updates):
+    return [in_run(update, run) for update in updates]
+
+
+def test_every_run_that_starts_in_a_history_page_is_named_after_the_page():
+    """Desktop folds a page on its own: unnamed, a resumed run's row there never ends, and the
+    page's first run shares a row with the tail's first."""
+    ids = subagents.RunIds()
+    other = [started(OTHER), completed(OTHER)]
+    assert paged(ids, *RUN, *RUN, *other) == [
+        *in_page(f"{AGENT}-h125-1", *RUN),
+        *in_page(f"{AGENT}-h125-2", *RUN),
+        *in_page(f"{OTHER}-h125-1", *other),
+    ]
+    # A pause belongs to the run before the next start, like an end.
+    parked = [started(), paused(AGENT, True), started(), completed()]
+    assert paged(ids, *parked) == [
+        *in_page(f"{AGENT}-h125-1", *parked[:2]),
+        *in_page(f"{AGENT}-h125-2", *parked[2:]),
+    ]
+    # Another page's runs are told apart by its rows, whatever chat or order it comes in.
+    assert paged(ids, *RUN, chat="other", startRowId=90, endRowId=120) == in_page(
+        f"{AGENT}-h120-1", *RUN
+    )
+    # One update can be a subagent's own work and another one's start: each names its own.
+    nested = {**started(OTHER), "_meta": {**started(OTHER)["_meta"], **by(AGENT, {})["_meta"]}}
+    stamped = paged(ids, started(), nested)[1]["_meta"]
+    assert stamped[STARTED]["runId"] == f"{OTHER}-h125-1"
+    assert stamped[CONTEXT]["runId"] == f"{AGENT}-h125-1"
+
+
+def test_a_history_page_and_the_tail_number_their_runs_apart():
+    """The tail is named as before: its first run not at all, a resumed one "<id>-<n>"."""
+    ids = subagents.RunIds()
+    twice = [*RUN, *RUN]
+    tail = [*RUN, *in_page(f"{AGENT}-2", *RUN)]
+    assert [named_by(ids, update) for update in twice] == tail
+    assert paged(ids, *twice) == [
+        *in_page(f"{AGENT}-h125-1", *RUN),
+        *in_page(f"{AGENT}-h125-2", *RUN),
+    ]
+    # A page's starts are not the tail's: the next live run is the tail's third.
+    assert [named_by(ids, update) for update in RUN] == in_page(f"{AGENT}-3", *RUN)
+
+
+def test_a_history_page_leaves_what_started_in_an_older_page_unnamed():
+    ids = subagents.RunIds()
+    leading = [by(AGENT, THOUGHT), paused(AGENT, True), completed()]
+    other = [started(OTHER), by(OTHER, TOOL), completed(OTHER)]
+    assert paged(ids, *leading, *other, *RUN) == [
+        *leading,
+        *in_page(f"{OTHER}-h125-1", *other),
+        *in_page(f"{AGENT}-h125-1", *RUN),
+    ]
+
+
+def test_a_history_page_leaves_a_run_the_native_named_alone():
+    ids = subagents.RunIds()
+    own = [started(runId="r1"), by(AGENT, THOUGHT), paused(AGENT, True), completed()]
+    whole = in_page("r2", *RUN)
+    # Named on its start alone, or on everything: nothing is added or renamed. The start
+    # still counts, and a name left empty is no name.
+    assert paged(ids, *own, *whole, started(runId=None), completed()) == [
+        *own,
+        *whole,
+        *in_page(f"{AGENT}-h125-3", started(), completed()),
+    ]
+    # After a run that the page named, too: its name ends with it.
+    assert paged(ids, *RUN, *own) == [*in_page(f"{AGENT}-h125-1", *RUN), *own]
+    # A name of the native's on a later event of a run that the page named stays as well.
+    step = in_run(by(AGENT, TOOL), "own")
+    assert paged(ids, started(), step) == [in_run(started(), f"{AGENT}-h125-1"), step]
+
+
+def test_a_history_page_without_subagents_comes_out_as_it_went_in():
+    ids = subagents.RunIds()
+    plain = [MESSAGE, THOUGHT, TOOL, RAN, by("root", USAGE), {"sessionUpdate": "plan"}]
+    page = page_of(*plain)
+    given = json.dumps(page)
+    ids.stamp_page("chat", page)
+    assert json.dumps(page) == given
+
+
+ODD_PAGES = [
+    {},
+    {"exhausted": True, "nextEndRowId": None},
+    # No row range to name the runs after.
+    {"updates": [{"update": update} for update in RUN]},
+    *(
+        {"updates": [{"update": update} for update in RUN], "coveredRange": covered}
+        for covered in (
+            None,
+            "120-125",
+            [120, 125],
+            {},
+            {"startRowId": 120},
+            {"endRowId": 125},
+            {"startRowId": "120", "endRowId": 125},
+            {"startRowId": 120, "endRowId": None},
+            {"startRowId": 120, "endRowId": 125.5},
+            {"startRowId": 120, "endRowId": True},
+        )
+    ),
+    # No rows.
+    *({"updates": rows, "coveredRange": ROWS} for rows in (None, "none", 7, {"0": RUN[0]})),
+    # Rows that are none, and updates that name no subagent.
+    {"updates": [None, 7, "row", [], {}, {"sessionId": "any"}], "coveredRange": ROWS},
+    {
+        "updates": [
+            {"update": odd}
+            for odd in (
+                None,
+                "text",
+                [started()],
+                {},
+                {"sessionUpdate": "tool_call_update"},
+                *({"_meta": meta} for meta in (None, "text", [STARTED])),
+                *({"_meta": {key: value}} for key in RUN_EVENTS for value in (None, "x", [1])),
+                *(
+                    {"_meta": {key: {field: odd}}}
+                    for key, field in RUN_EVENTS.items()
+                    for odd in (None, "", 7, ["a"], {"a": 1})
+                ),
+                {"_meta": {key: {"title": "No ID"} for key in RUN_EVENTS}},
+            )
+        ],
+        "coveredRange": ROWS,
+    },
+]
+
+
+@pytest.mark.parametrize("page", ODD_PAGES)
+def test_naming_a_history_page_never_raises_on_an_odd_one(page):
+    """It runs on a chat's answer to Desktop, where an error fails the request."""
+    ids = subagents.RunIds()
+    given = json.dumps(page)
+    for _ in range(2):
+        ids.stamp_page("chat", page)
+        assert json.dumps(page) == given
+
+
+def test_a_history_page_names_the_runs_beside_a_row_that_is_none():
+    ids = subagents.RunIds()
+    odd = [None, {"update": "text"}, {"update": {"_meta": {STARTED: {"agentId": 7}}}}]
+    page = {"updates": [*odd, *({"update": update} for update in RUN)], "coveredRange": ROWS}
+    given = copy.deepcopy(page)
+    ids.stamp_page("chat", page)
+    named = [{"update": update} for update in in_page(f"{AGENT}-h125-1", *RUN)]
+    assert page == {**given, "updates": [*odd, *named]}
+
+
 async def get(port, target, host=None):
     """Status, headers and body of a request the server answers and closes."""
     reader, writer = await asyncio.open_connection("127.0.0.1", port)

@@ -2513,6 +2513,288 @@ def test_gui_history_page_replies_reach_desktop_without_event_ids(
     asyncio.run(scenario())
 
 
+WORKER, HELPER = "d29b75b1", "b7e2c9d4"
+
+
+def run_event(agent, what, run=None, **details):
+    """A subagent's `started`, `completed` or `paused` as the native reports it: no run named.
+
+    `run`: as Desktop is sent it, naming the run it belongs to.
+    """
+    event = {"agentId": agent, **details, **({"runId": run} if run else {})}
+    change = {"sessionUpdate": "tool_call_update", "toolCallId": agent}
+    return {**change, "_meta": {f"cognition.ai/subagent_{what}": event}}
+
+
+def run_step(agent, run=None):
+    """A thought of the subagent's own, which says whose it is and nothing of the run."""
+    context = {"parentAgentId": agent, **({"runId": run} if run else {})}
+    thought = saved("agent_thought_chunk", "Reading on.", "23940")
+    return {**thought, "_meta": {**thought["_meta"], "cognition.ai/subagent_context": context}}
+
+
+def run_of(agent, run=None):
+    return [
+        run_event(agent, "started", run),
+        run_step(agent, run),
+        run_event(agent, "completed", run),
+    ]
+
+
+def page_of(session_id, updates, start=120, end=125):
+    """An answer to `loadPage` that holds these updates, oldest first."""
+    return {
+        "updates": [{"sessionId": session_id, "update": update} for update in updates],
+        "coveredRange": {"startRowId": start, "endRowId": end},
+        "nextEndRowId": start,
+        "exhausted": False,
+        "replayFilterVersion": "1",
+    }
+
+
+@pytest.mark.parametrize("working", [False, True])
+def test_gui_history_page_names_the_runs_of_its_subagents(
+    acp_native, tmp_path, monkeypatch, working
+):
+    """Desktop 3.14 folds a page of older rows on its own and counts a resumed run as running.
+
+    The native names no run, so the second start in a page gets a row that its end never
+    finds: "3 subagents running" in a chat where none was. A page is an answer, which never
+    passes the path a chat's updates take.
+    """
+    answer, gate = tmp_path / "page.json", tmp_path / "say-gate"
+    monkeypatch.setenv("FAKE_PAGE", str(answer))
+    monkeypatch.setenv("FAKE_SAY", json.dumps([agent_text("live progress")]))
+    monkeypatch.setenv("FAKE_SAY_GATE", str(gate))
+
+    async def scenario():
+        async with connect(acp_native) as client:
+            session_id = await client.new(tmp_path)
+
+            async def page(updates, **rows):
+                answer.write_text(json.dumps(page_of(session_id, updates, **rows)))
+                request = client.request(LOAD_PAGE, {"sessionId": session_id, **PAGE})
+                return (await asyncio.wait_for(request, 5)).get("result")
+
+            turn = asyncio.create_task(client.prompt(session_id, "say")) if working else None
+            try:
+                if working:
+                    await wait_for_text(client, "live progress")
+                # Every run that starts in the page says which run it is, on its start, its
+                # own work and its end: the first one too, and each subagent on its own.
+                sent = [*run_of(WORKER), *run_of(HELPER), *run_of(WORKER)]
+                assert await page(sent) == page_of(
+                    session_id,
+                    [
+                        *run_of(WORKER, f"{WORKER}-h125-1"),
+                        *run_of(HELPER, f"{HELPER}-h125-1"),
+                        *run_of(WORKER, f"{WORKER}-h125-2"),
+                    ],
+                )
+                # The next older page names its runs after its own rows.
+                assert await page(run_of(WORKER), start=90, end=120) == page_of(
+                    session_id, run_of(WORKER, f"{WORKER}-h120-1"), start=90, end=120
+                )
+                assert not turn or not turn.done()
+            finally:
+                gate.touch()
+            if turn:
+                assert (await turn)["result"]["stopReason"] == "end_turn"
+            only_native(acp_native, session_id)
+
+    asyncio.run(scenario())
+
+
+def about_runs(messages):
+    """The updates Desktop was sent that are a subagent's start, end, pause or own work."""
+    return [row for row in rows(messages) if "cognition.ai/subagent_" in json.dumps(row)]
+
+
+def test_gui_run_that_ends_in_the_tail_is_ended_in_the_page_that_holds_its_start(
+    acp_native, tmp_path, monkeypatch
+):
+    """Desktop 3.14 applies an end as its segment arrives, to a row of that segment.
+
+    The tail comes first, so an end whose start sits in an older page finds no row and is
+    dropped for good: the run counted as running although its start now had a name.
+    """
+    answer = tmp_path / "page.json"
+    end = run_event(WORKER, "completed", success=True, summary="Read on.")
+    monkeypatch.setenv("FAKE_PAGE", str(answer))
+    monkeypatch.setenv("FAKE_REPLAY_SAY", json.dumps([run_step(WORKER), end]))
+
+    async def scenario():
+        async with connect(acp_native) as client:
+            session_id = await client.new(tmp_path)
+            params = {"sessionId": session_id, "cwd": str(tmp_path), "mcpServers": []}
+            start = len(client.messages)
+            assert "result" in await client.request("session/load", params)
+            # Nothing in the tail started this run, so the tail is as the native sent it.
+            assert about_runs(client.messages[start:]) == [run_step(WORKER), end]
+
+            older = [*run_of(WORKER), run_event(WORKER, "started")]
+            answer.write_text(json.dumps(page_of(session_id, older)))
+            second = f"{WORKER}-h125-2"
+            # The page that holds the start ends with a copy of the end, under the name it
+            # gave that run: one more row, shaped like the page's own.
+            named = [
+                *run_of(WORKER, f"{WORKER}-h125-1"),
+                run_event(WORKER, "started", second),
+                run_event(WORKER, "completed", second, success=True, summary="Read on."),
+            ]
+            for _ in range(2):
+                # Desktop may ask again: the same answer, not one without the copy.
+                request = client.request(LOAD_PAGE, {"sessionId": session_id, **PAGE})
+                got = (await asyncio.wait_for(request, 5)).get("result")
+                assert got == page_of(session_id, named)
+
+    asyncio.run(scenario())
+
+
+def test_gui_live_end_names_the_run_that_a_history_page_left_open(
+    acp_native, tmp_path, monkeypatch
+):
+    """A subagent that works on while Desktop pages in the row of its start."""
+    answer, gate = tmp_path / "page.json", tmp_path / "say-gate"
+    end = run_event(HELPER, "completed", success=True, summary="Done.")
+    monkeypatch.setenv("FAKE_PAGE", str(answer))
+    monkeypatch.setenv("FAKE_SAY", json.dumps([run_step(HELPER), end, run_step(HELPER)]))
+    monkeypatch.setenv("FAKE_SAY_GATE", str(gate))
+
+    async def scenario():
+        async with connect(acp_native) as client:
+            session_id = await client.new(tmp_path)
+            name = f"{HELPER}-h125-1"
+            answer.write_text(
+                json.dumps(page_of(session_id, [run_event(HELPER, "started"), run_step(HELPER)]))
+            )
+            request = client.request(LOAD_PAGE, {"sessionId": session_id, **PAGE})
+            assert (await asyncio.wait_for(request, 5)).get("result") == page_of(
+                session_id, [run_event(HELPER, "started", name), run_step(HELPER, name)]
+            )
+            turn = asyncio.create_task(client.prompt(session_id, "say"))
+            try:
+                await until(lambda: len(about_runs(client.messages)) == 3)
+                # Its work and its end find the row of the page; what follows the end is
+                # that run's no more.
+                assert about_runs(client.messages) == [
+                    run_step(HELPER, name),
+                    run_event(HELPER, "completed", name, success=True, summary="Done."),
+                    run_step(HELPER),
+                ]
+            finally:
+                gate.touch()
+            assert (await turn)["result"]["stopReason"] == "end_turn"
+
+    asyncio.run(scenario())
+
+
+def test_gui_history_page_fetched_again_after_a_reload_from_the_record_ends_its_run(
+    acp_native, tmp_path, monkeypatch
+):
+    """A reload during a turn that the bridge answers from its record, then the pages again.
+
+    The record holds the live end under the name of a run whose row is in a page, so Desktop
+    reads the end before any row of that run and drops it. The page that holds the start is
+    fetched again after that, and must bring what came live of the run it left open.
+    """
+    answer, gate = tmp_path / "page.json", tmp_path / "say-gate"
+    live = [
+        run_event(HELPER, "paused", paused=True),
+        run_event(HELPER, "completed", success=True, summary="Done."),
+    ]
+    monkeypatch.setenv("FAKE_PAGE", str(answer))
+    monkeypatch.setenv("FAKE_SAY", json.dumps(live))
+    monkeypatch.setenv("FAKE_SAY_GATE", str(gate))
+
+    async def scenario():
+        async with connect(acp_native) as client:
+            session_id = await client.new(tmp_path)
+            params = {"sessionId": session_id, "cwd": str(tmp_path), "mcpServers": []}
+            name = f"{HELPER}-h125-1"
+            open_run = run_event(HELPER, "started", name)
+            named = [
+                run_event(HELPER, "paused", name, paused=True),
+                run_event(HELPER, "completed", name, success=True, summary="Done."),
+            ]
+            answer.write_text(json.dumps(page_of(session_id, [run_event(HELPER, "started")])))
+
+            async def page():
+                request = client.request(LOAD_PAGE, {"sessionId": session_id, **PAGE})
+                return (await asyncio.wait_for(request, 5)).get("result")
+
+            assert await page() == page_of(session_id, [open_run])
+            turn = asyncio.create_task(client.prompt(session_id, "say"))
+            try:
+                await until(lambda: len(about_runs(client.messages)) == 2)
+                assert about_runs(client.messages) == named
+                # The reload replays the record: the pause and the end, and no row of the run.
+                start = len(client.messages)
+                assert "result" in await asyncio.wait_for(client.request("session/load", params), 5)
+                assert about_runs(client.messages[start:]) == named
+                # The page fetched again brings both after its own rows, in order, named.
+                assert await page() == page_of(session_id, [open_run, *named])
+            finally:
+                gate.touch()
+            assert (await turn)["result"]["stopReason"] == "end_turn"
+            # The reload was answered from the record, never by the native, and the page
+            # answers the same once the turn is over.
+            assert not [call for call in logged(acp_native) if call["method"] == "session/load"]
+            assert await page() == page_of(session_id, [open_run, *named])
+
+    asyncio.run(scenario())
+
+
+def test_gui_second_load_starts_the_history_pages_over(acp_native, tmp_path, monkeypatch):
+    """A load shows Desktop a new tail, and Desktop fetches every page again from it."""
+    answer, gate = tmp_path / "page.json", tmp_path / "say-gate"
+    end = run_event(WORKER, "completed", success=True, summary="Read on.")
+    live = run_event(HELPER, "completed", success=True, summary="Done.")
+    monkeypatch.setenv("FAKE_PAGE", str(answer))
+    monkeypatch.setenv("FAKE_REPLAY_SAY", json.dumps([end]))
+    monkeypatch.setenv("FAKE_SAY", json.dumps([live]))
+    monkeypatch.setenv("FAKE_SAY_GATE", str(gate))
+
+    async def scenario():
+        async with connect(acp_native) as client:
+            session_id = await client.new(tmp_path)
+            params = {"sessionId": session_id, "cwd": str(tmp_path), "mcpServers": []}
+
+            async def page(updates):
+                answer.write_text(json.dumps(page_of(session_id, updates)))
+                request = client.request(LOAD_PAGE, {"sessionId": session_id, **PAGE})
+                return (await asyncio.wait_for(request, 5)).get("result")
+
+            # The first round: an end leads the tail, and a page leaves another run open.
+            assert "result" in await client.request("session/load", params)
+            open_run = run_event(HELPER, "started", f"{HELPER}-h125-1")
+            assert await page([run_event(HELPER, "started")]) == page_of(session_id, [open_run])
+
+            # The second round owes nothing to the first. The tail's end is copied once, to
+            # the page that now covers those rows, which is not answered from the first
+            # round's memory of them.
+            assert "result" in await client.request("session/load", params)
+            name = f"{WORKER}-h125-1"
+            assert await page([run_event(WORKER, "started")]) == page_of(
+                session_id,
+                [
+                    run_event(WORKER, "started", name),
+                    run_event(WORKER, "completed", name, success=True, summary="Read on."),
+                ],
+            )
+            # And the run that the first round's page left open is no longer named.
+            start = len(client.messages)
+            turn = asyncio.create_task(client.prompt(session_id, "say"))
+            try:
+                await until(lambda: about_runs(client.messages[start:]))
+                assert about_runs(client.messages[start:]) == [live]
+            finally:
+                gate.touch()
+            assert (await turn)["result"]["stopReason"] == "end_turn"
+
+    asyncio.run(scenario())
+
+
 def test_gui_history_page_the_native_refuses_is_answered_with_its_error(
     acp_native, tmp_path, monkeypatch
 ):

@@ -1416,7 +1416,11 @@ class Bridge:
             backend.remember_selection(category, params[f"{category}Id"])
         if method == LOAD_PAGE:
             # Older rows are a replay that comes as an answer, past `from_backend`: its
-            # replies lose their event ids here, for the reason given there.
+            # subagent runs are named and its replies lose their event ids here, for the
+            # reasons given there. The two touch different keys, so either could run first;
+            # in this order the rows that naming adds (ends and pauses, never a reply) pass
+            # the second step as a chat's own updates do.
+            self.run_ids.stamp_page(params["sessionId"], result)
             drop_page_event_ids(result)
         return result
 

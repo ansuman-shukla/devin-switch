@@ -1,4 +1,5 @@
 import json
+import math
 import os
 import re
 import shlex
@@ -6,6 +7,7 @@ import tempfile
 import time
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime
 from pathlib import Path
 
 from devin_switch import sessions, usage
@@ -241,9 +243,42 @@ def choose_best(
                 except SwitchError:
                     continue
     raise SwitchError(
-        "No other saved login has confirmed remaining usage. This chat is unchanged. "
+        f"No other saved login has confirmed remaining usage. {usage_back(store)}"
+        "This chat is unchanged. "
         "If usage is unavailable, choose an account explicitly: !ds switch ALIAS."
     )
+
+
+def moment(when: float, now: float) -> str:
+    """A time as people say it: the clock time, its day unless that is today, and the wait."""
+    at, today = datetime.fromtimestamp(when), datetime.fromtimestamp(now).date()
+    days = (at.date() - today).days
+    day = "" if days == 0 else "tomorrow " if days == 1 else f"on {at.day} {at:%b} "
+    hours, minutes = divmod(max(1, math.ceil((when - now) / 60)), 60)
+    wait = " ".join(
+        text
+        for text in (f"{hours} h" if hours else "", f"{minutes} min" if minutes else "")
+        if text
+    )
+    return f"{day}at {at:%H:%M} (in {wait})"
+
+
+def usage_back(store: Store) -> str:
+    """A sentence on when the first saved login has usage again; empty when that is unknown.
+
+    With every login used up, an error that only says so reads like a failed switch. The
+    logins' saved readings say when their windows reset.
+    """
+    now = time.time()
+    try:
+        resets = [
+            usage.usage_returns(usage.read_cached(store, account, now=now), now=now)
+            for account in store.accounts()
+        ]
+    except (SwitchError, OSError):
+        return ""
+    soonest = min((reset for reset in resets if reset is not None), default=None)
+    return "" if soonest is None else f"The first gets usage back {moment(soonest, now)}. "
 
 
 def controller_available(store: Store, run_id: str) -> bool:

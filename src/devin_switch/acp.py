@@ -163,6 +163,11 @@ BACKGROUND_UPDATES = {
     "session_info_update",
     "usage_update",
 }
+SWITCH_OFF = "Auto-switch is off: use /switch, or turn it on with /auto-switch on."
+SWITCH_LIMIT = (
+    f"This message already moved to {AUTO_SWITCH_LIMIT} other logins, so it stopped there. "
+    "Send it again to go on."
+)
 BUSY_ELSEWHERE = (
     "This chat is busy in another Devin window. Let its turn finish or stop it there, "
     "then open it here again."
@@ -287,6 +292,15 @@ def error_details(error: Exception) -> tuple[int, dict | None]:
         return -32015, data
     data = getattr(error, "data", None)
     return getattr(error, "code", -32603), data if isinstance(data, dict) else None
+
+
+def out_of_usage(error: RpcError, spent: str, reason: str) -> RpcError:
+    """The quota error as Desktop shows it: what ran out and why the chat did not move on.
+
+    "Native ACP rejected the request (RPC code -32011)" read like a broken switch when every
+    saved login was used up. The code and data Desktop classifies the error by stay as sent.
+    """
+    return RpcError(f"Out of usage on {spent}. {reason}", error.code, error.data)
 
 
 def failure_detail(error: Exception) -> str:
@@ -1241,18 +1255,19 @@ class Bridge:
                 else backend.stop_cause == "quota_exhausted"
                 and result.get("stopReason") != "cancelled"
             )
-            if (
-                not exhausted
-                or chat.canceled
-                or len(tried) > AUTO_SWITCH_LIMIT
-                or not await asyncio.to_thread(handoff.auto_switch_enabled, self.native.store)
-            ):
+            if not exhausted or chat.canceled:
                 if error:
                     raise error
                 return result
+            enabled = await asyncio.to_thread(handoff.auto_switch_enabled, self.native.store)
+            limited = len(tried) > AUTO_SWITCH_LIMIT
             if backend.relay:
                 tried |= backend.relay.recently_exhausted()
             spent = ", ".join(sorted(tried)) or backend.account.name
+            if limited or not enabled:
+                if error:
+                    raise out_of_usage(error, spent, SWITCH_LIMIT if enabled else SWITCH_OFF)
+                return result
             if backend.relay and backend.process.poll() is None:
                 # Subagents live only in this process: continue in it on another login.
                 try:
@@ -1290,7 +1305,7 @@ class Bridge:
                     "Turn it off with /auto-switch off.",
                 )
                 if error:
-                    raise error from exc
+                    raise out_of_usage(error, spent, failure_detail(exc)) from exc
                 return result
             if chat.canceled:
                 return {"stopReason": "cancelled"}

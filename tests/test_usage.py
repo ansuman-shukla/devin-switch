@@ -285,3 +285,27 @@ def test_remaining_allowance_requires_fresh_complete_finite_usage(problem):
     else:
         reading = replace(reading, daily=replace(reading.daily, used_percent=float("nan")))
     assert usage.remaining_allowance(reading, now=NOW) is None
+
+
+def window(used: float, resets_in: float) -> usage.Window:
+    return usage.Window(used, NOW + resets_in, "available")
+
+
+@pytest.mark.parametrize(
+    ("daily", "weekly", "returns_in"),
+    [
+        # Out of weekly usage: the daily reset brings nothing back.
+        (window(30, 3600), window(100, 86400), 86400),
+        (window(100, 3600), window(100, 86400), 86400),
+        (window(100, 3600), window(40, 86400), 3600),
+        # Usage left, a reset that has passed, or nothing known: no time to give.
+        (window(30, 3600), window(40, 86400), None),
+        (window(100, -60), window(40, 86400), None),
+        (usage.Window(), usage.Window(), None),
+        (usage.Window(state="not_applicable"), window(100, 7200), 7200),
+    ],
+)
+def test_usage_returns_with_the_last_reset_of_the_used_up_windows(daily, weekly, returns_in):
+    reading = usage.Usage(status="stale", daily=daily, weekly=weekly, fetched_at=NOW - 9000)
+    expected = None if returns_in is None else NOW + returns_in
+    assert usage.usage_returns(reading, now=NOW) == expected

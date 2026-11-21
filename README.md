@@ -231,8 +231,10 @@ restart needed. If the setting file is unreadable, automatic switching stays off
   on the new login instead of `continue`.
   Rate limits that include a retry delay do not trigger a switch. Stopping the turn in Desktop
   cancels the pending `continue`. Each turn switches at most three times and never goes back
-  to a login it already tried. If no login has confirmed remaining usage, the original quota
-  error is shown.
+  to a login it already tried. If no login has confirmed remaining usage, the chat stays
+  where it is and the error says so: which logins ran out, that none is left, and when the
+  first saved login has usage again, for example "The first gets usage back at 13:30 (in 13 h
+  6 min)".
 - **Terminal chats keep running too** (Devin CLI 3000.14 or later). `ds run` routes the chat's
   API traffic through the same kind of relay, so a request that runs out of usage is answered
   on the next login with remaining usage, in the same CLI process: no exit, no resume, and no

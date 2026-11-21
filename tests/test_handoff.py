@@ -883,3 +883,59 @@ def test_best_account_keeps_searching_when_full_login_is_signed_out(signed_in, m
         lambda store, account, *, force: full_usage(0 if account.name == "ansuman-2" else 25),
     )
     assert handoff.choose_best(signed_in, "ansuman-1") == (store.account("ansuman-3"), 75)
+
+
+def test_no_login_left_says_when_usage_comes_back(signed_in, monkeypatch):
+    """With every login used up, "no other login" alone read like a switch that broke."""
+    import time
+    from datetime import datetime
+
+    from devin_switch.store import write_json
+
+    store, now = signed_in.store, time.time()
+    resets = {"ansuman-1": now + 7200, "ansuman-2": now + 3 * 3600 + 20 * 60}
+
+    def refresh(store, account, *, force):
+        reading = usage.Usage(
+            status="ok",
+            fetched_at=now,
+            checked_at=now,
+            # The daily window resets first, but it is the weekly one that ran out.
+            daily=usage.Window(10, now + 600, "available"),
+            weekly=usage.Window(100, resets[account.name], "available"),
+        )
+        saved = usage.fingerprint(usage.credential_bytes(store, account))
+        write_json(
+            store.directory(account.name) / "usage.json",
+            {"credential_fingerprint": saved, "usage": asdict(reading)},
+        )
+        return reading
+
+    monkeypatch.setattr(usage, "refresh_account", refresh)
+    refresh(store, store.account("ansuman-1"), force=True)
+    with pytest.raises(SwitchError) as raised:
+        handoff.choose_best(signed_in, "ansuman-1")
+    # The login the chat is on counts too: it is the first to get usage back here.
+    clock = datetime.fromtimestamp(resets["ansuman-1"]).strftime("%H:%M")
+    assert f"at {clock} (in 2 h)" in str(raised.value)
+    assert "The first gets usage back " in str(raised.value)
+
+
+@pytest.mark.parametrize(
+    ("ahead", "said"),
+    [
+        ((0, 0, 20), "at 10:00 (in 1 min)"),
+        ((0, 45, 0), "at 10:45 (in 45 min)"),
+        ((3, 0, 0), "at 13:00 (in 3 h)"),
+        ((13, 6, 0), "at 23:06 (in 13 h 6 min)"),
+        ((20, 30, 0), "tomorrow at 06:30 (in 20 h 30 min)"),
+        ((80, 0, 0), "on 25 Nov at 18:00 (in 80 h)"),
+    ],
+)
+def test_a_reset_time_is_said_with_its_day_and_the_wait(ahead, said):
+    from datetime import datetime, timedelta
+
+    start = datetime(2026, 11, 22, 10, 0)
+    hours, minutes, seconds = ahead
+    later = start + timedelta(hours=hours, minutes=minutes, seconds=seconds)
+    assert handoff.moment(later.timestamp(), start.timestamp()) == said

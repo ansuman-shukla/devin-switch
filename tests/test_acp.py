@@ -4027,6 +4027,13 @@ def test_gui_quota_error_without_auto_switch_is_returned_unchanged(
             with pytest.raises(acp.RpcError) as raised:
                 await bridge.dispatch("session/prompt", prompt_params(session_id, "work"))
             assert raised.value.code == -32011
+            assert raised.value.data["cognition.ai/errorKind"] == "resource_exhausted"
+            # Desktop shows this text: a bare RPC code read like a switch that broke.
+            assert str(raised.value).startswith(
+                "Out of usage on ansuman-1. Auto-switch is off"
+                if case == "disabled"
+                else "Native ACP rejected the request"
+            )
             assert chat.backend.account.name == "ansuman-1"
             assert acp_native.store.selected().name == "ansuman-1"
             assert prompts(acp_native) == [("ansuman-1", "work")]
@@ -4056,6 +4063,32 @@ def test_gui_native_error_details_reach_desktop(acp_native, tmp_path, monkeypatc
     asyncio.run(scenario())
 
 
+def test_gui_auto_switch_stops_after_its_limit_and_says_so(acp_native, tmp_path, monkeypatch):
+    store = acp_native.store
+    with store.lock():
+        for name in ("ansuman-3", "ansuman-4", "ansuman-5"):
+            store.credentials(store.add(name, None)).write_text(f"valid-{name}")
+    names = [account.name for account in store.accounts()]
+    monkeypatch.setattr(usage, "refresh_account", fresh_usage())
+    monkeypatch.setenv("FAKE_QUOTA_ACCOUNTS", ",".join(names))
+
+    async def scenario():
+        async with in_process(acp_native) as (bridge, _):
+            created = await bridge.dispatch("session/new", {"cwd": str(tmp_path), "mcpServers": []})
+            with pytest.raises(acp.RpcError) as raised:
+                await bridge.dispatch("session/prompt", prompt_params(created["sessionId"], "work"))
+            # The first login and three more: the fifth is never tried in this turn.
+            tried = [account for account, _ in prompts(acp_native)]
+            assert len(tried) == acp.AUTO_SWITCH_LIMIT + 1 and len(set(tried)) == len(tried)
+            assert str(raised.value) == (
+                f"Out of usage on {', '.join(sorted(tried))}. This message already moved to "
+                "3 other logins, so it stopped there. Send it again to go on."
+            )
+            assert raised.value.code == -32011
+
+    asyncio.run(scenario())
+
+
 def test_gui_auto_switch_never_revisits_exhausted_logins(acp_native, tmp_path, monkeypatch):
     monkeypatch.setattr(usage, "refresh_account", fresh_usage())
     monkeypatch.setenv("FAKE_QUOTA_ACCOUNTS", "ansuman-1,ansuman-2")
@@ -4064,11 +4097,18 @@ def test_gui_auto_switch_never_revisits_exhausted_logins(acp_native, tmp_path, m
         async with in_process(acp_native) as (bridge, messages):
             created = await bridge.dispatch("session/new", {"cwd": str(tmp_path), "mcpServers": []})
             session_id = created["sessionId"]
-            with pytest.raises(acp.RpcError):
+            with pytest.raises(acp.RpcError) as raised:
                 await bridge.dispatch("session/prompt", prompt_params(session_id, "work"))
             assert prompts(acp_native) == [("ansuman-1", "work"), ("ansuman-2", "continue")]
             assert bridge.chats[session_id].backend.account.name == "ansuman-2"
             assert "Automatic switch stopped" in json.dumps(messages)
+            # The error says which logins ran out and that none is left, with the native's
+            # code and data, which Desktop classifies it by.
+            assert str(raised.value).startswith(
+                "Out of usage on ansuman-1, ansuman-2. No other saved login has confirmed"
+            )
+            assert raised.value.code == -32011
+            assert raised.value.data["cognition.ai/errorKind"] == "resource_exhausted"
 
     asyncio.run(scenario())
 

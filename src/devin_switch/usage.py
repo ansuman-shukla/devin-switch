@@ -241,6 +241,27 @@ def cached_remaining(reading: Usage, *, now: float | None = None) -> float:
     return min(remaining) if remaining else -1.0
 
 
+def usage_returns(reading: Usage, *, now: float | None = None) -> float | None:
+    """When a login that a saved reading shows out of usage has some again, if that is known.
+
+    The last reset among its used-up windows: a login out of weekly usage gets nothing from a
+    daily reset. A reading of any age counts, because a reset time does not go stale; a
+    window whose reset has passed is no longer used up.
+    """
+    now = time.time() if now is None else now
+    resets = []
+    try:
+        for window in (reading.daily, reading.weekly):
+            if window.state != "available" or window.used_percent is None:
+                continue
+            reset = finite_number(window.resets_at)
+            if finite_number(window.used_percent) >= 100 and reset > now:
+                resets.append(reset)
+    except ValueError:
+        return None
+    return max(resets, default=None)
+
+
 def refresh_account(store: Store, account: Account, *, force: bool = False) -> Usage:
     now = time.time()
     previous = read_cached(store, account, now=now)
